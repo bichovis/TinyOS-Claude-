@@ -5,15 +5,22 @@
 #include "irq.h"
 #include "timer.h"
 #include "mm.h"
+#include "mmio.h"
 #include "sched.h"
 #include "sync.h"
+#include "ipc.h"
 
 #define TICK_HZ      100
 
 /* La imagen del proceso de usuario, empotrada por tools/bin2c.py. Cuando
  * haya un sistema de ficheros, esto sera una carga de verdad desde disco. */
-extern const uint8_t  user_hello[];
-extern const uint64_t user_hello_size;
+extern const uint8_t  user_hello[];      extern const uint64_t user_hello_size;
+extern const uint8_t  user_conserver[];  extern const uint64_t user_conserver_size;
+extern const uint8_t  user_client[];     extern const uint64_t user_client_size;
+
+/* Registros de la PL011. Se los concedemos al driver de consola para que
+ * pueda hacer su trabajo desde EL0 sin pasar por el kernel. */
+#define UART0_PHYS  (PERIPHERAL_BASE + 0x201000)
 
 /* Ventana virtual para los experimentos: 2 GB, donde no hay nada fisico.
  * Que funcione es justamente la demostracion de que la traduccion existe. */
@@ -322,7 +329,10 @@ static void menu(void)
     uart_puts("  c - contador compartido: intentos vs valor real\n");
     uart_puts("  m - activar/desactivar el mutex del contador\n");
     uart_puts("  k - estado del canal productor/consumidor\n");
-    uart_puts("  u - lanzar un proceso de usuario en EL0\n");
+    uart_puts("  u - lanzar el proceso 'hello' en EL0\n");
+    uart_puts("  s - lanzar el SERVIDOR de consola (driver en EL0)\n");
+    uart_puts("  n - lanzar un cliente que imprime por mensajes\n");
+    uart_puts("  i - estado de los puertos IPC\n");
     uart_puts("  y - ceder la CPU (yield) desde la tarea idle\n");
     uart_puts("  p - estado de la memoria fisica\n");
     uart_puts("  v - dos direcciones virtuales, una pagina fisica\n");
@@ -361,11 +371,35 @@ static void command(char c)
         chan_stats();
         break;
 
+    case 's': {
+        uart_puts("\n  [kernel] arrancando el driver de consola en EL0,\n");
+        uart_puts("           con la pagina de la PL011 mapeada en su espacio\n");
+        int pid = task_create_user("conserver", user_conserver,
+                                   user_conserver_size, UART0_PHYS);
+        if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
+        break;
+    }
+
+    case 'n': {
+        int pid = task_create_user("client", user_client, user_client_size, 0);
+        if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
+        else {
+            uart_puts("\n  [kernel] cliente creado, pid ");
+            uart_dec((uint64_t)pid);
+            uart_puts("\n");
+        }
+        break;
+    }
+
+    case 'i':
+        ipc_dump();
+        break;
+
     case 'u': {
         uart_puts("\n  [kernel] cargando ");
         uart_dec(user_hello_size);
         uart_puts(" bytes en un espacio de direcciones nuevo...\n");
-        int pid = task_create_user("hello", user_hello, user_hello_size);
+        int pid = task_create_user("hello", user_hello, user_hello_size, 0);
         if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
         else {
             uart_puts("  [kernel] proceso creado, pid ");
@@ -459,6 +493,7 @@ void kernel_main(uint64_t dtb_ptr)
     irq_enable();
 
     pmm_init();
+    ipc_init();
     mem_stats();
 
     uart_puts("\n  Midiendo la memoria SIN MMU (sin caches)...\n    ");

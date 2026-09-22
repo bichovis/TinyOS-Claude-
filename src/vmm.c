@@ -208,6 +208,21 @@ uint64_t vmm_translate_user(uint64_t va)
     return (par & PTE_ADDR_MASK) | (va & (PAGE_SIZE - 1));
 }
 
+/* Igual, pero preguntando por ESCRITURA ('w' en vez de 'r'). Hace falta
+ * para recv(): el kernel va a escribir el mensaje en un buffer que ha
+ * elegido el proceso, y hay que asegurarse de que ese buffer es suyo y es
+ * escribible. Si no, un proceso podria hacer que el kernel le machacara
+ * memoria a otro, o a si mismo su propio codigo de solo lectura. */
+uint64_t vmm_translate_user_w(uint64_t va)
+{
+    uint64_t par;
+    __asm__ volatile("at s1e0w, %1\n isb\n mrs %0, par_el1"
+                     : "=r"(par) : "r"(va) : "memory");
+    if (par & 1)
+        return 0;
+    return (par & PTE_ADDR_MASK) | (va & (PAGE_SIZE - 1));
+}
+
 uint64_t vmm_translate(uint64_t va)
 {
     /* 'at' = Address Translate: le pide a la MMU que traduzca una direccion

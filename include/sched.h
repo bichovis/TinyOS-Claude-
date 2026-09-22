@@ -36,6 +36,7 @@ struct task {
     uint64_t    wake_tick;    /* si duerme, cuando despertar                */
     struct task *wait_next;   /* encadenamiento dentro de una cola de espera */
     uint64_t   *pgd;          /* tabla TTBR0 propia; 0 = hilo de kernel      */
+    uint64_t    mmio_va;      /* MMIO concedido a un driver de EL0; 0 si no  */
     const char *name;
 };
 
@@ -43,7 +44,8 @@ extern struct task *current;
 
 void sched_init(void);
 int  task_create(const char *name, void (*fn)(void *), void *arg);
-int  task_create_user(const char *name, const uint8_t *image, uint64_t size);
+int  task_create_user(const char *name, const uint8_t *image, uint64_t size,
+                      uint64_t mmio_pa);
 void schedule(void);
 void scheduler_tick(void);       /* lo llama el timer                       */
 void task_yield(void);           /* ceder la CPU voluntariamente            */

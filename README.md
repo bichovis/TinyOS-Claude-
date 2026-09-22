@@ -38,8 +38,8 @@ GPIO15/RXD (pin 10) a 115200 8N1.
 | 5    | Hilos y planificador                        | hecho  |
 | 6    | Sincronización: colas de espera, mutex, canales | hecho |
 | 7    | Procesos en EL0 y llamadas al sistema       | hecho  |
-| 8    | Kernel en alto (TTBR1) y ASIDs              | —      |
-| 9    | Drivers en espacio de usuario               | —      |
+| 8    | IPC por puertos y driver de consola en EL0  | hecho  |
+| 9    | Kernel en alto (TTBR1) y ASIDs              | —      |
 
 ## Estructura
 
@@ -51,7 +51,11 @@ GPIO15/RXD (pin 10) a 115200 8N1.
     sched.c      hilos del kernel y planificador round-robin
     sync.c       colas de espera, mutex, semaforos y canales de mensajes
     syscall.c    despacho de las llamadas al sistema desde EL0
-    user/        programa de usuario: se compila aparte y se empotra
+    ipc.c        puertos de mensajes entre procesos
+    user/        programas de usuario, compilados aparte y empotrados:
+                 hello.c     usa syscalls directas
+                 conserver.c driver de la UART en EL0, sirve el puerto 0
+                 client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py, convierte el binario de usuario en un array C
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
@@ -72,3 +76,7 @@ GPIO15/RXD (pin 10) a 115200 8N1.
   escribibles; solo pila.
 - Un proceso que muere queda zombi y no se liberan ni su pgd ni sus paginas:
   falta un recolector.
+- El kernel conserva su propio driver de UART para depuracion, asi que
+  cuando el servidor de consola esta activo hay dos escritores sobre el
+  mismo hardware y el texto puede entremezclarse. Un microkernel estricto
+  dejaria en el kernel, como mucho, una salida de panico.

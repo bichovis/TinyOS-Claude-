@@ -6,32 +6,43 @@
  */
 #include "syscall.h"
 
+/* Imprimir un numero por la via directa del kernel (SYS_write). El cliente
+ * del servidor de consola lo hace por mensajes; este proceso usa la syscall
+ * a proposito, para que se vean los dos caminos. */
+static void kdec(uint64_t v)
+{
+    char buf[24];
+    uint64_t n = udec(buf, v);
+    buf[n] = 0;
+    kprint(buf);
+}
+
 /* Que el enlazador ponga _start el primero (ver user/user.ld) */
 void _start(void) __attribute__((section(".text.start")));
 
 void _start(void)
 {
-    print("\n  >> Hola desde EL0. Soy un proceso de usuario.\n");
+    kprint("\n  >> Hola desde EL0. Soy un proceso de usuario.\n");
 
-    print("  >> mi pid es ");
-    print_dec(getpid());
-    print("\n");
+    kprint("  >> mi pid es ");
+    kdec(getpid());
+    kprint("\n");
 
     for (int i = 1; i <= 3; i++) {
-        print("  >> vuelta ");
-        print_dec((uint64_t)i);
-        print(", uptime ");
-        print_dec(uptime());
-        print(" ms\n");
+        kprint("  >> vuelta ");
+        kdec((uint64_t)i);
+        kprint(", uptime ");
+        kdec(uptime());
+        kprint(" ms\n");
         sleep(60);                 /* syscall bloqueante: el kernel me duerme */
     }
 
-    print("  >> Ahora intento leer memoria del kernel (0x80000)...\n");
+    kprint("  >> Ahora intento leer memoria del kernel (0x80000)...\n");
     volatile unsigned int *kernel_mem = (volatile unsigned int *)0x80000UL;
     unsigned int robado = *kernel_mem;      /* deberia morir aqui */
 
-    print("  >> LO HE CONSEGUIDO, el aislamiento no funciona: ");
-    print_dec(robado);
-    print("\n");
+    kprint("  >> LO HE CONSEGUIDO, el aislamiento no funciona: ");
+    kdec(robado);
+    kprint("\n");
     exit(1);
 }

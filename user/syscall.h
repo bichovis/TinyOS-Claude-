@@ -6,16 +6,10 @@
  * vector +0x400. Estos envoltorios son toda la "libc" que hay.
  */
 #pragma once
+#include "ipc_abi.h"        /* el contrato compartido con el kernel */
 
 typedef unsigned long uint64_t;
 typedef long          int64_t;
-
-#define SYS_write   1
-#define SYS_exit    2
-#define SYS_yield   3
-#define SYS_getpid  4
-#define SYS_sleep   5
-#define SYS_uptime  6
 
 static inline int64_t syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
 {
@@ -33,22 +27,36 @@ static inline uint64_t ustrlen(const char *s)
     return n;
 }
 
-static inline void print(const char *s)  { syscall2(SYS_write, (uint64_t)s, ustrlen(s)); }
-static inline void exit(int code)        { syscall2(SYS_exit, (uint64_t)code, 0); }
-static inline void yield(void)           { syscall2(SYS_yield, 0, 0); }
-static inline uint64_t getpid(void)      { return (uint64_t)syscall2(SYS_getpid, 0, 0); }
-static inline void sleep(uint64_t ticks) { syscall2(SYS_sleep, ticks, 0); }
-static inline uint64_t uptime(void)      { return (uint64_t)syscall2(SYS_uptime, 0, 0); }
+/* --- Llamadas basicas -------------------------------------------------- */
+static inline void kprint(const char *s)  { syscall2(SYS_write, (uint64_t)s, ustrlen(s)); }
+static inline void exit(int code)         { syscall2(SYS_exit, (uint64_t)code, 0); }
+static inline void yield(void)            { syscall2(SYS_yield, 0, 0); }
+static inline uint64_t getpid(void)       { return (uint64_t)syscall2(SYS_getpid, 0, 0); }
+static inline void sleep(uint64_t ticks)  { syscall2(SYS_sleep, ticks, 0); }
+static inline uint64_t uptime(void)       { return (uint64_t)syscall2(SYS_uptime, 0, 0); }
 
-static inline void print_dec(uint64_t v)
+/* --- Paso de mensajes -------------------------------------------------- */
+static inline int64_t port_create(void)   { return syscall2(SYS_port_create, 0, 0); }
+static inline int64_t msg_send(uint64_t port, struct message *m)
+                                          { return syscall2(SYS_send, port, (uint64_t)m); }
+static inline int64_t msg_recv(uint64_t port, struct message *m)
+                                          { return syscall2(SYS_recv, port, (uint64_t)m); }
+
+/* --- MMIO concedido (solo para drivers) -------------------------------- */
+static inline uint64_t mmio_base(void)    { return (uint64_t)syscall2(SYS_mmio_base, 0, 0); }
+
+/* --- Utilidades sin libc ----------------------------------------------- */
+static inline void ucopy(char *dst, const char *src, uint64_t n)
 {
-    char buf[21];
-    int n = 0;
-    if (v == 0) { print("0"); return; }
-    while (v) { buf[n++] = (char)('0' + v % 10); v /= 10; }
-    char out[22];
-    int i = 0;
-    while (n--) out[i++] = buf[n];
-    out[i] = 0;
-    print(out);
+    for (uint64_t i = 0; i < n; i++) dst[i] = src[i];
+}
+
+static inline uint64_t udec(char *out, uint64_t v)
+{
+    char tmp[21];
+    uint64_t n = 0, i = 0;
+    if (v == 0) { out[0] = '0'; return 1; }
+    while (v) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) out[i++] = tmp[--n];
+    return i;
 }

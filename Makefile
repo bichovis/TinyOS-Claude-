@@ -27,17 +27,18 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
+UPROGS  := hello conserver client
 UCFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -ffreestanding -nostdlib \
            -nostartfiles -mcpu=cortex-a53 -mgeneral-regs-only -mstrict-align \
-           -fno-stack-protector -fno-pie -fno-common -Iuser
+           -fno-stack-protector -fno-pie -fno-common -Iuser -I$(INCDIR)
 ULDFLAGS := -nostdlib -nostartfiles -T user/user.ld \
             -Wl,--no-warn-rwx-segments
 
-CSRCS   := $(wildcard $(SRCDIR)/*.c) $(BUILD)/hello_bin.c
+CSRCS   := $(wildcard $(SRCDIR)/*.c)
 ASRCS   := $(wildcard $(SRCDIR)/*.S)
 OBJS    := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(wildcard $(SRCDIR)/*.c)) \
            $(patsubst $(SRCDIR)/%.S,$(BUILD)/%.S.o,$(ASRCS)) \
-           $(BUILD)/hello_bin.o
+           $(patsubst %,$(BUILD)/%_bin.o,$(UPROGS))
 DEPS    := $(OBJS:.o=.d)
 
 .PHONY: all clean run debug dump
@@ -51,19 +52,23 @@ $(BUILD)/%.S.o: $(SRCDIR)/%.S | $(BUILD)
 	@echo "  AS    $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 
-# --- Cadena del programa de usuario ---
-$(BUILD)/hello.elf: user/hello.c user/syscall.h user/user.ld | $(BUILD)
-	@echo "  CC-U  user/hello.c"
-	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/hello.c -o $@
+# --- Cadena de los programas de usuario ---
+# Cada uno se compila y enlaza por separado (en 0x80000000, ver user/user.ld),
+# se pasa a binario plano y se empotra en el kernel como un array de C.
+.PRECIOUS: $(BUILD)/%.elf $(BUILD)/%.bin $(BUILD)/%_bin.c
 
-$(BUILD)/hello.bin: $(BUILD)/hello.elf
+$(BUILD)/%.elf: user/%.c user/syscall.h $(INCDIR)/ipc_abi.h user/user.ld | $(BUILD)
+	@echo "  CC-U  user/$*.c"
+	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c -o $@
+
+$(BUILD)/%.bin: $(BUILD)/%.elf
 	@$(OBJCOPY) -O binary $< $@
 
-$(BUILD)/hello_bin.c: $(BUILD)/hello.bin tools/bin2c.py
+$(BUILD)/%_bin.c: $(BUILD)/%.bin tools/bin2c.py
 	@echo "  BIN2C $@"
-	@python3 tools/bin2c.py $< $@ user_hello
+	@python3 tools/bin2c.py $< $@ user_$*
 
-$(BUILD)/hello_bin.o: $(BUILD)/hello_bin.c
+$(BUILD)/%_bin.o: $(BUILD)/%_bin.c
 	@$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel8.elf: $(OBJS) linker.ld

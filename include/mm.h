@@ -66,6 +66,7 @@
  * primeras entradas L1 (0-2 GB) las ocupa el kernel, compartidas por todos
  * los espacios. El split TTBR0/TTBR1 liberaria el rango bajo.            */
 #define USER_BASE        0x80000000UL      /* codigo                       */
+#define USER_MMIO_BASE   0x90000000UL      /* MMIO concedido a un driver   */
 #define USER_STACK_TOP   0x80200000UL      /* pila (crece hacia abajo)     */
 #define USER_LIMIT       0xC0000000UL      /* nada de usuario por encima   */
 
@@ -89,4 +90,5 @@ uint64_t *vmm_create_pgd(void);       /* tabla nueva, con el kernel dentro   */
 void      vmm_destroy_pgd(uint64_t *pgd);
 int       vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags);
 void      vmm_switch_to(uint64_t *pgd);   /* cambia TTBR0                    */
-uint64_t  vmm_translate_user(uint64_t va);/* traduce como lo veria EL0       */
+uint64_t  vmm_translate_user(uint64_t va);      /* ¿puede EL0 LEER aqui?     */
+uint64_t  vmm_translate_user_w(uint64_t va);    /* ¿puede EL0 ESCRIBIR aqui? */

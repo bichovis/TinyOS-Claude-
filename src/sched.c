@@ -16,6 +16,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "exception.h"
+#include "ipc.h"
 
 /* Definidos en switch.S */
 void cpu_switch_to(struct task *prev, struct task *next);
@@ -181,6 +182,10 @@ void task_exit(void)
 {
     uint64_t flags = irq_save();
     current->state = TASK_ZOMBIE;
+    /* Si era un servidor, sus puertos mueren con el. Hay que despertar a
+     * quien estuviera esperando o se quedaria bloqueado para siempre
+     * esperando a alguien que ya no existe. */
+    ipc_release_ports(current->pid);
     irq_restore(flags);
 
     schedule();
@@ -217,7 +222,8 @@ static void kcopy(void *dst, const void *src, uint64_t n)
  * nos deposite en EL0. Para la CPU es indistinguible de volver de una
  * interrupcion que hubiera ocurrido en el primer instante del proceso.
  */
-int task_create_user(const char *name, const uint8_t *image, uint64_t size)
+int task_create_user(const char *name, const uint8_t *image, uint64_t size,
+                     uint64_t mmio_pa)
 {
     uint64_t flags = irq_save();
     struct task *t = 0;
@@ -245,6 +251,17 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size)
     uint64_t ustack = pmm_alloc();
     if (!ustack) { irq_restore(flags); return -1; }
     vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA);
+
+    /* --- MMIO concedido: asi un driver puede vivir en EL0 ---------------
+     * Le mapeamos la pagina de registros del periferico en su espacio, como
+     * memoria Device y accesible desde EL0. A partir de ahi el driver habla
+     * con el hardware sin pasar por el kernel ni una sola vez. */
+    t->mmio_va = 0;
+    if (mmio_pa) {
+        vmm_map_in(pgd, USER_MMIO_BASE, mmio_pa & ~(PAGE_SIZE - 1),
+                   MM_DEVICE | PTE_AP_RW_ALL | PTE_nG);
+        t->mmio_va = USER_MMIO_BASE | (mmio_pa & (PAGE_SIZE - 1));
+    }
 
     /* --- Pila de kernel: donde se guardara su contexto en cada syscall --- */
     uint64_t kstack = pmm_alloc();
