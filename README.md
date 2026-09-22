@@ -37,8 +37,9 @@ GPIO15/RXD (pin 10) a 115200 8N1.
 | 4    | MMU, paginación, gestor de memoria física   | hecho  |
 | 5    | Hilos y planificador                        | hecho  |
 | 6    | Sincronización: colas de espera, mutex, canales | hecho |
-| 7    | Kernel en alto (TTBR1), EL0, syscalls       | —      |
-| 8    | Drivers en espacio de usuario               | —      |
+| 7    | Procesos en EL0 y llamadas al sistema       | hecho  |
+| 8    | Kernel en alto (TTBR1) y ASIDs              | —      |
+| 9    | Drivers en espacio de usuario               | —      |
 
 ## Estructura
 
@@ -49,6 +50,9 @@ GPIO15/RXD (pin 10) a 115200 8N1.
     linker.ld    mapa de memoria (carga en 0x80000)
     sched.c      hilos del kernel y planificador round-robin
     sync.c       colas de espera, mutex, semaforos y canales de mensajes
+    syscall.c    despacho de las llamadas al sistema desde EL0
+    user/        programa de usuario: se compila aparte y se empotra
+    tools/       bin2c.py, convierte el binario de usuario en un array C
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
     vmm.c        tablas de traduccion de 3 niveles y encendido de la MMU
@@ -56,3 +60,15 @@ GPIO15/RXD (pin 10) a 115200 8N1.
     timer.c      temporizador generico de ARM: tick de 100 Hz
     uart.c       driver PL011: salida por polling, entrada por interrupcion
     kernel.c     kernel_main
+
+## Limitaciones conocidas
+
+- Los procesos viven a partir de 2 GB porque el kernel ocupa las dos primeras
+  entradas L1 de cada espacio, compartidas. El split TTBR0/TTBR1 (paso 8)
+  liberaria el rango bajo y separaria del todo los dos mundos.
+- Sin ASIDs: cada cambio de espacio de direcciones invalida la TLB entera.
+- El cargador de procesos mapea toda la imagen como codigo de solo lectura,
+  asi que un programa de usuario no puede tener variables globales
+  escribibles; solo pila.
+- Un proceso que muere queda zombi y no se liberan ni su pgd ni sus paginas:
+  falta un recolector.

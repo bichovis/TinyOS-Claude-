@@ -15,10 +15,12 @@
 #include "irq.h"
 #include "timer.h"
 #include "uart.h"
+#include "exception.h"
 
 /* Definidos en switch.S */
 void cpu_switch_to(struct task *prev, struct task *next);
 void ret_from_fork(void);
+void ret_to_user(void);
 
 /* switch.S accede al contexto con offsets desde el principio del struct */
 _Static_assert(__builtin_offsetof(struct task, ctx) == 0, "ctx debe ir primero");
@@ -118,6 +120,12 @@ void schedule(void)
         current       = next;
         switches++;
 
+        /* Cambiar de espacio de direcciones. Las tareas de kernel vuelven
+         * a la tabla del kernel: asi ninguna sigue corriendo sobre la de un
+         * proceso que podria morir. vmm_switch_to() no hace nada si ya es
+         * la activa, que es el caso habitual entre hilos de kernel. */
+        vmm_switch_to(next->pgd ? next->pgd : vmm_kernel_pgd());
+
         cpu_switch_to(prev, next);
         /* --- Cuando la ejecucion vuelve a esta linea, han podido pasar
          * horas y haber corrido veinte hilos. Estamos otra vez en 'prev',
@@ -187,6 +195,87 @@ static int kstrlen(const char *s)
     return n;
 }
 
+static void kzero(void *dst, uint64_t n)
+{
+    uint8_t *d = dst;
+    while (n--) *d++ = 0;
+}
+
+static void kcopy(void *dst, const void *src, uint64_t n)
+{
+    uint8_t *d = dst;
+    const uint8_t *s = src;
+    while (n--) *d++ = *s++;
+}
+
+/* Crea un PROCESO: hilo de kernel + espacio de direcciones propio + una
+ * imagen de codigo cargada en el, y arranca en EL0.
+ *
+ * La diferencia con task_create() esta al final: en vez de aterrizar en
+ * ret_from_fork y llamar a una funcion del kernel, fabricamos a mano el
+ * trap_frame que kernel_exit espera encontrar, y dejamos que su 'eret'
+ * nos deposite en EL0. Para la CPU es indistinguible de volver de una
+ * interrupcion que hubiera ocurrido en el primer instante del proceso.
+ */
+int task_create_user(const char *name, const uint8_t *image, uint64_t size)
+{
+    uint64_t flags = irq_save();
+    struct task *t = 0;
+
+    for (int i = 1; i < MAX_TASKS; i++)
+        if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
+    if (!t) { irq_restore(flags); return -1; }
+
+    uint64_t *pgd = vmm_create_pgd();
+    if (!pgd) { irq_restore(flags); return -1; }
+
+    /* --- Codigo: tantas paginas como haga falta, copiadas de la imagen --- */
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        uint64_t page = pmm_alloc();
+        if (!page) { irq_restore(flags); return -1; }
+
+        uint64_t chunk = size - off;
+        if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
+        kcopy((void *)page, image + off, chunk);
+
+        vmm_map_in(pgd, USER_BASE + off, page, MM_USER_CODE);
+    }
+
+    /* --- Pila de usuario: una pagina justo debajo de USER_STACK_TOP --- */
+    uint64_t ustack = pmm_alloc();
+    if (!ustack) { irq_restore(flags); return -1; }
+    vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA);
+
+    /* --- Pila de kernel: donde se guardara su contexto en cada syscall --- */
+    uint64_t kstack = pmm_alloc();
+    if (!kstack) { irq_restore(flags); return -1; }
+    *(uint64_t *)kstack = STACK_MAGIC;
+
+    t->stack     = kstack;
+    t->pgd       = pgd;
+    t->name      = name;
+    t->pid       = next_pid++;
+    t->counter   = TASK_QUANTUM;
+    t->ticks_run = 0;
+
+    /* --- El trap_frame fabricado --- */
+    struct trap_frame *tf =
+        (struct trap_frame *)(kstack + PAGE_SIZE - sizeof(struct trap_frame));
+    kzero(tf, sizeof(*tf));
+    tf->elr    = USER_BASE;          /* empezar por el principio del codigo */
+    tf->spsr   = 0;                  /* M=0b0000 -> EL0t; DAIF=0 -> IRQ ON  */
+    tf->sp_el0 = USER_STACK_TOP;     /* su pila, no la nuestra              */
+
+    kzero(&t->ctx, sizeof(t->ctx));
+    t->ctx.pc = (uint64_t)ret_to_user;
+    t->ctx.sp = (uint64_t)tf;
+
+    t->state = TASK_READY;
+
+    irq_restore(flags);
+    return (int)t->pid;
+}
+
 static const char *state_name(uint64_t s)
 {
     switch (s) {
@@ -226,6 +315,7 @@ void sched_dump(void)
             int ok = (*(uint64_t *)t->stack == STACK_MAGIC);
             uart_puts(ok ? "         ok" : "         DESBORDADA");
         }
+        if (t->pgd) uart_puts("   EL0");
         uart_puts("\n");
     }
     irq_restore(flags);

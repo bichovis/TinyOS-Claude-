@@ -10,9 +10,11 @@ struct trap_frame {
     uint64_t elr;     /* offset 248 : ELR_EL1,  PC interrumpido         */
     uint64_t spsr;    /* offset 256 : SPSR_EL1, estado interrumpido     */
     uint64_t esr;     /* offset 264 : ESR_EL1,  causa de la excepcion   */
-};                    /* total: 272 bytes                               */
+    uint64_t sp_el0;  /* offset 272 : pila de EL0 (EL1 usa la suya)     */
+    uint64_t _pad;    /* offset 280 : el frame debe medir multiplo de 16 */
+};                    /* total: 288 bytes                               */
 
-_Static_assert(sizeof(struct trap_frame) == 272, "trap_frame != kernel_entry");
+_Static_assert(sizeof(struct trap_frame) == 288, "trap_frame != kernel_entry");
 
 void exception_init(void);
 void exception_dispatch(struct trap_frame *f, uint64_t index);

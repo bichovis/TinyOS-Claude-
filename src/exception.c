@@ -11,6 +11,8 @@
 #include "uart.h"
 #include "exception.h"
 #include "irq.h"
+#include "syscall.h"
+#include "sched.h"
 
 extern char vector_table[];   /* definido en vectors.S */
 
@@ -160,6 +162,15 @@ void exception_dispatch(struct trap_frame *f, uint64_t index)
         return;
     }
 
+    /* Vector 8 = excepcion sincrona desde EL0 en AArch64. Si la causa es
+     * EC=0x15 (SVC), es una llamada al sistema: el proceso ha pedido algo.
+     * Cualquier otra cosa desde EL0 es un fallo suyo, y ahi no se hace
+     * panic del sistema: se mata al proceso y el kernel sigue. */
+    if (index == 8 && ec == 0x15) {
+        syscall_dispatch(f);
+        return;
+    }
+
     /* BRK es una excepcion "de mentira": la pedimos nosotros. La informamos
      * y seguimos adelante saltando por encima de la instruccion brk.
      * Esto demuestra algo importante: el handler puede MODIFICAR el estado
@@ -171,6 +182,16 @@ void exception_dispatch(struct trap_frame *f, uint64_t index)
         uart_hex32(f->esr & 0xFFFF);
         uart_puts(" -> continuamos\n");
         f->elr += 4;              /* saltar la instruccion brk (4 bytes) */
+        return;
+    }
+
+    /* Fallo dentro de un proceso de usuario: culpa suya, no nuestra. */
+    if (index == 8 || index == 12) {
+        dump(f, index);
+        uart_puts("\n  [kernel] el proceso ");
+        uart_puts(current ? current->name : "?");
+        uart_puts(" ha violado la ley. Lo mato y sigo.\n");
+        task_exit();
         return;
     }
 

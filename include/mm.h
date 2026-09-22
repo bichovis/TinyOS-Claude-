@@ -51,6 +51,24 @@
 #define MM_DEVICE    (PTE_VALID | PTE_AF | PTE_ATTR(MT_DEVICE_nGnRE)          \
                       | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN)
 
+/* Paginas de un proceso de usuario. PTE_nG las marca "no globales": la TLB
+ * no las comparte entre espacios de direcciones distintos.
+ *   CODE: solo lectura, ejecutable en EL0 (UXN=0) pero NO en EL1 (PXN=1),
+ *         para que un puntero de funcion corrupto del kernel no pueda
+ *         acabar ejecutando codigo del proceso con privilegios.
+ *   DATA: lectura/escritura desde EL0, nunca ejecutable.                  */
+#define MM_USER_CODE (PTE_VALID | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL) \
+                      | PTE_AP_RO_ALL | PTE_PXN | PTE_nG)
+#define MM_USER_DATA (PTE_VALID | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL) \
+                      | PTE_AP_RW_ALL | PTE_PXN | PTE_UXN | PTE_nG)
+
+/* Mapa de un proceso de usuario. Vive a partir de 2 GB porque las dos
+ * primeras entradas L1 (0-2 GB) las ocupa el kernel, compartidas por todos
+ * los espacios. El split TTBR0/TTBR1 liberaria el rango bajo.            */
+#define USER_BASE        0x80000000UL      /* codigo                       */
+#define USER_STACK_TOP   0x80200000UL      /* pila (crece hacia abajo)     */
+#define USER_LIMIT       0xC0000000UL      /* nada de usuario por encima   */
+
 /* --- Gestor de memoria fisica (pmm.c) --------------------------------- */
 void     pmm_init(void);
 uint64_t pmm_alloc(void);             /* una pagina de 4 KB, 0 si no hay    */
@@ -64,3 +82,11 @@ void     vmm_init(void);              /* construye las tablas del kernel    */
 void     vmm_enable(void);            /* enciende MMU, cachés y todo        */
 int      vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags);
 uint64_t vmm_translate(uint64_t va);  /* pregunta al hardware: VA -> PA      */
+
+/* --- Espacios de direcciones por proceso ------------------------------- */
+uint64_t *vmm_kernel_pgd(void);
+uint64_t *vmm_create_pgd(void);       /* tabla nueva, con el kernel dentro   */
+void      vmm_destroy_pgd(uint64_t *pgd);
+int       vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags);
+void      vmm_switch_to(uint64_t *pgd);   /* cambia TTBR0                    */
+uint64_t  vmm_translate_user(uint64_t va);/* traduce como lo veria EL0       */

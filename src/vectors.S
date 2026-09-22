@@ -24,7 +24,7 @@
  * con 'struct trap_frame' de include/exception.h.
  */
 .macro kernel_entry
-    sub     sp,  sp,  #272
+    sub     sp,  sp,  #288
     stp     x0,  x1,  [sp, #16 * 0]
     stp     x2,  x3,  [sp, #16 * 1]
     stp     x4,  x5,  [sp, #16 * 2]
@@ -41,16 +41,20 @@
     stp     x26, x27, [sp, #16 * 13]
     stp     x28, x29, [sp, #16 * 14]
 
-    // Ya tenemos x21..x23 a salvo: podemos usarlos como temporales.
+    // Ya tenemos x21..x24 a salvo: podemos usarlos como temporales.
     mrs     x21, elr_el1             // direccion que se estaba ejecutando
     mrs     x22, spsr_el1            // estado del procesador al interrumpirse
     mrs     x23, esr_el1             // "Exception Syndrome": por que ha pasado
+    mrs     x24, sp_el0              // pila del proceso de usuario
     stp     x30, x21, [sp, #16 * 15]
     stp     x22, x23, [sp, #16 * 16]
+    str     x24,      [sp, #16 * 17]
 .endm
 
 /* --- Restaurar el contexto y volver ------------------------------------ */
 .macro kernel_exit
+    ldr     x24,      [sp, #16 * 17]
+    msr     sp_el0,   x24            // devolverle su pila al proceso
     ldp     x22, x23, [sp, #16 * 16]
     ldp     x30, x21, [sp, #16 * 15]
     msr     elr_el1,  x21            // permite al handler C modificar el PC
@@ -71,7 +75,7 @@
     ldp     x24, x25, [sp, #16 * 12]
     ldp     x26, x27, [sp, #16 * 13]
     ldp     x28, x29, [sp, #16 * 14]
-    add     sp,  sp,  #272
+    add     sp,  sp,  #288
     eret                             // vuelve a ELR_EL1 con el estado SPSR_EL1
 .endm
 
@@ -140,3 +144,17 @@ el0_32_sync:    handle_exception 12
 el0_32_irq:     handle_exception 13
 el0_32_fiq:     handle_exception 14
 el0_32_serror:  handle_exception 15
+
+
+/* Primera entrada a EL0 de un proceso recien creado.
+ *
+ * task_create_user() deja un trap_frame fabricado a mano en el tope de la
+ * pila de kernel del proceso, con ELR = punto de entrada, SPSR = EL0t y
+ * SP_EL0 = pila de usuario. Aqui solo hay que desapilarlo: el 'eret' de
+ * kernel_exit hace el resto. Es el mismo mecanismo con el que bajamos de
+ * EL3 a EL1 en el arranque, y el mismo por el que se vuelve de una syscall:
+ * para la CPU, entrar en un proceso es "retornar" a el.
+ */
+.global ret_to_user
+ret_to_user:
+    kernel_exit

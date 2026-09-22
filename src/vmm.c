@@ -106,9 +106,9 @@ static uint64_t *next_table(uint64_t *table, uint64_t index)
     return (uint64_t *)(table[index] & PTE_ADDR_MASK);
 }
 
-int vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags)
+int vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags)
 {
-    uint64_t *l2 = next_table(l1_table, L1_INDEX(va));
+    uint64_t *l2 = next_table(pgd, L1_INDEX(va));
     if (!l2) return -1;
     uint64_t *l3 = next_table(l2, L2_INDEX(va));
     if (!l3) return -1;
@@ -127,6 +127,85 @@ int vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags)
         "isb\n"
         :: "r"(va >> PAGE_SHIFT) : "memory");
     return 0;
+}
+
+int vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags)
+{
+    return vmm_map_in(l1_table, va, pa, flags);
+}
+
+uint64_t *vmm_kernel_pgd(void) { return l1_table; }
+
+/* Tabla de traduccion nueva para un proceso.
+ *
+ * Las dos primeras entradas (0-1 GB y 1-2 GB) se copian de la del kernel:
+ * son dos punteros de 8 bytes, no memoria duplicada, y apuntan a las mismas
+ * tablas L2. Gracias a eso el kernel sigue mapeado cuando entra una
+ * excepcion con TTBR0 apuntando al proceso. El usuario no puede tocarlo:
+ * esas paginas llevan AP=RW_EL1, asi que desde EL0 no existen. */
+uint64_t *vmm_create_pgd(void)
+{
+    uint64_t pa = pmm_alloc();
+    if (!pa) return 0;
+
+    uint64_t *pgd = (uint64_t *)pa;
+    pgd[0] = l1_table[0];
+    pgd[1] = l1_table[1];
+    return pgd;
+}
+
+void vmm_destroy_pgd(uint64_t *pgd)
+{
+    if (!pgd) return;
+
+    /* Liberar solo lo propio del proceso: de la entrada 2 en adelante.
+     * Las entradas 0 y 1 son del kernel y las comparte todo el mundo. */
+    for (uint64_t i = 2; i < 512; i++) {
+        if (!(pgd[i] & PTE_VALID) || !(pgd[i] & PTE_TABLE)) continue;
+        uint64_t *l2 = (uint64_t *)(pgd[i] & PTE_ADDR_MASK);
+
+        for (uint64_t j = 0; j < 512; j++) {
+            if (!(l2[j] & PTE_VALID) || !(l2[j] & PTE_TABLE)) continue;
+            uint64_t *l3 = (uint64_t *)(l2[j] & PTE_ADDR_MASK);
+
+            for (uint64_t k = 0; k < 512; k++)
+                if (l3[k] & PTE_VALID)
+                    pmm_free(l3[k] & PTE_ADDR_MASK);   /* la pagina de datos */
+
+            pmm_free((uint64_t)l3);
+        }
+        pmm_free((uint64_t)l2);
+    }
+    pmm_free((uint64_t)pgd);
+}
+
+void vmm_switch_to(uint64_t *pgd)
+{
+    __asm__ volatile(
+        "msr ttbr0_el1, %0\n"
+        "isb\n"
+        /* Sin ASIDs hay que tirar la TLB entera en cada cambio de proceso.
+         * Es correcto pero caro; los ASID permiten conservar las entradas
+         * de cada espacio y es una de las mejoras evidentes de este codigo. */
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        :: "r"((uint64_t)pgd) : "memory");
+}
+
+/* Traduce una direccion COMO LA VERIA EL0. Es la forma correcta de validar
+ * un puntero que viene de un proceso: si 'at s1e0r' falla, ese proceso no
+ * tiene derecho a leer ahi, por muy valida que sea la direccion para el
+ * kernel. Sin esta comprobacion, un proceso pasaria un puntero al kernel y
+ * le haria leer memoria que no le corresponde. */
+uint64_t vmm_translate_user(uint64_t va)
+{
+    uint64_t par;
+    __asm__ volatile("at s1e0r, %1\n isb\n mrs %0, par_el1"
+                     : "=r"(par) : "r"(va) : "memory");
+    if (par & 1)
+        return 0;
+    return (par & PTE_ADDR_MASK) | (va & (PAGE_SIZE - 1));
 }
 
 uint64_t vmm_translate(uint64_t va)

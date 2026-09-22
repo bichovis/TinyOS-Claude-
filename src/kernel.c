@@ -10,6 +10,11 @@
 
 #define TICK_HZ      100
 
+/* La imagen del proceso de usuario, empotrada por tools/bin2c.py. Cuando
+ * haya un sistema de ficheros, esto sera una carga de verdad desde disco. */
+extern const uint8_t  user_hello[];
+extern const uint64_t user_hello_size;
+
 /* Ventana virtual para los experimentos: 2 GB, donde no hay nada fisico.
  * Que funcione es justamente la demostracion de que la traduccion existe. */
 #define TEST_VA_A    0x80000000UL
@@ -144,6 +149,9 @@ static void demo_readonly(void)
  * duerme y deja la CPU libre, y las interrupciones siguen entrando. */
 static struct mutex console;
 
+/* syscall.c tambien imprime, y tiene que compartir el mismo mutex. */
+struct mutex *console_mutex(void) { return &console; }
+
 static void say(const char *who, const char *what, uint64_t n)
 {
     mutex_lock(&console);
@@ -180,7 +188,7 @@ static void thread_cruncher(void *arg)
             sum += (uint64_t)i;
         rounds++;
         __asm__ volatile("" :: "r"(sum));   /* que el bucle no se optimice */
-        if (rounds % 400 == 0)
+        if (rounds % 2000 == 0)
             say(current->name, "vueltas ", rounds);
     }
 }
@@ -314,6 +322,7 @@ static void menu(void)
     uart_puts("  c - contador compartido: intentos vs valor real\n");
     uart_puts("  m - activar/desactivar el mutex del contador\n");
     uart_puts("  k - estado del canal productor/consumidor\n");
+    uart_puts("  u - lanzar un proceso de usuario en EL0\n");
     uart_puts("  y - ceder la CPU (yield) desde la tarea idle\n");
     uart_puts("  p - estado de la memoria fisica\n");
     uart_puts("  v - dos direcciones virtuales, una pagina fisica\n");
@@ -351,6 +360,20 @@ static void command(char c)
     case 'k':
         chan_stats();
         break;
+
+    case 'u': {
+        uart_puts("\n  [kernel] cargando ");
+        uart_dec(user_hello_size);
+        uart_puts(" bytes en un espacio de direcciones nuevo...\n");
+        int pid = task_create_user("hello", user_hello, user_hello_size);
+        if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
+        else {
+            uart_puts("  [kernel] proceso creado, pid ");
+            uart_dec((uint64_t)pid);
+            uart_puts("\n");
+        }
+        break;
+    }
 
     case 'y':
         uart_puts("\n  idle cede la CPU...\n");
