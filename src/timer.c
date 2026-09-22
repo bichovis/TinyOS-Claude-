@@ -80,3 +80,10 @@ void delay_ms(uint32_t ms)
     while (read_cntpct() < target)
         ;
 }
+
+uint64_t timer_now(void) { return read_cntpct(); }
+
+uint64_t timer_us(uint64_t cycles)
+{
+    return cycles * 1000000UL / counter_hz;
+}

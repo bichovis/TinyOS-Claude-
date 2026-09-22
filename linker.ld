@@ -34,6 +34,8 @@ SECTIONS
     . += 0x4000;
     __stack_top = .;
 
+    /* Alineado a 4 KB: a partir de aqui empieza la RAM que reparte el PMM */
+    . = ALIGN(4096);
     __kernel_end = .;
 
     /DISCARD/ : { *(.comment) *(.note.*) }
