@@ -103,3 +103,5 @@ static void uart_hex(uint64_t value, int nibbles)
 
 void uart_hex32(uint32_t v) { uart_hex(v, 8);  }
 void uart_hex64(uint64_t v) { uart_hex(v, 16); }
+
+void uart_hex8(uint8_t v) { uart_hex(v, 2); }

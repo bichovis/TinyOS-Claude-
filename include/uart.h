@@ -8,3 +8,4 @@ char uart_getc(void);
 void uart_puts(const char *s);
 void uart_hex32(uint32_t v);
 void uart_hex64(uint64_t v);
+void uart_hex8(uint8_t v);

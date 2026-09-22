@@ -32,7 +32,7 @@ GPIO15/RXD (pin 10) a 115200 8N1.
 | Paso | Contenido                                   | Estado |
 |------|---------------------------------------------|--------|
 | 1    | Arranque, stack, .bss, consola serie PL011  | hecho  |
-| 2    | Bajada a EL1, vectores de excepción         | —      |
+| 2    | Bajada a EL1, vectores de excepción         | hecho  |
 | 3    | Temporizador e interrupciones               | —      |
 | 4    | MMU, paginación, gestor de memoria física   | —      |
 | 5    | Hilos y planificador                        | —      |
@@ -41,7 +41,10 @@ GPIO15/RXD (pin 10) a 115200 8N1.
 
 ## Estructura
 
-    boot.S      punto de entrada, aparca cores 1-3, stack, .bss -> C
-    linker.ld   mapa de memoria (carga en 0x80000)
-    uart.c      driver PL011 por polling
-    kernel.c    kernel_main
+    boot.S       punto de entrada: aparca cores 1-3, baja EL3/EL2 -> EL1,
+                 stack, .bss, y salta a C
+    vectors.S    tabla de 16 vectores de excepcion + guardado de contexto
+    exception.c  decodifica ESR_EL1 y vuelca el estado; panic()
+    linker.ld    mapa de memoria (carga en 0x80000)
+    uart.c       driver PL011 por polling
+    kernel.c     kernel_main
