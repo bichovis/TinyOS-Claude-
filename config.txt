@@ -1,0 +1,10 @@
+# config.txt - copiar a la particion FAT de la SD junto a kernel8.img
+#
+# arm_64bit=1      -> arrancar la CPU en AArch64 y buscar kernel8.img
+# dtoverlay=disable-bt -> libera la PL011 (UART0) del modulo Bluetooth
+#                         y la deja en los pines GPIO 14/15 del header
+# enable_uart=1    -> mantiene fijo el reloj de la UART
+arm_64bit=1
+enable_uart=1
+dtoverlay=disable-bt
+kernel=kernel8.img
