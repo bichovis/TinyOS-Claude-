@@ -7,10 +7,15 @@
 #define BLOCK_2MB        (2UL * 1024 * 1024)
 
 /* Mapa fisico de la Raspberry Pi 3B:
- *   0x00000000 - 0x3EFFFFFF   RAM vista por la CPU ARM
+ *   0x00000000 - ram_top      RAM que la GPU le ha dejado a la CPU
+ *   ram_top    - 0x3EFFFFFF   RAM reservada para la GPU: NO tocar
  *   0x3F000000 - 0x3FFFFFFF   perifericos (UART, GPIO, controlador IRQ...)
- *   0x40000000 - 0x400000FF   "ARM local peripherals" (timers, mailboxes)  */
-#define RAM_TOP          0x3F000000UL
+ *   0x40000000 - 0x400000FF   "ARM local peripherals" (timers, mailboxes)
+ *
+ * RAM_MAX es el tope absoluto (donde empiezan los perifericos); el limite
+ * de verdad lo dice la GPU por el buzon y puede ser bastante menor. */
+#define RAM_MAX          0x3F000000UL
+#define RAM_TOP          RAM_MAX       /* solo para el mapeo de la MMU     */
 #define PERIPH_START     0x3F000000UL
 #define PERIPH_END       0x40200000UL
 
@@ -71,7 +76,7 @@
 #define USER_LIMIT       0xC0000000UL      /* nada de usuario por encima   */
 
 /* --- Gestor de memoria fisica (pmm.c) --------------------------------- */
-void     pmm_init(void);
+void     pmm_init(uint64_t ram_limit);
 uint64_t pmm_alloc(void);             /* una pagina de 4 KB, 0 si no hay    */
 void     pmm_free(uint64_t pa);
 uint64_t pmm_total_pages(void);

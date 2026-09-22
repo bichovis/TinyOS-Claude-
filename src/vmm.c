@@ -236,10 +236,18 @@ uint64_t vmm_translate(uint64_t va)
     return (par & PTE_ADDR_MASK) | (va & (PAGE_SIZE - 1));
 }
 
+void dcache_invalidate_all(void);   /* cache.S */
+
 void vmm_enable(void)
 {
     uint64_t flags = irq_save();
     uint64_t sctlr;
+
+    /* Tirar lo que la cache de datos pudiera tener de antes del arranque.
+     * Ahora mismo esta apagada, asi que todo lo que hemos escrito (las
+     * tablas incluidas) esta en RAM de verdad y no perdemos nada. En cuanto
+     * pongamos SCTLR.C, cualquier linea residual pasaria a ser valida. */
+    dcache_invalidate_all();
 
     __asm__ volatile(
         /* 1. Publicar la configuracion. El orden importa: MAIR y TCR tienen

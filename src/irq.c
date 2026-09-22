@@ -25,6 +25,9 @@
 
 /* --- [2] ARM local peripherals ---------------------------------------- */
 #define LOCAL_BASE            0x40000000UL
+#define GPU_INT_ROUTING       (LOCAL_BASE + 0x0C)  /* a que nucleo van las */
+                                                   /* IRQ del controlador  */
+                                                   /* de perifericos       */
 #define CORE0_TIMER_IRQCNTL   (LOCAL_BASE + 0x40)  /* que timers avisan    */
 #define CORE0_IRQ_SOURCE      (LOCAL_BASE + 0x60)  /* quien ha interrumpido*/
 
@@ -52,6 +55,13 @@ void irq_init(void)
     /* Apagar todo lo que el firmware pudiera dejar encendido. */
     mmio_write(DISABLE_IRQS_1, 0xFFFFFFFF);
     mmio_write(DISABLE_IRQS_2, 0xFFFFFFFF);
+
+    /* Mandar las interrupciones de perifericos al nucleo 0. El valor por
+     * defecto ya es ese, pero en hardware real depende de lo que haya
+     * dejado el firmware y no cuesta nada asegurarlo.
+     *   bits [1:0] = nucleo que recibe las IRQ
+     *   bits [3:2] = nucleo que recibe las FIQ                            */
+    mmio_write(GPU_INT_ROUTING, 0);
 
     /* [2] Que el temporizador fisico no-seguro del nucleo 0 genere IRQ.
      *     Estamos en non-secure EL1 (lo fijamos con SCR_EL3.NS), de ahi

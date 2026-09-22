@@ -6,6 +6,7 @@
 #include "timer.h"
 #include "mm.h"
 #include "mmio.h"
+#include "mbox.h"
 #include "sched.h"
 #include "sync.h"
 #include "ipc.h"
@@ -479,7 +480,7 @@ void kernel_main(uint64_t dtb_ptr)
     uart_puts("\n");
     uart_puts("+--------------------------------------+\n");
     uart_puts("|  TinyOS  -  microkernel RPi 3B       |\n");
-    uart_puts("|  paso 4: MMU y memoria virtual       |\n");
+    uart_puts("|  microkernel ARM64 bare metal        |\n");
     uart_puts("+--------------------------------------+\n\n");
 
     uart_puts("  Exception Level : EL");
@@ -492,7 +493,23 @@ void kernel_main(uint64_t dtb_ptr)
     uart_enable_rx_irq();
     irq_enable();
 
-    pmm_init();
+    /* Preguntar a la GPU cuanta RAM nos ha dejado. Tiene que hacerse ANTES
+     * de encender la MMU: la GPU lee el buffer de la RAM y no ve nuestra
+     * cache. Si no contesta (o estamos en un emulador que no lo implementa)
+     * nos quedamos con el tope teorico. */
+    uint64_t ram_base = 0, ram_size = 0;
+    if (mbox_arm_memory(&ram_base, &ram_size)) {
+        uart_puts("  RAM de la CPU   : ");
+        uart_dec(ram_size / 1024 / 1024);
+        uart_puts(" MB  (base 0x");
+        uart_hex64(ram_base);
+        uart_puts(")\n");
+    } else {
+        uart_puts("  RAM de la CPU   : la GPU no contesta, supongo el maximo\n");
+        ram_size = RAM_MAX;
+    }
+
+    pmm_init(ram_base + ram_size);
     ipc_init();
     mem_stats();
 

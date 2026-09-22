@@ -41,7 +41,7 @@ OBJS    := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(wildcard $(SRCDIR)/*.c)) \
            $(patsubst %,$(BUILD)/%_bin.o,$(UPROGS))
 DEPS    := $(OBJS:.o=.d)
 
-.PHONY: all clean run debug dump
+.PHONY: all clean run debug dump sdcard sd firmware
 all: $(BUILD)/kernel8.img
 
 $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
@@ -94,6 +94,30 @@ debug: $(BUILD)/kernel8.elf
 
 dump: $(BUILD)/kernel8.elf
 	@$(OBJDUMP) -d $<
+
+# ====================== Arranque en hardware real ======================
+SD ?= /Volumes/BOOT
+
+# Descarga el firmware propietario de Broadcom (solo la primera vez)
+firmware:
+	@sh tools/fetch-firmware.sh $(BUILD)/sdcard
+
+# Prepara en build/sdcard todo lo que hay que copiar a la particion FAT32
+sdcard: $(BUILD)/kernel8.img firmware
+	@cp config.txt $(BUILD)/sdcard/
+	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
+	@echo
+	@echo "Listo en $(BUILD)/sdcard:"
+	@ls -l $(BUILD)/sdcard
+	@echo
+	@echo "Copialo a una SD con una particion FAT32, o usa:  make sd SD=/Volumes/TUSD"
+
+# Copia directamente a una SD ya montada
+sd: sdcard
+	@test -d "$(SD)" || { echo "No existe $(SD). Usa: make sd SD=/Volumes/TUSD"; exit 1; }
+	@cp $(BUILD)/sdcard/* "$(SD)/"
+	@sync
+	@echo "Copiado a $(SD). Expulsala y arranca la Pi."
 
 clean:
 	@rm -rf $(BUILD)

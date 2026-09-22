@@ -13,7 +13,9 @@
 
 extern char __kernel_end[];          /* lo define linker.ld */
 
-#define MAX_PAGES   (RAM_TOP / PAGE_SIZE)          /* 258048 paginas */
+/* El bitmap se dimensiona para el caso maximo; cuantas paginas se reparten
+ * de verdad lo decide el limite que nos da la GPU en el arranque. */
+#define MAX_PAGES   (RAM_MAX / PAGE_SIZE)          /* 258048 paginas */
 #define BITMAP_WORDS (MAX_PAGES / 64)
 
 static uint64_t bitmap[BITMAP_WORDS];
@@ -25,8 +27,12 @@ static inline void mark_used(uint64_t pfn) { bitmap[pfn / 64] |=  (1UL << (pfn %
 static inline void mark_free(uint64_t pfn) { bitmap[pfn / 64] &= ~(1UL << (pfn % 64)); }
 static inline int  is_used(uint64_t pfn)   { return (bitmap[pfn / 64] >> (pfn % 64)) & 1; }
 
-void pmm_init(void)
+void pmm_init(uint64_t ram_limit)
 {
+    if (ram_limit == 0 || ram_limit > RAM_MAX)
+        ram_limit = RAM_MAX;
+    uint64_t last_page = ram_limit / PAGE_SIZE;
+
     /* Todo ocupado de entrada; luego liberamos lo que de verdad es nuestro. */
     for (uint64_t i = 0; i < BITMAP_WORDS; i++)
         bitmap[i] = ~0UL;
@@ -38,7 +44,7 @@ void pmm_init(void)
     first_page = ((uint64_t)__kernel_end) / PAGE_SIZE;
 
     total = 0;
-    for (uint64_t pfn = first_page; pfn < MAX_PAGES; pfn++) {
+    for (uint64_t pfn = first_page; pfn < last_page; pfn++) {
         mark_free(pfn);
         total++;
     }
