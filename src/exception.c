@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "uart.h"
 #include "exception.h"
+#include "irq.h"
 
 extern char vector_table[];   /* definido en vectors.S */
 
@@ -150,6 +151,14 @@ void panic(const char *msg)
 void exception_dispatch(struct trap_frame *f, uint64_t index)
 {
     uint32_t ec = (uint32_t)(f->esr >> 26) & 0x3F;
+
+    /* Los dos bits bajos del indice dicen el TIPO dentro de cada grupo de la
+     * tabla: 0=Synchronous, 1=IRQ, 2=FIQ, 3=SError. Asi el mismo codigo
+     * atiende las IRQ vengan de EL1 (vector 5) o de EL0 (vector 9). */
+    if ((index & 3) == 1) {
+        irq_handle();
+        return;
+    }
 
     /* BRK es una excepcion "de mentira": la pedimos nosotros. La informamos
      * y seguimos adelante saltando por encima de la instruccion brk.

@@ -33,7 +33,7 @@ GPIO15/RXD (pin 10) a 115200 8N1.
 |------|---------------------------------------------|--------|
 | 1    | Arranque, stack, .bss, consola serie PL011  | hecho  |
 | 2    | Bajada a EL1, vectores de excepción         | hecho  |
-| 3    | Temporizador e interrupciones               | —      |
+| 3    | Temporizador e interrupciones               | hecho  |
 | 4    | MMU, paginación, gestor de memoria física   | —      |
 | 5    | Hilos y planificador                        | —      |
 | 6    | Espacios de usuario, syscalls, IPC          | —      |
@@ -46,5 +46,7 @@ GPIO15/RXD (pin 10) a 115200 8N1.
     vectors.S    tabla de 16 vectores de excepcion + guardado de contexto
     exception.c  decodifica ESR_EL1 y vuelca el estado; panic()
     linker.ld    mapa de memoria (carga en 0x80000)
-    uart.c       driver PL011 por polling
+    irq.c        los dos controladores de interrupcion del BCM2837
+    timer.c      temporizador generico de ARM: tick de 100 Hz
+    uart.c       driver PL011: salida por polling, entrada por interrupcion
     kernel.c     kernel_main

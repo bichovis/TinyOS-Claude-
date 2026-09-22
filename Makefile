@@ -24,7 +24,7 @@ CFLAGS  := -Wall -Wextra -Werror -O2 -std=c11 \
            -I$(INCDIR) -MMD -MP
 
 LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
-           -Wl,--gc-sections -Wl,-Map,$(BUILD)/kernel8.map
+           -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 CSRCS   := $(wildcard $(SRCDIR)/*.c)
 ASRCS   := $(wildcard $(SRCDIR)/*.S)
