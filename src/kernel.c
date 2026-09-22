@@ -6,6 +6,7 @@
 #include "timer.h"
 #include "mm.h"
 #include "sched.h"
+#include "sync.h"
 
 #define TICK_HZ      100
 
@@ -136,13 +137,16 @@ static void demo_readonly(void)
 
 /* La UART es un recurso compartido y uart_puts no es atomica: si el timer
  * desaloja a un hilo a mitad de una frase, la siguiente se mete por medio.
- * Tapar las IRQ mientras se imprime lo arregla en un uniprocesador. No es
- * gratis: a 115200 baudios cada caracter cuesta ~87 us, asi que una linea
- * larga puede costar varios ticks. Un kernel serio pondria las lineas en
- * una cola y las sacaria por interrupcion. */
+ *
+ * Antes esto se resolvia con irq_save(): tapar el hardware entero del
+ * sistema para que dos hilos no se pisaran una cadena de texto. Ahora se
+ * hace con un mutex, que es lo proporcionado: el hilo que llega segundo se
+ * duerme y deja la CPU libre, y las interrupciones siguen entrando. */
+static struct mutex console;
+
 static void say(const char *who, const char *what, uint64_t n)
 {
-    uint64_t f = irq_save();
+    mutex_lock(&console);
     uart_puts("    [");
     uart_puts(who);
     uart_puts("] ");
@@ -151,7 +155,7 @@ static void say(const char *who, const char *what, uint64_t n)
     uart_puts("   (tick ");
     uart_dec(timer_ticks());
     uart_puts(")\n");
-    irq_restore(f);
+    mutex_unlock(&console);
 }
 
 /* Hilo que duerme: la mayor parte del tiempo no consume CPU. */
@@ -198,20 +202,118 @@ static void command(char c);
 static void thread_shell(void *arg)
 {
     (void)arg;
+    /* Ya no hay polling: el hilo se bloquea en la cola de espera de la UART
+     * y la interrupcion de recepcion lo despierta. Latencia minima y cero
+     * CPU consumida mientras no escribes. */
+    for (;;)
+        command(uart_getc_blocking());
+}
+
+/* ---------------- Demostracion 1: la carrera de datos ----------------
+ * Dos hilos incrementan el mismo contador. La operacion "leer, sumar,
+ * escribir" NO es atomica: si el timer desaloja al hilo entre la lectura y
+ * la escritura, el otro lee el mismo valor y uno de los dos incrementos se
+ * evapora. El bucle de en medio ensancha esa ventana para que se vea.
+ */
+static volatile uint64_t shared_counter;   /* lo que vale de verdad     */
+static volatile uint64_t attempted;        /* lo que deberia valer      */
+static struct mutex      counter_mutex;
+static volatile int      use_mutex = 1;
+
+static void thread_incrementer(void *arg)
+{
+    (void)arg;
     for (;;) {
-        char c;
-        while (uart_read(&c))
-            command(c);
-        /* Dormir 10 ms en vez de dar vueltas preguntando. Lo correcto seria
-         * bloquearse hasta que llegue un byte; eso pide colas de espera. */
+        /* Sin el mutex, los dos hilos leen el mismo valor y escriben el
+         * mismo resultado: dos incrementos, uno solo cuenta. */
+        if (use_mutex) mutex_lock(&counter_mutex);
+
+        uint64_t v = shared_counter;
+
+        /* Ceder aqui fuerza el peor caso en cada vuelta. Esperar a que el
+         * timer caiga por azar justo entre la lectura y la escritura
+         * tambien funciona, pero es un suceso de 1 entre mil: la carrera
+         * apareceria a las horas, que es exactamente lo que hace a estos
+         * bugs tan dificiles de encontrar. */
+        task_yield();
+
+        shared_counter = v + 1;
+
+        if (use_mutex) mutex_unlock(&counter_mutex);
+
+        /* 'attempted' tambien es una seccion critica, pero esta la
+         * protegemos siempre: es nuestra vara de medir. */
+        uint64_t f = irq_save();
+        attempted++;
+        irq_restore(f);
+
         task_sleep(1);
     }
+}
+
+/* ------------- Demostracion 2: productor / consumidor ----------------
+ * Un canal de 8 huecos. El productor va mas rapido que el consumidor, asi
+ * que se llena y el productor acaba bloqueado esperando sitio: control de
+ * flujo gratis, sin que ninguno de los dos sepa nada del otro.
+ */
+static struct channel pipe_chan;
+
+static void thread_producer(void *arg)
+{
+    (void)arg;
+    for (uint64_t n = 1; ; n++) {
+        chan_send(&pipe_chan, n * n);
+        task_sleep(15);
+    }
+}
+
+static void thread_consumer(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint64_t msg = chan_recv(&pipe_chan);
+        say(current->name, "recibo ", msg);
+        task_sleep(40);              /* consume mas despacio de lo que llega */
+    }
+}
+
+static void race_stats(void)
+{
+    uint64_t f = irq_save();
+    uint64_t got = shared_counter, want = attempted;
+    irq_restore(f);
+
+    uart_puts("\n  mutex: ");
+    uart_puts(use_mutex ? "SI" : "NO");
+    uart_puts("\n  incrementos intentados : ");
+    uart_dec(want);
+    uart_puts("\n  valor del contador     : ");
+    uart_dec(got);
+    uart_puts("\n  PERDIDOS               : ");
+    uart_dec(want - got);
+    uart_puts(want == got ? "  (ninguno)\n" : "  <-- carrera de datos\n");
+}
+
+static void chan_stats(void)
+{
+    uart_puts("\n  canal: ");
+    uart_dec(pipe_chan.count);
+    uart_puts("/");
+    uart_dec(CHAN_CAPACITY);
+    uart_puts(" ocupado   enviados: ");
+    uart_dec(pipe_chan.sent);
+    uart_puts("   recibidos: ");
+    uart_dec(pipe_chan.received);
+    uart_puts("\n");
 }
 
 static void menu(void)
 {
     uart_puts("\nComandos:\n");
     uart_puts("  l - listar hilos\n");
+    uart_puts("  c - contador compartido: intentos vs valor real\n");
+    uart_puts("  m - activar/desactivar el mutex del contador\n");
+    uart_puts("  k - estado del canal productor/consumidor\n");
     uart_puts("  y - ceder la CPU (yield) desde la tarea idle\n");
     uart_puts("  p - estado de la memoria fisica\n");
     uart_puts("  v - dos direcciones virtuales, una pagina fisica\n");
@@ -229,6 +331,25 @@ static void command(char c)
     switch (c) {
     case 'l':
         sched_dump();
+        break;
+
+    case 'c':
+        race_stats();
+        break;
+
+    case 'm': {
+        uint64_t f = irq_save();
+        use_mutex = !use_mutex;
+        shared_counter = 0;
+        attempted = 0;
+        irq_restore(f);
+        uart_puts(use_mutex ? "\n  mutex ACTIVADO, contadores a cero\n"
+                            : "\n  mutex DESACTIVADO, contadores a cero\n");
+        break;
+    }
+
+    case 'k':
+        chan_stats();
         break;
 
     case 'y':
@@ -340,12 +461,20 @@ void kernel_main(uint64_t dtb_ptr)
     }
 
     uart_puts("\n  Arrancando hilos...\n");
-    sched_init();                       /* adopta este contexto como tarea 0 */
+    sched_init();
+    mutex_init(&console);                       /* adopta este contexto como tarea 0 */
     task_create("alfa",  thread_ticker,     (void *)120UL);
     task_create("beta",  thread_ticker,     (void *)170UL);
     task_create("crunch", thread_cruncher,  0);
     task_create("efimero", thread_shortlived, 0);
     task_create("shell",  thread_shell,       0);
+
+    mutex_init(&counter_mutex);
+    chan_init(&pipe_chan);
+    task_create("inc-a",  thread_incrementer, 0);
+    task_create("inc-b",  thread_incrementer, 0);
+    task_create("prod",   thread_producer,    0);
+    task_create("cons",   thread_consumer,    0);
     sched_dump();
 
     menu();

@@ -8,6 +8,8 @@
  */
 #include "mmio.h"
 #include "uart.h"
+#include "sync.h"
+#include "irq.h"
 
 /* --- Registros GPIO --------------------------------------------------- */
 #define GPIO_BASE     (PERIPHERAL_BASE + 0x200000)
@@ -38,6 +40,7 @@
 static volatile char     rxbuf[RXBUF_SIZE];
 static volatile uint32_t rx_head;         /* donde escribe la IRQ           */
 static volatile uint32_t rx_tail;         /* donde lee el kernel            */
+static struct waitqueue  rx_waiters;      /* hilos esperando un byte        */
 
 void uart_init(void)
 {
@@ -154,6 +157,25 @@ void uart_irq(void)
         }
     }
     mmio_write(UART0_ICR, INT_RX | INT_RT);   /* reconocer la interrupcion */
+
+    /* Despertar a quien estuviera esperando. Se puede llamar desde aqui
+     * porque wq_wake_one solo cambia estados; no planifica ni bloquea. */
+    wq_wake_all(&rx_waiters);
+}
+
+/* Version bloqueante: en vez de preguntar cada 10 ms si ha llegado algo,
+ * el hilo se duerme y la interrupcion de la UART lo despierta. Mientras
+ * tanto no consume ni un ciclo. */
+char uart_getc_blocking(void)
+{
+    uint64_t f = irq_save();
+    char c;
+
+    while (!uart_read(&c))
+        wq_wait(&rx_waiters);
+
+    irq_restore(f);
+    return c;
 }
 
 int uart_read(char *out)

@@ -11,6 +11,7 @@ enum task_state {
     TASK_READY,               /* quiere CPU, esperando turno                */
     TASK_RUNNING,             /* la que se esta ejecutando ahora mismo      */
     TASK_SLEEPING,            /* dormida hasta cierto tick                  */
+    TASK_BLOCKED,             /* esperando en una cola (mutex, canal, UART)  */
     TASK_ZOMBIE,              /* termino; su pila aun no se ha liberado     */
 };
 
@@ -33,6 +34,7 @@ struct task {
     uint64_t    counter;      /* ticks que le quedan de su turno            */
     uint64_t    ticks_run;    /* CPU consumida en total                     */
     uint64_t    wake_tick;    /* si duerme, cuando despertar                */
+    struct task *wait_next;   /* encadenamiento dentro de una cola de espera */
     const char *name;
 };
 

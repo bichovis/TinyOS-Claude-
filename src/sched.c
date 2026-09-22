@@ -193,6 +193,7 @@ static const char *state_name(uint64_t s)
     case TASK_READY:    return "listo  ";
     case TASK_RUNNING:  return "activo ";
     case TASK_SLEEPING: return "durmien";
+    case TASK_BLOCKED:  return "bloq   ";
     case TASK_ZOMBIE:   return "zombi  ";
     default:            return "libre  ";
     }

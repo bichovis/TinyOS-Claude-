@@ -36,8 +36,9 @@ GPIO15/RXD (pin 10) a 115200 8N1.
 | 3    | Temporizador e interrupciones               | hecho  |
 | 4    | MMU, paginación, gestor de memoria física   | hecho  |
 | 5    | Hilos y planificador                        | hecho  |
-| 6    | Kernel en alto (TTBR1), usuario, syscalls, IPC | —   |
-| 7    | Drivers en espacio de usuario               | —      |
+| 6    | Sincronización: colas de espera, mutex, canales | hecho |
+| 7    | Kernel en alto (TTBR1), EL0, syscalls       | —      |
+| 8    | Drivers en espacio de usuario               | —      |
 
 ## Estructura
 
@@ -47,6 +48,7 @@ GPIO15/RXD (pin 10) a 115200 8N1.
     exception.c  decodifica ESR_EL1 y vuelca el estado; panic()
     linker.ld    mapa de memoria (carga en 0x80000)
     sched.c      hilos del kernel y planificador round-robin
+    sync.c       colas de espera, mutex, semaforos y canales de mensajes
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
     vmm.c        tablas de traduccion de 3 niveles y encendido de la MMU
