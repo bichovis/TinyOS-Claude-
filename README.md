@@ -60,12 +60,14 @@ Tres cosas que QEMU perdona y el silicio no:
 | 7    | Procesos en EL0 y llamadas al sistema       | hecho  |
 | 8    | IPC por puertos y driver de consola en EL0  | hecho  |
 | 9    | Arranque en hardware real: buzon, caches, SD | hecho  |
-| 10   | Kernel en alto (TTBR1) y ASIDs              | —      |
+| 10a  | Kernel en alto: split TTBR0 / TTBR1         | hecho  |
+| 10b  | ASIDs: dejar de tirar la TLB entera         | —      |
 
 ## Estructura
 
     boot.S       punto de entrada: aparca cores 1-3, baja EL3/EL2 -> EL1,
-                 stack, .bss, y salta a C
+                 stack, .bss, construye las tablas, ENCIENDE LA MMU y salta
+                 al kernel, que vive en 0xFFFFFF8000080000
     vectors.S    tabla de 16 vectores de excepcion + guardado de contexto
     exception.c  decodifica ESR_EL1 y vuelca el estado; panic()
     linker.ld    mapa de memoria (carga en 0x80000)
@@ -82,7 +84,7 @@ Tres cosas que QEMU perdona y el silicio no:
     config.txt   lo que la GPU lee antes de arrancar la CPU
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
-    vmm.c        tablas de traduccion de 3 niveles y encendido de la MMU
+    vmm.c        tablas de traduccion de 3 niveles y espacios de usuario
     irq.c        los dos controladores de interrupcion del BCM2837
     mbox.c       buzon de la VideoCore: le pregunta a la GPU cuanta RAM hay
     cache.S      invalidacion de la cache de datos antes de encender la MMU
@@ -90,12 +92,37 @@ Tres cosas que QEMU perdona y el silicio no:
     uart.c       driver PL011: salida por polling, entrada por interrupcion
     kernel.c     kernel_main
 
+## Los dos mundos
+
+AArch64 traduce con dos tablas a la vez y elige segun los bits altos de la
+direccion. Con 39 bits de VA quedan dos mitades de 512 GB con un abismo en
+medio:
+
+    0x0000000000000000 - 0x0000007FFFFFFFFF   TTBR0   el proceso
+    0xFFFFFF8000000000 - 0xFFFFFFFFFFFFFFFF   TTBR1   el kernel
+
+El kernel esta enlazado arriba y mapeado LINEAL: `VA = PA + KERNEL_VA_BASE`.
+Pasar de una a otra es una suma (`phys_to_virt`, `virt_to_phys` en `mm.h`),
+sin consultar ninguna tabla.
+
+Eso obliga a encender la MMU en `boot.S`, antes de la primera instruccion de
+C: el kernel esta enlazado en direcciones que sin traduccion no existen, asi
+que ni siquiera podria leer una cadena de texto. `boot.S` trabaja en fisico
+(restando `KERNEL_VA_BASE` a mano), construye las tablas, enciende la MMU
+con TTBR0 y TTBR1 apuntando a la misma tabla — identidad abajo, lineal
+arriba — salta a la direccion alta, y solo entonces quita la identidad.
+
+A cambio:
+
+  - cambiar de proceso toca **solo TTBR0**; el kernel no se mueve
+  - un proceso ya no comparte **ni una entrada** de tabla con el kernel: si
+    intenta leerlo, no es un fallo de permisos, es que ahi no hay nada
+  - TTBR0 queda entero para el usuario, que ahora empieza en 4 MB
+
 ## Limitaciones conocidas
 
-- Los procesos viven a partir de 2 GB porque el kernel ocupa las dos primeras
-  entradas L1 de cada espacio, compartidas. El split TTBR0/TTBR1 (paso 10)
-  liberaria el rango bajo y separaria del todo los dos mundos.
-- Sin ASIDs: cada cambio de espacio de direcciones invalida la TLB entera.
+- Sin ASIDs: cada cambio de espacio de direcciones invalida la TLB entera,
+  incluidas las entradas del kernel, que no han cambiado.
 - El cargador de procesos mapea toda la imagen como codigo de solo lectura,
   asi que un programa de usuario no puede tener variables globales
   escribibles; solo pila.

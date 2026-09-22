@@ -9,14 +9,20 @@
  * en el registro de escritura y se espera a que la GPU conteste rellenando
  * el mismo buffer.
  *
- * IMPORTANTE: esto solo se puede usar con las caches apagadas. La GPU lee
- * el buffer directamente de la RAM y no ve la cache de la CPU; con la MMU
- * encendida habria que reservarlo como memoria no cacheable.
+ * Y hay dos detalles que no perdonan, porque la GPU no es la CPU:
+ *
+ *   - La direccion que se le pasa es FISICA. La nuestra es virtual (el
+ *     kernel vive en TTBR1), asi que hay que convertirla.
+ *   - La GPU lee y escribe la RAM directamente, sin pasar por nuestra
+ *     cache. Hay que bajarle el buffer a la RAM antes de avisarla, y tirar
+ *     lo que tengamos cacheado de el despues, o leeriamos nuestra propia
+ *     peticion en vez de su respuesta.
  */
 #include <stdint.h>
 #include "mbox.h"
 #include "mmio.h"
 #include "timer.h"
+#include "mm.h"
 
 #define MBOX_BASE     (PERIPHERAL_BASE + 0xB880)
 #define MBOX_READ     (MBOX_BASE + 0x00)
@@ -42,18 +48,20 @@ static volatile uint32_t buf[16] __attribute__((aligned(16)));
  * entero. Nos damos 100 ms y nos rendimos.                              */
 #define MBOX_TIMEOUT_MS  100
 
+void dcache_clean_range(const void *addr, uint64_t bytes);       /* cache.S */
+void dcache_invalidate_range(const void *addr, uint64_t bytes);  /* cache.S */
+
 static int mbox_call(uint32_t channel)
 {
-    uint32_t addr = (uint32_t)(uint64_t)buf;
+    uint32_t addr = (uint32_t)virt_to_phys((const void *)buf);
     uint32_t msg  = (addr & ~0xFu) | (channel & 0xFu);
     uint64_t limit = timer_now() + (uint64_t)timer_hz() * MBOX_TIMEOUT_MS / 1000;
 
-    /* Que los datos del buffer esten de verdad en RAM ANTES de tocar el
-     * timbre. Las caches estan apagadas, pero eso no basta: el procesador
-     * puede reordenar una escritura a memoria normal respecto de una
-     * escritura a un periferico. 'dsb sy' espera a que se hayan completado
-     * todas las anteriores.                                              */
-    __asm__ volatile("dsb sy" ::: "memory");
+    /* Bajar el buffer a la RAM: la GPU no ve nuestra cache. El 'dsb sy' que
+     * lleva dentro dcache_clean_range sirve ademas para lo otro que hace
+     * falta aqui: que la escritura al buffer no se reordene por delante de
+     * la escritura al registro del periferico. */
+    dcache_clean_range((const void *)buf, sizeof(buf));
 
     while (mmio_read(MBOX_STATUS) & MBOX_FULL) {
         if (timer_now() > limit)
@@ -68,9 +76,9 @@ static int mbox_call(uint32_t channel)
         }
         /* El buzon es compartido: puede llegar respuesta de otro canal. */
         if (mmio_read(MBOX_READ) == msg) {
-            /* Y simetricamente: no leer el buffer hasta estar seguros de
-             * que lo que escribio la GPU ya es visible.                  */
-            __asm__ volatile("dsb sy" ::: "memory");
+            /* Y simetricamente: tirar lo que tengamos cacheado del buffer,
+             * porque lo que vale es lo que la GPU acaba de dejar en RAM. */
+            dcache_invalidate_range((const void *)buf, sizeof(buf));
             return buf[1] == CODE_RESP_OK;
         }
         if (timer_now() > limit)

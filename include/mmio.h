@@ -6,10 +6,21 @@
  */
 #pragma once
 #include <stdint.h>
+#include "mm.h"
 
-/* Base de perifericos del BCM2837 (Raspberry Pi 3).
+/* Base FISICA de los perifericos del BCM2837 (Raspberry Pi 3).
  * Ojo: en la Pi 1 era 0x20000000 y en la Pi 4 es 0xFE000000. */
-#define PERIPHERAL_BASE   0x3F000000UL
+#define PERIPHERAL_PA     0x3F000000UL
+
+/* ...y la direccion por la que los ve el kernel. Desde que el kernel vive
+ * en TTBR1 no puede tocar una direccion fisica directamente: los 0x3F...
+ * de los manuales de Broadcom caen en el espacio del proceso. */
+#define PERIPHERAL_BASE   (KERNEL_VA_BASE + PERIPHERAL_PA)
+
+/* Los "ARM local peripherals" (timers y mailboxes por nucleo) viven fuera
+ * del bloque anterior, en 0x40000000. */
+#define LOCAL_PA          0x40000000UL
+#define LOCAL_BASE        (KERNEL_VA_BASE + LOCAL_PA)
 
 /* 'volatile' es obligatorio: le prohibe al compilador cachear, reordenar o
  * eliminar estos accesos. Sin el, -O2 borraria medio driver. */

@@ -11,7 +11,10 @@
 #include "mm.h"
 #include "uart.h"
 
-extern char __kernel_end[];          /* lo define linker.ld */
+/* Lo define linker.ld, y es una direccion VIRTUAL: el kernel esta enlazado
+ * arriba. El PMM razona en fisico, asi que lo primero que hace con el es
+ * bajarlo al mapa lineal.                                                */
+extern char __kernel_end[];
 
 /* El bitmap se dimensiona para el caso maximo; cuantas paginas se reparten
  * de verdad lo decide el limite que nos da la GPU en el arranque. */
@@ -41,7 +44,7 @@ void pmm_init(uint64_t ram_limit)
      * stack), ya alineado a 4 KB por el linker script, y llega hasta donde
      * empiezan los perifericos. Lo de debajo del kernel (vectores del
      * firmware, el propio kernel) no se toca. */
-    first_page = ((uint64_t)__kernel_end) / PAGE_SIZE;
+    first_page = virt_to_phys(__kernel_end) / PAGE_SIZE;
 
     total = 0;
     for (uint64_t pfn = first_page; pfn < last_page; pfn++) {
@@ -69,7 +72,8 @@ uint64_t pmm_alloc(void)
             /* Entregar paginas con basura dentro es una fuente inagotable de
              * bugs (y una fuga de informacion entre procesos). Se limpian. */
             uint64_t pa = pfn * PAGE_SIZE;
-            uint64_t *p = (uint64_t *)pa;
+            uint64_t *p = phys_to_virt(pa);   /* el kernel no puede tocar */
+                                              /* una direccion fisica     */
             for (uint64_t i = 0; i < PAGE_SIZE / 8; i++)
                 p[i] = 0;
             return pa;

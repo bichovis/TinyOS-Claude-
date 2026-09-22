@@ -6,7 +6,41 @@
  *   - Los 4 nucleos arrancan (o estan parados en una spin-table)
  *   - NO hay stack: no podemos llamar a codigo C todavia
  *   - Nivel de privilegio: EL3 en QEMU, EL2 en una Pi 3B real
+ *
+ * Y una complicacion nueva: el kernel esta ENLAZADO en 0xFFFFFF8000080000,
+ * pero nos han cargado en 0x80000. Mientras la MMU este apagada, ninguna
+ * direccion del enlazador sirve para nada. Asi que todo lo de aqui abajo
+ * trabaja en fisico, restando KERNEL_VA_BASE a mano, hasta que la MMU esta
+ * encendida y podemos saltar "arriba" de una vez.
  */
+
+// Los mismos bits que include/mm.h, repetidos aqui porque el ensamblador no
+// entiende los sufijos UL de C. Si tocas uno alli, tocalo aqui.
+.equ KERNEL_VA_BASE, 0xFFFFFF8000000000
+.equ RAM_MAX,        0x3F000000
+.equ LOCAL_PA,       0x40000000
+
+.equ PTE_VALID,   (1 << 0)
+.equ PTE_TABLE,   (1 << 1)
+.equ PTE_AF,      (1 << 10)
+.equ PTE_SH_IN,   (3 << 8)
+.equ PTE_PXN,     (1 << 53)
+.equ PTE_UXN,     (1 << 54)
+.equ ATTR_DEV,    (1 << 2)      // indice 1 en MAIR: Device-nGnRE
+.equ ATTR_NORM,   (2 << 2)      // indice 2 en MAIR: Normal write-back
+
+.equ MM_RAM_RW,   (PTE_VALID | PTE_AF | PTE_SH_IN | ATTR_NORM | PTE_UXN | PTE_PXN)
+.equ MM_RAM_CODE, (PTE_VALID | PTE_AF | PTE_SH_IN | ATTR_NORM | PTE_UXN)
+.equ MM_DEVICE,   (PTE_VALID | PTE_AF | ATTR_DEV  | PTE_UXN | PTE_PXN)
+
+// MAIR_EL1: los cuatro tipos de memoria, un byte cada uno
+.equ MAIR_VALUE,  (0x00 << 0) | (0x04 << 8) | (0xFF << 16) | (0x44 << 24)
+
+// TCR_EL1: 39 bits de VA en los dos lados, granulo de 4 KB, tablas
+// cacheables, PA de 40 bits. Lo que YA NO esta es EPD1: TTBR1 se enciende.
+.equ TCR_VALUE,   (25) | (1 << 8) | (1 << 10) | (3 << 12) | \
+                  (25 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | \
+                  (2 << 30) | (2 << 32)
 
 .section ".text.boot"        // seccion que el linker coloca en 0x80000
 .global _start
@@ -90,9 +124,14 @@ from_el2:
 
     // --- 3. Ya en EL1: instalar el stack ---------------------------------
 at_el1:
+    // x9 = KERNEL_VA_BASE. A partir de aqui, toda direccion que venga del
+    // enlazador hay que bajarla a fisico restandole esto.
+    ldr     x9, =KERNEL_VA_BASE
+
     // Ojo: en EL1h el registro SP activo es SP_EL1, que esta sin inicializar.
     // Escribir en 'sp' aqui escribe en SP_EL1.
     ldr     x1, =__stack_top
+    sub     x1, x1, x9               // ...en fisico, que la MMU aun no esta
     mov     sp, x1
 
     // Permitir a EL1/EL0 usar FP/SIMD sin que la CPU lo atrape.
@@ -107,6 +146,8 @@ at_el1:
     // Nadie lo hace por nosotros: el binario ni siquiera contiene esos bytes.
     ldr     x1, =__bss_start
     ldr     x2, =__bss_end
+    sub     x1, x1, x9               // en fisico: la MMU sigue apagada
+    sub     x2, x2, x9
 bss_loop:
     cmp     x1, x2
     b.hs    bss_done                 // hs = higher-or-same (sin signo)
@@ -114,11 +155,127 @@ bss_loop:
     b       bss_loop                 // [x1], #8 = escribe y luego x1 += 8
 bss_done:
 
-    // --- 5. Saltar a C ----------------------------------------------------
+    // --- 5. Construir las tablas de traduccion de arranque ---------------
+    //
+    // Tres tablas, todas en .bss (o sea, ya puestas a cero):
+    //   l1_table[0]  -> l2_low     cubre 0 - 1 GB
+    //   l1_table[1]  -> l2_local   cubre 1 - 2 GB
+    //
+    // Con 39 bits de VA, el indice L1 son los bits [38:30] de la direccion.
+    // Y aqui esta el truco que hace que todo esto sea sencillo: para una VA
+    // alta 0xFFFFFF80_00000000 + PA, esos bits valen exactamente PA >> 30.
+    // Es decir, LA MISMA TABLA sirve de mapa de identidad por TTBR0 y de
+    // mapa lineal del kernel por TTBR1. No hay que duplicar nada.
+    ldr     x10, =l1_table
+    sub     x10, x10, x9
+    ldr     x11, =l2_low
+    sub     x11, x11, x9
+    ldr     x12, =l2_local
+    sub     x12, x12, x9
+
+    orr     x13, x11, #(PTE_VALID | PTE_TABLE)
+    str     x13, [x10]               // l1_table[0] = l2_low
+    orr     x13, x12, #(PTE_VALID | PTE_TABLE)
+    str     x13, [x10, #8]           // l1_table[1] = l2_local
+
+    // --- 0 - 1 GB en bloques de 2 MB: RAM abajo, perifericos arriba ------
+    ldr     x14, =MM_RAM_RW
+    ldr     x15, =MM_DEVICE
+    ldr     x16, =RAM_MAX
+    mov     x13, #0                  // i = 0
+tbl_loop:
+    lsl     x17, x13, #21            // pa = i * 2 MB
+    cmp     x17, x16
+    csel    x18, x14, x15, lo        // ¿RAM o periferico?
+    cbnz    x13, 1f
+    ldr     x18, =MM_RAM_CODE        // el bloque 0 lleva el kernel: ejecutable
+1:  orr     x18, x17, x18
+    str     x18, [x11], #8
+    add     x13, x13, #1
+    cmp     x13, #512
+    b.lo    tbl_loop
+
+    // --- 1 - 2 GB: solo el primer bloque, los "ARM local peripherals" ----
+    ldr     x13, =LOCAL_PA
+    orr     x13, x13, x15
+    str     x13, [x12]
+
+    // --- 6. Encender la MMU ----------------------------------------------
+    // TTBR0 y TTBR1 apuntan a la MISMA tabla: abajo queda un mapa de
+    // identidad (para que la instruccion siguiente al encendido siga
+    // existiendo) y arriba el mapa lineal del kernel.
+    ldr     x13, =MAIR_VALUE
+    msr     mair_el1, x13
+    ldr     x13, =TCR_VALUE
+    msr     tcr_el1, x13
+    msr     ttbr0_el1, x10
+    msr     ttbr1_el1, x10
+    isb
+
+    ic      iallu                    // tirar la cache de instrucciones
+    tlbi    vmalle1                  // y la TLB entera
+    dsb     nsh
+    isb
+
+    mrs     x13, sctlr_el1
+    orr     x13, x13, #(1 << 0)      // M: MMU
+    orr     x13, x13, #(1 << 2)      // C: cache de datos
+    orr     x13, x13, #(1 << 12)     // I: cache de instrucciones
+    msr     sctlr_el1, x13
+    isb                              // <- a partir de aqui hay traduccion
+
+    // --- 7. La mudanza ----------------------------------------------------
+    // Seguimos ejecutando en 0x80xxx gracias al mapa de identidad. Este
+    // salto absoluto es el que nos lleva de verdad arriba: 'ldr =' carga la
+    // direccion que puso el enlazador, que es la alta.
+    ldr     x13, =en_alto
+    br      x13
+
+en_alto:
+    // Ya estamos en 0xFFFFFF80_000xxxxx. El stack todavia apunta abajo.
+    ldr     x1, =__stack_top
+    mov     sp, x1
+
+    // Y ahora se puede quitar el mapa de identidad: TTBR0 pasa a una tabla
+    // vacia, que es lo que tendra cualquier hilo de kernel. Desde este
+    // instante, tocar una direccion baja es una excepcion, que es justo lo
+    // que queremos: el kernel no tiene nada que hacer en el espacio del
+    // usuario salvo cuando lo pide explicitamente.
+    ldr     x1, =empty_pgd
+    sub     x1, x1, x9
+    msr     ttbr0_el1, x1
+    dsb     ish
+    tlbi    vmalle1
+    dsb     ish
+    isb
+
+    // --- 8. Saltar a C ----------------------------------------------------
     // x0 sigue conteniendo el puntero al dtb -> llega como 1er argumento.
     bl      kernel_main
 
-    // --- 6. Si kernel_main retorna, aparcamos este nucleo tambien ---------
+    // --- 9. Si kernel_main retorna, aparcamos este nucleo tambien ---------
 halt:
     wfe
     b       halt
+
+
+// ==========================================================================
+//  Las tablas de traduccion de arranque
+//
+//  Viven en .bss (no ocupan sitio en la imagen y boot.S las pone a cero) y
+//  estan alineadas a 4 KB porque un descriptor de tabla solo guarda los bits
+//  [47:12] de la direccion: los 12 de abajo tienen que ser cero.
+// ==========================================================================
+.section ".bss.pgtables", "aw", %nobits
+.align 12
+
+.global l1_table
+l1_table:   .space 4096
+.global l2_low
+l2_low:     .space 4096
+.global l2_local
+l2_local:   .space 4096
+
+// Tabla vacia: el TTBR0 de un hilo que no tiene espacio de usuario.
+.global empty_pgd
+empty_pgd:  .space 4096

@@ -1,7 +1,7 @@
 /* user/hello.c - Primer proceso de espacio de usuario de TinyOS
  *
  * Esto NO es parte del kernel: se compila y enlaza por separado, en su
- * propio espacio de direcciones (0x80000000), y se ejecuta en EL0. No puede
+ * propio espacio de direcciones (0x400000), y se ejecuta en EL0. No puede
  * llamar a uart_puts ni a nada del kernel; solo a traves de 'svc'.
  */
 #include "syscall.h"

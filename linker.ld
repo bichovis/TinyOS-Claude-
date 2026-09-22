@@ -1,16 +1,31 @@
 /* linker.ld - Mapa de memoria de TinyOS
  *
- * El firmware de la Raspberry Pi carga kernel8.img en 0x80000 y salta ahi.
- * Por tanto TODO nuestro codigo debe estar enlazado para vivir en esa direccion.
+ * Aqui hay dos direcciones para cada byte del kernel y conviene no
+ * confundirlas:
+ *
+ *   LMA (load address)  0x00080000        donde el firmware deja la imagen
+ *   VMA (virtual address) 0xFFFFFF8000080000  donde el kernel cree que vive
+ *
+ * El kernel esta enlazado en la mitad alta, la de TTBR1. Eso significa que
+ * NADA de su codigo funciona hasta que la MMU esta encendida: una simple
+ * referencia a una cadena de texto apunta a 0xFFFFFF80... y sin traduccion
+ * esa direccion no existe. Por eso boot.S enciende la MMU a mano, usando
+ * solo direcciones calculadas, antes de saltar aqui arriba.
+ *
+ * AT() es lo que le dice al enlazador "colocalo en la imagen como si fuera
+ * a cargarse en 0x80000, aunque se ejecute desde arriba".
  */
+
+KERNEL_VA_BASE = 0xFFFFFF8000000000;
+PHYS_BASE      = 0x80000;            /* direccion de carga que impone el firmware */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x80000;                /* direccion de carga que impone el firmware */
+    . = KERNEL_VA_BASE + PHYS_BASE;
 
-    .text : {
+    .text : AT(PHYS_BASE) {
         KEEP(*(.text.boot))     /* boot.S PRIMERO: _start debe caer en 0x80000 */
         *(.text .text.*)
     }
@@ -19,9 +34,12 @@ SECTIONS
     .data   : ALIGN(8) { *(.data .data.*) }
 
     /* .bss = variables globales sin inicializar. No ocupan sitio en el binario,
-     * asi que somos nosotros quienes debemos ponerlas a cero al arrancar.     */
-    .bss (NOLOAD) : ALIGN(16) {
+     * asi que somos nosotros quienes debemos ponerlas a cero al arrancar.
+     * Aqui viven tambien las tablas de traduccion de arranque (boot.S), que
+     * por eso deben estar alineadas a 4 KB.                                 */
+    .bss (NOLOAD) : ALIGN(4096) {
         __bss_start = .;
+        *(.bss.pgtables)        /* las tablas, primero y alineadas */
         *(.bss .bss.*)
         *(COMMON)
         . = ALIGN(16);

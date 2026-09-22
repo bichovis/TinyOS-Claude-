@@ -30,7 +30,7 @@ struct task {
     struct cpu_context ctx;   /* PRIMERO: switch.S da por hecho offset 0    */
     uint64_t    state;
     uint64_t    pid;
-    uint64_t    stack;        /* pagina fisica de la pila                   */
+    uint64_t    stack;        /* pila del hilo, en el mapa lineal           */
     uint64_t    counter;      /* ticks que le quedan de su turno            */
     uint64_t    ticks_run;    /* CPU consumida en total                     */
     uint64_t    wake_tick;    /* si duerme, cuando despertar                */

@@ -15,9 +15,28 @@
  * RAM_MAX es el tope absoluto (donde empiezan los perifericos); el limite
  * de verdad lo dice la GPU por el buzon y puede ser bastante menor. */
 #define RAM_MAX          0x3F000000UL
-#define RAM_TOP          RAM_MAX       /* solo para el mapeo de la MMU     */
 #define PERIPH_START     0x3F000000UL
 #define PERIPH_END       0x40200000UL
+
+/* --- El kernel vive arriba: el split TTBR0 / TTBR1 ---------------------
+ *
+ * AArch64 no traduce con una tabla, sino con DOS, y elige cual segun los
+ * bits altos de la direccion. Con 39 bits de VA quedan dos mitades de
+ * 512 GB separadas por un abismo de direcciones invalidas:
+ *
+ *   0x0000000000000000 - 0x0000007FFFFFFFFF   TTBR0  ->  el proceso
+ *   (nada en medio: cualquier direccion de ahi es una excepcion)
+ *   0xFFFFFF8000000000 - 0xFFFFFFFFFFFFFFFF   TTBR1  ->  el kernel
+ *
+ * El kernel se mapea LINEAL: VA = PA + KERNEL_VA_BASE. Convertir de una a
+ * otra es una suma, sin consultar ninguna tabla. A cambio, el kernel solo
+ * puede ver la RAM que tenga mapeada de antemano (los 2 primeros GB, que
+ * en esta placa son toda).
+ *
+ * Que el kernel este en TTBR1 tiene dos consecuencias grandes:
+ *   - cambiar de proceso solo toca TTBR0; el kernel no se mueve
+ *   - TTBR0 queda entero para el usuario, que ya no empieza en 2 GB      */
+#define KERNEL_VA_BASE   0xFFFFFF8000000000UL
 
 /* --- Indices dentro de MAIR_EL1 ---------------------------------------
  * MAIR es una tabla de 8 "tipos de memoria". Cada descriptor de pagina no
@@ -67,13 +86,13 @@
 #define MM_USER_DATA (PTE_VALID | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL) \
                       | PTE_AP_RW_ALL | PTE_PXN | PTE_UXN | PTE_nG)
 
-/* Mapa de un proceso de usuario. Vive a partir de 2 GB porque las dos
- * primeras entradas L1 (0-2 GB) las ocupa el kernel, compartidas por todos
- * los espacios. El split TTBR0/TTBR1 liberaria el rango bajo.            */
-#define USER_BASE        0x80000000UL      /* codigo                       */
-#define USER_MMIO_BASE   0x90000000UL      /* MMIO concedido a un driver   */
-#define USER_STACK_TOP   0x80200000UL      /* pila (crece hacia abajo)     */
-#define USER_LIMIT       0xC0000000UL      /* nada de usuario por encima   */
+/* Mapa de un proceso de usuario. Vive abajo del todo porque TTBR0 es suyo
+ * entero: el kernel ya no le ocupa ni una entrada. Empezamos en 4 MB y no
+ * en 0 para que un puntero nulo (y sus vecinos) fallen en vez de acertar. */
+#define USER_BASE        0x00400000UL      /* codigo, en 4 MB              */
+#define USER_STACK_TOP   0x00800000UL      /* pila (crece hacia abajo)     */
+#define USER_MMIO_BASE   0x10000000UL      /* MMIO concedido a un driver   */
+#define USER_LIMIT       0x40000000UL      /* nada de usuario por encima   */
 
 /* --- Gestor de memoria fisica (pmm.c) --------------------------------- */
 void     pmm_init(uint64_t ram_limit);
@@ -84,16 +103,35 @@ uint64_t pmm_free_pages(void);
 uint64_t pmm_used_pages(void);
 
 /* --- Memoria virtual (vmm.c) ------------------------------------------ */
-void     vmm_init(void);              /* construye las tablas del kernel    */
-void     vmm_enable(void);            /* enciende MMU, cachés y todo        */
+/* Las tablas del kernel y el encendido de la MMU ya no estan aqui: ocurren
+ * en boot.S, antes de la primera instruccion de C. No hay alternativa: el
+ * kernel esta enlazado en direcciones altas, asi que sin MMU no podria ni
+ * leer una cadena de texto. */
+void     caches_disable(void);        /* apaga D+I (para medir)             */
+void     caches_enable(void);         /* y las vuelve a encender            */
 int      vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags);
 uint64_t vmm_translate(uint64_t va);  /* pregunta al hardware: VA -> PA      */
 
 /* --- Espacios de direcciones por proceso ------------------------------- */
-uint64_t *vmm_kernel_pgd(void);
+uint64_t *vmm_empty_pgd(void);        /* TTBR0 de un hilo de kernel      */
 uint64_t *vmm_create_pgd(void);       /* tabla nueva, con el kernel dentro   */
 void      vmm_destroy_pgd(uint64_t *pgd);
 int       vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags);
 void      vmm_switch_to(uint64_t *pgd);   /* cambia TTBR0                    */
 uint64_t  vmm_translate_user(uint64_t va);      /* ¿puede EL0 LEER aqui?     */
 uint64_t  vmm_translate_user_w(uint64_t va);    /* ¿puede EL0 ESCRIBIR aqui? */
+
+/* --- Lineal <-> fisico -------------------------------------------------
+ * El kernel maneja direcciones fisicas a menudo (pmm_alloc devuelve una,
+ * las entradas de las tablas guardan otra), pero no puede desreferenciarlas:
+ * lo que la CPU traduce son direcciones virtuales. Estas dos funciones son
+ * el puente, y solo valen para la RAM que cubre el mapa lineal.           */
+static inline void *phys_to_virt(uint64_t pa)
+{
+    return (void *)(pa + KERNEL_VA_BASE);
+}
+
+static inline uint64_t virt_to_phys(const void *va)
+{
+    return (uint64_t)va - KERNEL_VA_BASE;
+}

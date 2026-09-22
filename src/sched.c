@@ -55,8 +55,12 @@ int task_create(const char *name, void (*fn)(void *), void *arg)
     }
     if (!t) { irq_restore(flags); return -1; }
 
-    uint64_t stack = pmm_alloc();       /* 4 KB de pila por hilo */
-    if (!stack) { irq_restore(flags); return -1; }
+    uint64_t stack_pa = pmm_alloc();    /* 4 KB de pila por hilo */
+    if (!stack_pa) { irq_restore(flags); return -1; }
+
+    /* pmm_alloc habla en fisico; el hilo va a usar la pila de verdad, asi
+     * que lo que se guarda es la direccion por la que el kernel la ve. */
+    uint64_t stack = (uint64_t)phys_to_virt(stack_pa);
 
     /* Marca al fondo de la pila para detectar desbordamientos. Un hilo que
      * se pasa de pila no da ningun error: pisa silenciosamente lo que haya
@@ -125,7 +129,10 @@ void schedule(void)
          * a la tabla del kernel: asi ninguna sigue corriendo sobre la de un
          * proceso que podria morir. vmm_switch_to() no hace nada si ya es
          * la activa, que es el caso habitual entre hilos de kernel. */
-        vmm_switch_to(next->pgd ? next->pgd : vmm_kernel_pgd());
+        /* Un hilo de kernel no tiene espacio de usuario: le ponemos una
+         * tabla vacia, para que cualquier acceso suyo a direcciones bajas
+         * sea una excepcion y no un desastre silencioso. */
+        vmm_switch_to(next->pgd ? next->pgd : vmm_empty_pgd());
 
         cpu_switch_to(prev, next);
         /* --- Cuando la ejecucion vuelve a esta linea, han podido pasar
@@ -242,7 +249,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
 
         uint64_t chunk = size - off;
         if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
-        kcopy((void *)page, image + off, chunk);
+        kcopy(phys_to_virt(page), image + off, chunk);   /* escribir: virtual */
 
         vmm_map_in(pgd, USER_BASE + off, page, MM_USER_CODE);
     }
@@ -264,8 +271,9 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     }
 
     /* --- Pila de kernel: donde se guardara su contexto en cada syscall --- */
-    uint64_t kstack = pmm_alloc();
-    if (!kstack) { irq_restore(flags); return -1; }
+    uint64_t kstack_pa = pmm_alloc();
+    if (!kstack_pa) { irq_restore(flags); return -1; }
+    uint64_t kstack = (uint64_t)phys_to_virt(kstack_pa);
     *(uint64_t *)kstack = STACK_MAGIC;
 
     t->stack     = kstack;

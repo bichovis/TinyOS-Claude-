@@ -15,13 +15,27 @@
  *   CCSIDR_EL1  da la geometria del nivel seleccionado
  *   dc isw      invalida una linea por (conjunto, via)
  *
- * Usamos 'invalidate' y no 'clean+invalidate' a proposito: con las caches
- * apagadas, todo lo que hemos escrito ha ido directo a RAM, asi que no hay
- * nada sucio que valga la pena conservar.
+ * Hay dos variantes y la diferencia importa:
+ *   invalidate         tira las lineas. Se usa cuando lo que hay en la
+ *                      cache es basura o esta viejo, y lo bueno esta en RAM.
+ *   clean+invalidate    baja primero lo sucio a la RAM y luego tira. Se usa
+ *                      cuando en la cache hay escrituras que aun no han
+ *                      llegado a la RAM y no queremos perderlas.
+ * Equivocarse de variante es perder datos sin ningun sintoma inmediato.
  */
 
+// Los dos puntos de entrada comparten el recorrido y solo se diferencian en
+// x18: 0 = solo invalidar, 1 = limpiar e invalidar.
 .global dcache_invalidate_all
 dcache_invalidate_all:
+    mov     x18, #0
+    b       dcache_all
+
+.global dcache_clean_invalidate_all
+dcache_clean_invalidate_all:
+    mov     x18, #1
+
+dcache_all:
     mrs     x0, clidr_el1
     and     w3, w0, #0x07000000         // LoC: nivel de coherencia
     lsr     w3, w3, #23                 // w3 = LoC * 2
@@ -50,8 +64,11 @@ dcache_invalidate_all:
 3:  lsl     w11, w7, w2
     orr     w11, w9, w11                // via
     orr     w11, w11, w10               // nivel
-    dc      isw, x11                    // invalidar esa linea
-    subs    w7, w7, #1
+    cbz     x18, 6f
+    dc      cisw, x11                   // bajar a RAM y tirar
+    b       7f
+6:  dc      isw, x11                    // solo tirar
+7:  subs    w7, w7, #1
     b.ge    3b
     subs    x9, x9, x16
     b.ge    2b
@@ -65,4 +82,51 @@ dcache_invalidate_all:
     msr     csselr_el1, x10             // dejar CSSELR como estaba
     dsb     sy
     isb
+    ret
+
+
+/* ==========================================================================
+ *  Operaciones sobre un rango concreto
+ *
+ *  Para hablar con un periferico que lee o escribe la RAM por su cuenta (la
+ *  GPU con el buzon, o cualquier DMA) no vale con esperar: hay que
+ *  sincronizar a mano la cache con la RAM sobre esos bytes exactos.
+ *
+ *    dcache_clean_range       "lo que he escrito, bajalo a la RAM YA"
+ *    dcache_invalidate_range  "lo que tengo cacheado de ahi, tiralo; el
+ *                              otro lo ha cambiado a mis espaldas"
+ *
+ *  Las dos trabajan por lineas de cache, cuyo tamano lo dice CTR_EL0.
+ *  x0 = direccion, x1 = numero de bytes.
+ * ========================================================================== */
+
+// Deja en x2 el tamano de linea y alinea x0 hacia abajo a ese tamano.
+.macro line_setup
+    mrs     x2, ctr_el0
+    ubfx    x2, x2, #16, #4             // log2(lineas de 4 bytes) de la D-cache
+    mov     x3, #4
+    lsl     x2, x3, x2                  // x2 = bytes por linea
+    sub     x3, x2, #1
+    add     x1, x0, x1                  // x1 = final del rango
+    bic     x0, x0, x3                  // x0 = inicio, alineado hacia abajo
+.endm
+
+.global dcache_clean_range
+dcache_clean_range:
+    line_setup
+1:  dc      cvac, x0
+    add     x0, x0, x2
+    cmp     x0, x1
+    b.lo    1b
+    dsb     sy
+    ret
+
+.global dcache_invalidate_range
+dcache_invalidate_range:
+    line_setup
+1:  dc      ivac, x0
+    add     x0, x0, x2
+    cmp     x0, x1
+    b.lo    1b
+    dsb     sy
     ret

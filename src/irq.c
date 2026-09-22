@@ -24,7 +24,8 @@
 #include "sched.h"
 
 /* --- [2] ARM local peripherals ---------------------------------------- */
-#define LOCAL_BASE            0x40000000UL
+/* LOCAL_BASE lo define mmio.h: 0x40000000 fisico, visto desde el mapa
+ * lineal del kernel. */
 #define GPU_INT_ROUTING       (LOCAL_BASE + 0x0C)  /* a que nucleo van las */
                                                    /* IRQ del controlador  */
                                                    /* de perifericos       */

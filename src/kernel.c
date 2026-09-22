@@ -20,14 +20,17 @@ extern const uint8_t  user_conserver[];  extern const uint64_t user_conserver_si
 extern const uint8_t  user_client[];     extern const uint64_t user_client_size;
 
 /* Registros de la PL011. Se los concedemos al driver de consola para que
- * pueda hacer su trabajo desde EL0 sin pasar por el kernel. */
-#define UART0_PHYS  (PERIPHERAL_BASE + 0x201000)
+ * pueda hacer su trabajo desde EL0 sin pasar por el kernel. Aqui hace falta
+ * la direccion FISICA (es la que se va a meter en una tabla de paginas),
+ * no la virtual por la que los ve el kernel. */
+#define UART0_PHYS  (PERIPHERAL_PA + 0x201000)
 
-/* Ventana virtual para los experimentos: 2 GB, donde no hay nada fisico.
- * Que funcione es justamente la demostracion de que la traduccion existe. */
-#define TEST_VA_A    0x80000000UL
-#define TEST_VA_B    0x80001000UL
-#define TEST_VA_RO   0x80010000UL
+/* Ventana virtual para los experimentos, dentro del espacio del kernel pero
+ * fuera del mapa lineal: ahi no hay nada fisico. Que funcione es justamente
+ * la demostracion de que la traduccion existe. */
+#define TEST_VA_A    (KERNEL_VA_BASE + 0xC0000000UL)
+#define TEST_VA_B    (KERNEL_VA_BASE + 0xC0001000UL)
+#define TEST_VA_RO   (KERNEL_VA_BASE + 0xC0010000UL)
 
 /* Area para el benchmark de memoria: 256 KB en .bss */
 #define BENCH_WORDS  (256 * 1024 / 8)
@@ -47,6 +50,13 @@ static int mmu_is_on(void)
     uint64_t sctlr;
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
     return (int)(sctlr & 1);
+}
+
+static int caches_are_on(void)
+{
+    uint64_t sctlr;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    return (int)((sctlr >> 2) & 1);
 }
 
 /* Recorre 256 KB varias veces y devuelve los microsegundos que ha costado.
@@ -430,17 +440,18 @@ static void command(char c)
 
     case 'x':
         uart_puts("\n  Lo que ve la MMU (instruccion 'at s1e1r'):\n");
-        show_translation("kernel  ", 0x80000UL);
-        show_translation("UART0   ", 0x3F201000UL);
-        show_translation("timers  ", 0x40000000UL);
-        show_translation("sin map ", 0x70000000UL);
+        show_translation("kernel  ", KERNEL_VA_BASE + 0x80000UL);
+        show_translation("UART0   ", PERIPHERAL_BASE + 0x201000);
+        show_translation("timers  ", LOCAL_BASE);
+        show_translation("sin map ", KERNEL_VA_BASE + 0x70000000UL);
+        show_translation("usuario ", USER_BASE);
         break;
 
     case 'b': {
         uart_puts("\n  Recorriendo 4 MB (16 pasadas sobre 256 KB)...\n    ");
         uart_dec(bench_memory());
-        uart_puts(" us con la MMU ");
-        uart_puts(mmu_is_on() ? "ENCENDIDA (caches activas)\n" : "apagada\n");
+        uart_puts(" us con las caches ");
+        uart_puts(caches_are_on() ? "ENCENDIDAS\n" : "apagadas\n");
         break;
     }
 
@@ -487,7 +498,11 @@ void kernel_main(uint64_t dtb_ptr)
     uart_putc((char)('0' + current_el()));
     uart_puts("\n  Device tree en  : 0x");
     uart_hex64(dtb_ptr);
-    uart_puts("\n");
+    uart_puts("\n  MMU             : ");
+    uart_puts(mmu_is_on() ? "encendida desde boot.S\n" : "APAGADA (?)\n");
+    uart_puts("  Kernel en       : 0x");
+    uart_hex64(KERNEL_VA_BASE + 0x80000);
+    uart_puts("  (TTBR1)\n");
 
     timer_init(TICK_HZ);
     uart_enable_rx_irq();
@@ -513,19 +528,19 @@ void kernel_main(uint64_t dtb_ptr)
     ipc_init();
     mem_stats();
 
-    uart_puts("\n  Midiendo la memoria SIN MMU (sin caches)...\n    ");
+    /* La MMU lleva encendida desde boot.S: no habia alternativa, el kernel
+     * esta enlazado en direcciones altas. Lo que si podemos apagar en
+     * caliente son las caches, y es lo unico que se nota en la medida: la
+     * traduccion en si no acelera nada, las caches lo son todo.
+     * (En QEMU los dos numeros salen iguales porque no emula caches.) */
+    uart_puts("\n  Midiendo la memoria con las caches APAGADAS...\n    ");
+    caches_disable();
     uint64_t before = bench_memory();
+    caches_enable();
     uart_dec(before);
     uart_puts(" us\n");
 
-    uart_puts("\n  Construyendo las tablas de traduccion...\n");
-    vmm_init();
-    uart_puts("  Encendiendo MMU + caches (el suelo cambia aqui)...\n");
-    vmm_enable();
-    uart_puts("  Seguimos vivos. MMU: ");
-    uart_puts(mmu_is_on() ? "ON\n" : "OFF\n");
-
-    uart_puts("\n  Midiendo la memoria CON MMU y caches...\n    ");
+    uart_puts("  ...y con las caches encendidas:\n    ");
     uint64_t after = bench_memory();
     uart_dec(after);
     uart_puts(" us\n");
