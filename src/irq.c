@@ -21,6 +21,7 @@
 #include "irq.h"
 #include "timer.h"
 #include "uart.h"
+#include "sched.h"
 
 /* --- [2] ARM local peripherals ---------------------------------------- */
 #define LOCAL_BASE            0x40000000UL
@@ -77,6 +78,11 @@ void irq_handle(void)
         if (p2 & (1u << (IRQ_UART - 32)))
             uart_irq();
     }
+
+    /* Punto seguro para cambiar de hilo: el contexto del hilo interrumpido
+     * ya esta entero en su pila (lo apilo kernel_entry), asi que podemos
+     * congelarla y saltar a otra sin que se entere. */
+    sched_preempt();
 }
 
 uint64_t irq_count(void) { return irqs; }

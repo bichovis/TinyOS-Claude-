@@ -5,6 +5,7 @@
 #include "irq.h"
 #include "timer.h"
 #include "mm.h"
+#include "sched.h"
 
 #define TICK_HZ      100
 
@@ -133,9 +134,85 @@ static void demo_readonly(void)
     uart_puts("  !!! No ha saltado: la proteccion NO funciona\n");
 }
 
+/* La UART es un recurso compartido y uart_puts no es atomica: si el timer
+ * desaloja a un hilo a mitad de una frase, la siguiente se mete por medio.
+ * Tapar las IRQ mientras se imprime lo arregla en un uniprocesador. No es
+ * gratis: a 115200 baudios cada caracter cuesta ~87 us, asi que una linea
+ * larga puede costar varios ticks. Un kernel serio pondria las lineas en
+ * una cola y las sacaria por interrupcion. */
+static void say(const char *who, const char *what, uint64_t n)
+{
+    uint64_t f = irq_save();
+    uart_puts("    [");
+    uart_puts(who);
+    uart_puts("] ");
+    uart_puts(what);
+    uart_dec(n);
+    uart_puts("   (tick ");
+    uart_dec(timer_ticks());
+    uart_puts(")\n");
+    irq_restore(f);
+}
+
+/* Hilo que duerme: la mayor parte del tiempo no consume CPU. */
+static void thread_ticker(void *arg)
+{
+    uint64_t period = (uint64_t)arg;
+    for (uint64_t i = 1; ; i++) {
+        say(current->name, "latido ", i);
+        task_sleep(period);
+    }
+}
+
+/* Hilo que quema CPU: nunca cede voluntariamente. Solo el timer puede
+ * quitarselo de encima, y ahi se ve si la expropiacion funciona de verdad. */
+static void thread_cruncher(void *arg)
+{
+    (void)arg;
+    uint64_t rounds = 0;
+    volatile uint64_t sum = 0;
+    for (;;) {
+        for (int i = 0; i < 200000; i++)
+            sum += (uint64_t)i;
+        rounds++;
+        __asm__ volatile("" :: "r"(sum));   /* que el bucle no se optimice */
+        if (rounds % 400 == 0)
+            say(current->name, "vueltas ", rounds);
+    }
+}
+
+/* Hilo que termina: demuestra que task_exit deja un zombi. */
+static void thread_shortlived(void *arg)
+{
+    (void)arg;
+    say(current->name, "nazco y muero tras dormir 3 s, tarea ", current->pid);
+    task_sleep(300);
+    say(current->name, "me voy. pid ", current->pid);
+}
+
+static void command(char c);
+
+/* La consola vive en su propio hilo. Antes estaba en la tarea idle, pero la
+ * idle solo corre cuando nadie mas quiere CPU: con un hilo como 'crunch' en
+ * marcha, la consola no habria respondido jamas. */
+static void thread_shell(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        char c;
+        while (uart_read(&c))
+            command(c);
+        /* Dormir 10 ms en vez de dar vueltas preguntando. Lo correcto seria
+         * bloquearse hasta que llegue un byte; eso pide colas de espera. */
+        task_sleep(1);
+    }
+}
+
 static void menu(void)
 {
     uart_puts("\nComandos:\n");
+    uart_puts("  l - listar hilos\n");
+    uart_puts("  y - ceder la CPU (yield) desde la tarea idle\n");
     uart_puts("  p - estado de la memoria fisica\n");
     uart_puts("  v - dos direcciones virtuales, una pagina fisica\n");
     uart_puts("  r - pagina de solo lectura (FATAL: fallo de permisos)\n");
@@ -150,6 +227,16 @@ static void menu(void)
 static void command(char c)
 {
     switch (c) {
+    case 'l':
+        sched_dump();
+        break;
+
+    case 'y':
+        uart_puts("\n  idle cede la CPU...\n");
+        task_yield();
+        uart_puts("  idle ha vuelto\n");
+        break;
+
     case 'p':
         mem_stats();
         break;
@@ -252,18 +339,19 @@ void kernel_main(uint64_t dtb_ptr)
         uart_puts("\n");
     }
 
+    uart_puts("\n  Arrancando hilos...\n");
+    sched_init();                       /* adopta este contexto como tarea 0 */
+    task_create("alfa",  thread_ticker,     (void *)120UL);
+    task_create("beta",  thread_ticker,     (void *)170UL);
+    task_create("crunch", thread_cruncher,  0);
+    task_create("efimero", thread_shortlived, 0);
+    task_create("shell",  thread_shell,       0);
+    sched_dump();
+
     menu();
 
-    uint64_t last_second = 0;
-    for (;;) {
+    /* La tarea 0 se queda de idle pura: solo se ejecuta cuando ningun otro
+     * hilo quiere CPU, y entonces para el nucleo hasta la proxima interrupcion. */
+    for (;;)
         __asm__ volatile("wfi");
-
-        char c;
-        while (uart_read(&c))
-            command(c);
-
-        uint64_t secs = timer_ticks() / TICK_HZ;
-        if (secs != last_second)
-            last_second = secs;
-    }
 }

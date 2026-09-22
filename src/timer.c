@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "timer.h"
 #include "uart.h"
+#include "sched.h"
 
 static uint32_t          counter_hz;    /* frecuencia del contador       */
 static uint32_t          interval;      /* cuentas entre dos ticks       */
@@ -60,6 +61,7 @@ void timer_init(uint32_t hz)
 void timer_irq(void)
 {
     ticks++;
+    scheduler_tick();          /* contabilidad y despertares */
     /* Rearmar. Escribir TVAL de nuevo tambien baja la senal de interrupcion:
      * es asi como se "reconoce" este temporizador, no hay registro de ACK. */
     write_tval(interval);

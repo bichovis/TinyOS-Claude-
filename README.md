@@ -35,7 +35,7 @@ GPIO15/RXD (pin 10) a 115200 8N1.
 | 2    | Bajada a EL1, vectores de excepción         | hecho  |
 | 3    | Temporizador e interrupciones               | hecho  |
 | 4    | MMU, paginación, gestor de memoria física   | hecho  |
-| 5    | Hilos y planificador                        | —      |
+| 5    | Hilos y planificador                        | hecho  |
 | 6    | Kernel en alto (TTBR1), usuario, syscalls, IPC | —   |
 | 7    | Drivers en espacio de usuario               | —      |
 
@@ -46,6 +46,8 @@ GPIO15/RXD (pin 10) a 115200 8N1.
     vectors.S    tabla de 16 vectores de excepcion + guardado de contexto
     exception.c  decodifica ESR_EL1 y vuelca el estado; panic()
     linker.ld    mapa de memoria (carga en 0x80000)
+    sched.c      hilos del kernel y planificador round-robin
+    switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
     vmm.c        tablas de traduccion de 3 niveles y encendido de la MMU
     irq.c        los dos controladores de interrupcion del BCM2837
