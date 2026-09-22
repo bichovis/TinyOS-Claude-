@@ -125,14 +125,12 @@ void schedule(void)
         current       = next;
         switches++;
 
-        /* Cambiar de espacio de direcciones. Las tareas de kernel vuelven
-         * a la tabla del kernel: asi ninguna sigue corriendo sobre la de un
-         * proceso que podria morir. vmm_switch_to() no hace nada si ya es
-         * la activa, que es el caso habitual entre hilos de kernel. */
-        /* Un hilo de kernel no tiene espacio de usuario: le ponemos una
-         * tabla vacia, para que cualquier acceso suyo a direcciones bajas
-         * sea una excepcion y no un desastre silencioso. */
-        vmm_switch_to(next->pgd ? next->pgd : vmm_empty_pgd());
+        /* Cambiar de espacio de direcciones: una escritura a TTBR0 con la
+         * tabla y el ASID juntos, sin tocar la TLB. Un hilo de kernel no
+         * tiene espacio de usuario, asi que recibe la tabla vacia y el
+         * ASID 0: cualquier acceso suyo a direcciones bajas sera una
+         * excepcion y no un desastre silencioso. */
+        vmm_switch_to(next->pgd ? next->pgd : vmm_empty_pgd(), next->asid);
 
         cpu_switch_to(prev, next);
         /* --- Cuando la ejecucion vuelve a esta linea, han podido pasar
@@ -239,7 +237,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
         if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
     if (!t) { irq_restore(flags); return -1; }
 
-    uint64_t *pgd = vmm_create_pgd();
+    uint64_t asid = 0;
+    uint64_t *pgd = vmm_create_pgd(&asid);
     if (!pgd) { irq_restore(flags); return -1; }
 
     /* --- Codigo: tantas paginas como haga falta, copiadas de la imagen --- */
@@ -278,6 +277,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
 
     t->stack     = kstack;
     t->pgd       = pgd;
+    t->asid      = asid;
     t->name      = name;
     t->pid       = next_pid++;
     t->counter   = TASK_QUANTUM;
@@ -340,7 +340,10 @@ void sched_dump(void)
             int ok = (*(uint64_t *)t->stack == STACK_MAGIC);
             uart_puts(ok ? "         ok" : "         DESBORDADA");
         }
-        if (t->pgd) uart_puts("   EL0");
+        if (t->pgd) {
+            uart_puts("   EL0 asid ");
+            uart_dec(t->asid);
+        }
         uart_puts("\n");
     }
     irq_restore(flags);

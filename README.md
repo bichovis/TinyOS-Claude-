@@ -61,7 +61,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 8    | IPC por puertos y driver de consola en EL0  | hecho  |
 | 9    | Arranque en hardware real: buzon, caches, SD | hecho  |
 | 10a  | Kernel en alto: split TTBR0 / TTBR1         | hecho  |
-| 10b  | ASIDs: dejar de tirar la TLB entera         | —      |
+| 10b  | ASIDs: dejar de tirar la TLB entera         | hecho  |
 
 ## Estructura
 
@@ -119,10 +119,33 @@ A cambio:
     intenta leerlo, no es un fallo de permisos, es que ahi no hay nada
   - TTBR0 queda entero para el usuario, que ahora empieza en 4 MB
 
+### ASIDs
+
+Faltaba la otra mitad: aunque el kernel ya no se mueva, cada cambio de
+proceso seguia tirando la TLB entera, entradas del kernel incluidas.
+
+Un ASID es una etiqueta. Toda entrada de la TLB que venga de una pagina
+marcada `nG` (las de usuario, ver `MM_USER_CODE` y `MM_USER_DATA`) se guarda
+con el ASID del espacio que la creo, y la MMU solo la da por buena si
+coincide con el activo. Las del kernel no llevan `nG`: son globales y valen
+siempre.
+
+El ASID activo no es un registro aparte, son los bits [63:48] de
+**TTBR0_EL1** — los mismos que la direccion de la tabla. No es por ahorrar
+registros: es para que cambiar de tabla y de etiqueta sea *una* escritura
+de 64 bits. Si fueran dos, existiria un instante con la tabla nueva y la
+etiqueta vieja, y lo que la MMU cachease ahi quedaria mal etiquetado.
+
+Asi que `vmm_switch_to()` es ahora una escritura y un `isb`, sin ninguna
+invalidacion. La unica que queda en la vida de un proceso es un
+`tlbi aside1is` cuando muere y su etiqueta se recicla, en `vmm_destroy_pgd()`.
+
 ## Limitaciones conocidas
 
-- Sin ASIDs: cada cambio de espacio de direcciones invalida la TLB entera,
-  incluidas las entradas del kernel, que no han cambiado.
+- Los ASIDs se agotan: hay 255 utiles y solo se devuelven en
+  `vmm_destroy_pgd()`, al que todavia no llama nadie porque los procesos
+  muertos quedan zombis. Tras 255 procesos, `task_create_user()` falla
+  limpiamente. Se arregla solo en cuanto haya recolector.
 - El cargador de procesos mapea toda la imagen como codigo de solo lectura,
   asi que un programa de usuario no puede tener variables globales
   escribibles; solo pila.

@@ -71,8 +71,13 @@ int vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags)
      * desquiciantes que existen: el mapa esta bien, pero no funciona. */
     __asm__ volatile(
         "dsb ishst\n"                    /* que la escritura sea visible   */
-        "tlbi vaae1is, %0\n"             /* invalida esa VA en todos los   */
-                                         /* nucleos del inner shareable    */
+        "tlbi vaae1is, %0\n"             /* esa VA, en todos los nucleos   */
+                                         /* y en todos los ASIDs: aqui no  */
+                                         /* sabemos de quien es la tabla,  */
+                                         /* y pasarse de celoso es gratis  */
+                                         /* (esto solo corre al crear un   */
+                                         /* proceso o al mapear en el      */
+                                         /* kernel, no en cada cambio)     */
         "dsb ish\n"
         "isb\n"
         :: "r"(va >> PAGE_SHIFT) : "memory");
@@ -86,6 +91,63 @@ int vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags)
 
 uint64_t *vmm_empty_pgd(void) { return empty_pgd; }
 
+/* --- ASIDs: etiquetar la TLB -------------------------------------------
+ *
+ * Hasta aqui, cada cambio de proceso tiraba la TLB entera. Con el kernel en
+ * TTBR1 eso era ademas absurdo: sus traducciones no cambian nunca y las
+ * tirabamos igual, unas setecientas veces en diez segundos de arranque.
+ *
+ * Lo que ofrece el hardware es etiquetar. Cada entrada de la TLB que venga
+ * de una pagina marcada 'nG' (non-global) se guarda con el ASID del espacio
+ * que la creo, y la MMU solo la da por buena si coincide con el ASID
+ * activo. Las paginas del kernel NO llevan nG: son globales, valen en todos
+ * los espacios y ya nadie las echa.
+ *
+ * Y el ASID activo no vive en un registro aparte: son los bits [63:48] de
+ * TTBR0_EL1, los mismos que la direccion de la tabla. Eso no es por ahorrar
+ * registros, es para que cambiar de tabla y de etiqueta sea UNA escritura
+ * de 64 bits. Si fueran dos, existiria un instante con la tabla nueva y la
+ * etiqueta vieja, y lo que la MMU cachease en ese instante estaria mal
+ * etiquetado para siempre.
+ *
+ * Usamos 8 bits (TCR_EL1.AS = 0): 256 espacios, de sobra para 16 tareas.
+ * El ASID 0 se reserva para "no tengo espacio de usuario".
+ */
+#define ASID_MAX     256
+#define ASID_WORDS   (ASID_MAX / 64)
+
+static uint64_t asid_map[ASID_WORDS] = { 1 };   /* el 0 nace ocupado */
+
+static uint64_t asid_alloc(void)
+{
+    for (uint64_t i = 1; i < ASID_MAX; i++) {
+        if (!(asid_map[i / 64] & (1UL << (i % 64)))) {
+            asid_map[i / 64] |= 1UL << (i % 64);
+            return i;
+        }
+    }
+    return 0;                        /* no quedan; 0 significa fallo */
+}
+
+static void asid_free(uint64_t asid)
+{
+    if (asid == 0 || asid >= ASID_MAX) return;
+
+    /* Antes de reciclar una etiqueta hay que borrar de la TLB todo lo que
+     * la lleve puesta: si no, el proximo proceso que la reciba heredaria
+     * las traducciones del muerto y leeria su memoria. Esta es la unica
+     * invalidacion que queda en la vida de un proceso, y ocurre cuando
+     * muere, no cada vez que le toca la CPU. */
+    __asm__ volatile(
+        "dsb ishst\n"
+        "tlbi aside1is, %0\n"        /* toda la TLB de ESE espacio */
+        "dsb ish\n"
+        "isb\n"
+        :: "r"(asid << 48) : "memory");
+
+    asid_map[asid / 64] &= ~(1UL << (asid % 64));
+}
+
 /* Tabla de traduccion nueva para un proceso: vacia del todo.
  *
  * Hasta el paso anterior habia que copiarle al proceso las dos primeras
@@ -95,18 +157,26 @@ uint64_t *vmm_empty_pgd(void) { return empty_pgd; }
  * comparten ni una entrada de tabla.
  *
  * Devolvemos un puntero VIRTUAL (lineal); la direccion fisica, que es la
- * que acaba en TTBR0, se saca con virt_to_phys cuando hace falta. */
-uint64_t *vmm_create_pgd(void)
+ * que acaba en TTBR0, se saca con virt_to_phys cuando hace falta. Y de
+ * paso repartimos el ASID: un espacio de direcciones es la tabla mas la
+ * etiqueta, y no tiene sentido tener una sin la otra. */
+uint64_t *vmm_create_pgd(uint64_t *asid_out)
 {
-    uint64_t pa = pmm_alloc();
-    if (!pa) return 0;
+    uint64_t asid = asid_alloc();
+    if (!asid) return 0;             /* sin etiquetas libres */
 
-    return phys_to_virt(pa);        /* pmm_alloc ya la entrega a cero */
+    uint64_t pa = pmm_alloc();
+    if (!pa) { asid_free(asid); return 0; }
+
+    *asid_out = asid;
+    return phys_to_virt(pa);         /* pmm_alloc ya la entrega a cero */
 }
 
-void vmm_destroy_pgd(uint64_t *pgd)
+void vmm_destroy_pgd(uint64_t *pgd, uint64_t asid)
 {
     if (!pgd) return;
+
+    asid_free(asid);          /* devuelve la etiqueta y limpia su TLB */
 
     /* Ahora la tabla es entera del proceso: se libera desde la entrada 0.
      * Antes habia que saltarse las dos primeras, que eran del kernel. */
@@ -129,22 +199,22 @@ void vmm_destroy_pgd(uint64_t *pgd)
     pmm_free(virt_to_phys(pgd));
 }
 
-/* Cambiar de proceso es ahora tocar UN registro. TTBR1 (el kernel) se queda
- * donde esta, asi que nada de lo que el kernel tenga en la TLB se pierde...
- * salvo porque seguimos tirando la TLB entera. Eso lo arregla el paso 10b
- * con los ASIDs. */
-void vmm_switch_to(uint64_t *pgd)
+/* Cambiar de proceso es, por fin, UNA escritura.
+ *
+ * La tabla y la etiqueta van juntas en TTBR0_EL1, y no hay ninguna
+ * invalidacion: lo del proceso que se va queda en la TLB con su ASID, lo
+ * del que entra con el suyo, y lo del kernel es global y no se toca. Si el
+ * proceso que se va vuelve dentro de tres turnos, sus traducciones siguen
+ * ahi.
+ *
+ * El 'isb' sigue siendo obligatorio: sin el, las instrucciones que ya
+ * estan en el pipeline podrian traducirse con el TTBR0 anterior. */
+void vmm_switch_to(uint64_t *pgd, uint64_t asid)
 {
     __asm__ volatile(
         "msr ttbr0_el1, %0\n"
         "isb\n"
-        /* Sin ASIDs hay que tirar la TLB entera en cada cambio de proceso.
-         * Es correcto pero caro; los ASID permiten conservar las entradas
-         * de cada espacio y es una de las mejoras evidentes de este codigo. */
-        "tlbi vmalle1\n"
-        "dsb ish\n"
-        "isb\n"
-        :: "r"(virt_to_phys(pgd)) : "memory");
+        :: "r"(virt_to_phys(pgd) | (asid << 48)) : "memory");
 }
 
 /* Traduce una direccion COMO LA VERIA EL0. Es la forma correcta de validar

@@ -38,6 +38,11 @@
 
 // TCR_EL1: 39 bits de VA en los dos lados, granulo de 4 KB, tablas
 // cacheables, PA de 40 bits. Lo que YA NO esta es EPD1: TTBR1 se enciende.
+//
+// Dos bits que valen 0 y conviene no perder de vista, porque de ellos
+// dependen los ASIDs:
+//   A1 (bit 22) = 0 -> el ASID activo sale de TTBR0_EL1, no de TTBR1_EL1
+//   AS (bit 36) = 0 -> el ASID son 8 bits, no 16. 256 espacios bastan.
 .equ TCR_VALUE,   (25) | (1 << 8) | (1 << 10) | (3 << 12) | \
                   (25 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | \
                   (2 << 30) | (2 << 32)

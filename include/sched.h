@@ -36,6 +36,7 @@ struct task {
     uint64_t    wake_tick;    /* si duerme, cuando despertar                */
     struct task *wait_next;   /* encadenamiento dentro de una cola de espera */
     uint64_t   *pgd;          /* tabla TTBR0 propia; 0 = hilo de kernel      */
+    uint64_t    asid;         /* etiqueta de su TLB; 0 = hilo de kernel      */
     uint64_t    mmio_va;      /* MMIO concedido a un driver de EL0; 0 si no  */
     const char *name;
 };

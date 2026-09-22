@@ -114,10 +114,10 @@ uint64_t vmm_translate(uint64_t va);  /* pregunta al hardware: VA -> PA      */
 
 /* --- Espacios de direcciones por proceso ------------------------------- */
 uint64_t *vmm_empty_pgd(void);        /* TTBR0 de un hilo de kernel      */
-uint64_t *vmm_create_pgd(void);       /* tabla nueva, con el kernel dentro   */
-void      vmm_destroy_pgd(uint64_t *pgd);
+uint64_t *vmm_create_pgd(uint64_t *asid_out);   /* tabla nueva + su ASID     */
+void      vmm_destroy_pgd(uint64_t *pgd, uint64_t asid);
 int       vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags);
-void      vmm_switch_to(uint64_t *pgd);   /* cambia TTBR0                    */
+void      vmm_switch_to(uint64_t *pgd, uint64_t asid);  /* tabla + etiqueta  */
 uint64_t  vmm_translate_user(uint64_t va);      /* ¿puede EL0 LEER aqui?     */
 uint64_t  vmm_translate_user_w(uint64_t va);    /* ¿puede EL0 ESCRIBIR aqui? */
 
