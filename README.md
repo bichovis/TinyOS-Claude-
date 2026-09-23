@@ -66,7 +66,8 @@ Tres cosas que QEMU perdona y el silicio no:
 | 12   | Cargador con secciones: W^X y globales      | hecho  |
 | 13a  | Despertar los nucleos 1, 2 y 3              | hecho  |
 | 13b  | Cerrojos de verdad y `current` por nucleo   | hecho  |
-| 13c  | Que los cuatro nucleos ejecuten hilos       | —      |
+| 13c-1| Temporizador e interrupciones por nucleo    | hecho  |
+| 13c-2| Que los cuatro nucleos ejecuten hilos       | —      |
 
 ## Estructura
 
@@ -303,10 +304,44 @@ ahora cada nucleo lee el suyo. Las ranuras 0 a 3 de `tasks[]` quedan
 reservadas para la tarea idle de cada nucleo: el contexto en el que ya
 estaba cuando arranco.
 
+## Un temporizador por nucleo
+
+El temporizador generico de ARM no es un periferico compartido: `CNTP_TVAL_EL0`
+y `CNTP_CTL_EL0` son registros de CPU, uno por nucleo. Y en el BCM2837,
+`CORE0_TIMER_IRQCNTL` tampoco era un registro — era el primero de cuatro,
+uno cada 4 bytes, igual que `CORE0_IRQ_SOURCE`. Mientras solo habia un
+nucleo despierto la diferencia no se veia.
+
+Ahora cada nucleo arma el suyo y `irq_handle()` pregunta por el registro del
+nucleo en el que esta. Se ve en el comando `j`:
+
+    nucleo  MPIDR_EL1           EL  SP (su pila)        IRQ atendidas
+      0     0x0000000080000000  1   0xFFFFFF80000E80D0  641
+      1     0x0000000080000001  1   0xFFFFFF80000E4100  640
+      2     0x0000000080000002  1   0xFFFFFF80000E0100  640
+      3     0x0000000080000003  1   0xFFFFFF80000DC100  640
+
+Dos cosas siguen siendo de uno solo, a proposito:
+
+  - **El reloj del sistema.** `timer_ticks()` lo sube solo el nucleo 0. Si
+    lo subieran los cuatro, el tiempo correria al cuadruple y
+    `task_sleep(100)` dormiria 250 ms en vez de un segundo.
+  - **Las IRQ de perifericos.** `GPU_INT_ROUTING` las manda todas al nucleo
+    0, asi que el bit `SRC_GPU` solo se enciende alli.
+
+Lo que si es de cada uno es `need_resched` y la contabilidad de su hilo: que
+al nucleo 2 se le acabe el turno no dice nada de lo que hace el 3.
+
+Y `pick_next()` ya no acepta `TASK_RUNNING`. Antes daba igual, porque
+RUNNING solo podia significar "la de esta CPU"; con cuatro nucleos significa
+"corriendo en alguno", y elegirla seria ponerla a ejecutar en dos sitios a
+la vez sobre la misma pila.
+
 ## Limitaciones conocidas
 
-- Los nucleos 1-3 todavia no entran al planificador: solo ejecutan los
-  encargos de `smp.c`. Lo que falta para que ejecuten hilos es el paso 13c:
+- Los nucleos 1-3 reciben su tick y llevan su contabilidad, pero todavia no
+  cambian de hilo: `sched_preempt()` les da la vuelta mientras
+  `smp_sched_ready` valga 0. Lo que falta para encenderlo es el paso 13c-2:
     - el planificador, las colas de espera y los puertos IPC siguen
       protegidos solo con `irq_save()`. Hoy basta, porque solo el nucleo 0
       planifica; en cuanto planifiquen cuatro, no.
@@ -315,7 +350,6 @@ estaba cuando arranco.
       traves de un cambio de contexto, porque quien lo soltaria ya no es
       quien lo cogio. Hay que soltarlo DESPUES del cambio, desde el hilo
       que entra.
-    - el temporizador es por nucleo y solo esta inicializado en el 0.
     - el recolector puede liberar la pila de un zombi porque, para que el
       llegue a ejecutarse, el zombi ha tenido que dejar la CPU. Con cuatro
       nucleos el zombi puede seguir corriendo en otro.

@@ -17,6 +17,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "sched.h"
+#include "smp.h"
 
 static uint32_t          counter_hz;    /* frecuencia del contador       */
 static uint32_t          interval;      /* cuentas entre dos ticks       */
@@ -45,6 +46,7 @@ static inline void write_ctl(uint64_t v)
     __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(v));
 }
 
+/* El ritmo lo fija el nucleo 0 una sola vez. */
 void timer_init(uint32_t hz)
 {
     counter_hz = (uint32_t)read_cntfrq();
@@ -54,14 +56,33 @@ void timer_init(uint32_t hz)
     interval = counter_hz / hz;
     ticks    = 0;
 
+    timer_start_core();
+}
+
+/* Pero el temporizador es de cada nucleo: CNTP_TVAL_EL0 y CNTP_CTL_EL0 son
+ * registros de CPU, no un periferico compartido. Cada nucleo tiene que
+ * armar el suyo o no recibira un solo tick.
+ *
+ * Se ponen explicitamente los dos aunque "deberian" venir a cero: en tres
+ * de los cuatro nucleos nadie los ha tocado nunca, y lo que haya dejado el
+ * firmware no es asunto nuestro. */
+void timer_start_core(void)
+{
+    write_ctl(0);                       /* parado mientras lo configuramos */
     write_tval(interval);
     write_ctl(1);                       /* ENABLE=1, IMASK=0 -> que avise  */
 }
 
 void timer_irq(void)
 {
-    ticks++;
-    scheduler_tick();          /* contabilidad y despertares */
+    /* 'ticks' es el reloj del SISTEMA, no el de este nucleo. Si lo subieran
+     * los cuatro, el tiempo correria al cuadruple y task_sleep() dormiria
+     * la cuarta parte. Lo lleva el nucleo 0 y nadie mas. */
+    if (this_core() == 0)
+        ticks++;
+
+    scheduler_tick();          /* esto si es de cada nucleo */
+
     /* Rearmar. Escribir TVAL de nuevo tambien baja la senal de interrupcion:
      * es asi como se "reconoce" este temporizador, no hay registro de ACK. */
     write_tval(interval);

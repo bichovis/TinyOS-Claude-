@@ -37,7 +37,15 @@ _Static_assert(__builtin_offsetof(struct task, ctx) == 0, "ctx debe ir primero")
  * reparten a quien las pida. */
 static struct task tasks[MAX_TASKS];
 static uint64_t    next_pid = CORES;
-static volatile int need_resched;
+/* Uno por nucleo: que al nucleo 2 se le acabe el turno a su hilo no dice
+ * nada de lo que esta haciendo el 3. */
+static volatile int need_resched[CORES];
+
+/* Los nucleos 1-3 ya reciben su tick y llevan su contabilidad, pero
+ * todavia NO planifican: el planificador no es seguro entre nucleos hasta
+ * que tenga su cerrojo, y eso es el paso siguiente. Mientras tanto, cada
+ * uno se queda en su tarea idle. */
+static volatile int smp_sched_ready;
 static uint64_t switches;        /* cambios de contexto totales */
 
 static const char *idle_names[CORES] = { "idle0", "idle1", "idle2", "idle3" };
@@ -129,18 +137,27 @@ static struct task *pick_next(void)
         uint64_t idx = (start + (uint64_t)i) % MAX_TASKS;
         if (idx < CORES) continue;      /* las idle no compiten */
         struct task *t = &tasks[idx];
-        if (t->state == TASK_READY || t->state == TASK_RUNNING)
+
+        /* Solo READY. Antes valia tambien RUNNING, porque RUNNING solo
+         * podia significar "la que esta en esta CPU". Con cuatro nucleos
+         * significa "corriendo en alguno", y elegirla seria ponerla a
+         * ejecutar en dos sitios a la vez, sobre la misma pila. */
+        if (t->state == TASK_READY)
             return t;
     }
-    return &tasks[this_core()];         /* nadie quiere CPU: la idle de
-                                           ESTE nucleo, no la del 0 */
+
+    /* Nadie mas listo: seguimos con la que hay, si es que sigue queriendo
+     * CPU; y si no, la tarea idle de ESTE nucleo, no la del 0. */
+    if (current->state == TASK_RUNNING)
+        return current;
+    return &tasks[this_core()];
 }
 
 void schedule(void)
 {
     uint64_t flags = irq_save();
 
-    need_resched = 0;
+    need_resched[this_core()] = 0;
     struct task *prev = current;
     struct task *next = pick_next();
 
@@ -170,28 +187,42 @@ void schedule(void)
 
 void scheduler_tick(void)
 {
-    /* Despertar a las que les toque. Recorrer el array entero en cada tick
-     * es ineficiente; con muchos hilos se usaria una cola ordenada. */
-    uint64_t now = timer_ticks();
-    for (int i = 0; i < MAX_TASKS; i++) {
-        if (tasks[i].state == TASK_SLEEPING && now >= tasks[i].wake_tick)
-            tasks[i].state = TASK_READY;
+    /* Los despertares van con el reloj del sistema, que lleva el nucleo 0.
+     * Que lo recorrieran los cuatro seria hacer cuatro veces el mismo
+     * trabajo, y sobre una tabla que aun no tiene cerrojo. */
+    if (this_core() == 0) {
+        /* Recorrer el array entero en cada tick es ineficiente; con muchos
+         * hilos se usaria una cola ordenada. */
+        uint64_t now = timer_ticks();
+        for (int i = 0; i < MAX_TASKS; i++) {
+            if (tasks[i].state == TASK_SLEEPING && now >= tasks[i].wake_tick)
+                tasks[i].state = TASK_READY;
+        }
     }
 
+    /* Esto si es de cada nucleo: la contabilidad de SU hilo y SU turno. */
     if (!current) return;
     current->ticks_run++;
 
     if (current->counter > 0)
         current->counter--;
     if (current->counter == 0)
-        need_resched = 1;       /* se le acabo el turno */
+        need_resched[this_core()] = 1;       /* se le acabo el turno */
 }
 
 /* La llama irq_handle() al terminar de atender la interrupcion: es el punto
  * seguro para cambiar de hilo, con el trap_frame ya guardado en la pila. */
 void sched_preempt(void)
 {
-    if (need_resched)
+    uint64_t core = this_core();
+
+    /* Los secundarios reciben su tick y lo apuntan, pero no cambian de
+     * hilo: sin cerrojo en el planificador, dos nucleos podrian llevarse
+     * la misma tarea. Lo enciende el paso siguiente. */
+    if (core != 0 && !smp_sched_ready)
+        return;
+
+    if (need_resched[core])
         schedule();
 }
 

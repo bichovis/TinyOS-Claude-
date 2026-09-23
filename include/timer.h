@@ -2,7 +2,8 @@
 #pragma once
 #include <stdint.h>
 
-void     timer_init(uint32_t hz);   /* arranca el tick periodico           */
+void     timer_init(uint32_t hz);   /* lo llama el nucleo 0: fija el ritmo  */
+void     timer_start_core(void);    /* y esto, CADA nucleo: arma el suyo    */
 void     timer_irq(void);           /* lo llama irq.c al saltar la IRQ     */
 uint64_t timer_ticks(void);         /* ticks desde el arranque             */
 uint64_t timer_uptime_ms(void);     /* milisegundos desde el arranque      */

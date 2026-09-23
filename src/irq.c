@@ -22,6 +22,7 @@
 #include "timer.h"
 #include "uart.h"
 #include "sched.h"
+#include "smp.h"
 
 /* --- [2] ARM local peripherals ---------------------------------------- */
 /* LOCAL_BASE lo define mmio.h: 0x40000000 fisico, visto desde el mapa
@@ -29,8 +30,12 @@
 #define GPU_INT_ROUTING       (LOCAL_BASE + 0x0C)  /* a que nucleo van las */
                                                    /* IRQ del controlador  */
                                                    /* de perifericos       */
-#define CORE0_TIMER_IRQCNTL   (LOCAL_BASE + 0x40)  /* que timers avisan    */
-#define CORE0_IRQ_SOURCE      (LOCAL_BASE + 0x60)  /* quien ha interrumpido*/
+/* Ojo: estos NO son un registro, son el primero de cuatro. Cada nucleo
+ * tiene el suyo, uno cada 4 bytes. Escribir siempre en el del nucleo 0 es
+ * lo que hacia este fichero cuando solo habia un nucleo despierto. */
+#define CORE_TIMER_IRQCNTL(c) (LOCAL_BASE + 0x40 + 4 * (c))  /* que timers  */
+                                                             /* avisan      */
+#define CORE_IRQ_SOURCE(c)    (LOCAL_BASE + 0x60 + 4 * (c))  /* quien fue   */
 
 #define SRC_CNTPSIRQ          (1u << 0)   /* timer fisico seguro           */
 #define SRC_CNTPNSIRQ         (1u << 1)   /* timer fisico NO seguro <- ese */
@@ -49,7 +54,9 @@
 
 #define IRQ_UART              57          /* la PL011 es la fuente 57      */
 
-static volatile uint64_t irqs;
+/* Una cuenta por nucleo: sumar sobre la misma variable desde cuatro
+ * manejadores seria justo el error que el paso 13b acaba de ensenyar. */
+static volatile uint64_t irqs[CORES];
 
 void irq_init(void)
 {
@@ -64,25 +71,35 @@ void irq_init(void)
      *   bits [3:2] = nucleo que recibe las FIQ                            */
     mmio_write(GPU_INT_ROUTING, 0);
 
-    /* [2] Que el temporizador fisico no-seguro del nucleo 0 genere IRQ.
-     *     Estamos en non-secure EL1 (lo fijamos con SCR_EL3.NS), de ahi
-     *     que el bit correcto sea CNTPNSIRQ y no CNTPSIRQ. */
-    mmio_write(CORE0_TIMER_IRQCNTL, SRC_CNTPNSIRQ);
-
     /* [1] Habilitar la fuente 57 (UART0). Como 57 >= 32, va en el banco 2
      *     y el bit dentro del banco es 57 - 32 = 25. */
     mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
+
+    irq_init_core();                 /* y lo que le toca al nucleo 0 */
+}
+
+/* [2] Que el temporizador fisico no-seguro de ESTE nucleo genere IRQ.
+ *     Estamos en non-secure EL1 (lo fijamos con SCR_EL3.NS), de ahi que el
+ *     bit correcto sea CNTPNSIRQ y no CNTPSIRQ. */
+void irq_init_core(void)
+{
+    mmio_write(CORE_TIMER_IRQCNTL(this_core()), SRC_CNTPNSIRQ);
 }
 
 void irq_handle(void)
 {
-    irqs++;
+    uint64_t core = this_core();
+    irqs[core]++;
 
-    uint32_t src = mmio_read(CORE0_IRQ_SOURCE);
+    /* Cada nucleo pregunta por su propio registro: el del 0 no dice nada
+     * de lo que le ha pasado al 2. */
+    uint32_t src = mmio_read(CORE_IRQ_SOURCE(core));
 
     if (src & SRC_CNTPNSIRQ)
         timer_irq();
 
+    /* Las IRQ de perifericos van todas al nucleo 0 (GPU_INT_ROUTING), asi
+     * que este bit solo se enciende alli. */
     if (src & SRC_GPU) {
         /* Segunda pregunta: dentro del controlador [1], quien fue. */
         uint32_t p2 = mmio_read(IRQ_PENDING_2);
@@ -96,7 +113,18 @@ void irq_handle(void)
     sched_preempt();
 }
 
-uint64_t irq_count(void) { return irqs; }
+uint64_t irq_count(void)
+{
+    uint64_t total = 0;
+    for (uint64_t c = 0; c < CORES; c++)
+        total += irqs[c];
+    return total;
+}
+
+uint64_t irq_count_core(uint64_t core)
+{
+    return (core < CORES) ? irqs[core] : 0;
+}
 
 /* --- Mascara de interrupciones de la propia CPU ------------------------
  * DAIF: D=Debug, A=SError, I=IRQ, F=FIQ. Un 1 significa "tapada".

@@ -21,6 +21,7 @@
 #include "sched.h"
 #include "spinlock.h"
 #include "irq.h"
+#include "exception.h"
 
 extern char              secondary_entry[];   /* boot.S */
 extern volatile uint64_t smp_go;              /* boot.S, en .data */
@@ -112,7 +113,17 @@ void secondary_main(uint64_t core)
      * para que 'current' (o sea, TPIDR_EL1) valga algo aqui tambien. */
     sched_adopt_core(core);
 
+    /* VBAR_EL1 tambien es por nucleo, y este no lo ha puesto nadie. Si
+     * llega una interrupcion sin tabla de vectores, el salto es al vacio:
+     * tiene que ser LO PRIMERO, antes de destapar nada. */
+    exception_init();
+
+    irq_init_core();                 /* que su temporizador pueda avisarle */
+    timer_start_core();              /* y que cuente                       */
+
     fill_info(core);
+
+    irq_enable();                    /* ahora si */
 
     uint64_t visto = 0;
     for (;;) {
@@ -194,7 +205,7 @@ int smp_start_secondaries(void)
 
 void smp_dump(void)
 {
-    uart_puts("\n  nucleo  MPIDR_EL1           EL  SP (su pila)        TTBR1\n");
+    uart_puts("\n  nucleo  MPIDR_EL1           EL  SP (su pila)        IRQ atendidas\n");
     for (uint64_t c = 0; c < CORES; c++) {
         uart_puts("    ");
         uart_putc((char)('0' + c));
@@ -211,8 +222,8 @@ void smp_dump(void)
         uart_putc((char)('0' + cores[c].el));
         uart_puts("   0x");
         uart_hex64(cores[c].sp);
-        uart_puts("  0x");
-        uart_hex64(cores[c].ttbr1);
+        uart_puts("  ");
+        uart_dec(irq_count_core(c));
         uart_puts("\n");
     }
 }
