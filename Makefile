@@ -39,7 +39,7 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir lento
 
 # Los que van a /usr/bin de la tarjeta: todos menos los cinco que el kernel
 # lleva dentro (init, sh, fs, conserver, client) y por tanto no necesitan
@@ -57,9 +57,14 @@ EXTRA_fs := user/sd.c
 # Fijate en lo que NO esta aqui: -mgeneral-regs-only, que si lleva el
 # kernel. Los programas de usuario pueden usar coma flotante y SIMD desde
 # el paso 30; el kernel sigue sin poder, y eso es a proposito (ver fpu.h).
+# -MMD -MP: que el compilador apunte de que cabeceras depende cada objeto.
+# El kernel lo tenia desde siempre; los programas de usuario y la libc, no,
+# y sus reglas listaban las cabeceras A MANO. Una lista a mano se queda
+# corta en cuanto se anyade un #include, y lo que sale de ahi no parece un
+# fallo de construccion: parece un fallo de codigo. Ver el README.
 UCFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -ffreestanding -nostdlib \
            -nostartfiles -mcpu=cortex-a53 -mstrict-align \
-           -fno-stack-protector -fno-pie -fno-common \
+           -fno-stack-protector -fno-pie -fno-common -MMD -MP \
            -ffunction-sections -fdata-sections -Iuser -Ilib -I$(INCDIR)
 # -z max-page-size=4096 : sin esto el enlazador de AArch64 alinea los
 #                         segmentos a 64 KB y el ELF engorda quince veces
@@ -85,7 +90,9 @@ ASRCS   := $(wildcard $(SRCDIR)/*.S)
 OBJS    := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(wildcard $(SRCDIR)/*.c)) \
            $(patsubst $(SRCDIR)/%.S,$(BUILD)/%.S.o,$(ASRCS)) \
            $(patsubst %,$(BUILD)/%_bin.o,$(UPROGS))
-DEPS    := $(OBJS:.o=.d)
+# Las tres familias de objetos, no solo la del kernel.
+DEPS    := $(OBJS:.o=.d) $(LIBCOBJ:.o=.d) $(CRT0:.o=.d) \
+           $(patsubst %,$(BUILD)/%.elf.d,$(UPROGS))
 
 .PHONY: all clean run debug dump sdcard sd firmware sdtest
 all: $(BUILD)/kernel8.img
@@ -106,7 +113,7 @@ $(BUILD)/%.S.o: $(SRCDIR)/%.S | $(BUILD)
 $(BUILD)/lib:
 	@mkdir -p $(BUILD)/lib
 
-$(BUILD)/lib/%.o: lib/%.c lib/stdio.h lib/string.h lib/stdlib.h | $(BUILD)/lib
+$(BUILD)/lib/%.o: lib/%.c | $(BUILD)/lib
 	@echo "  CC-L  $<"
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
@@ -115,7 +122,7 @@ $(BUILD)/lib/%.o: lib/%.c lib/stdio.h lib/string.h lib/stdlib.h | $(BUILD)/lib
 # lo sustituye por una llamada a memcpy; dentro de memcpy eso es recursion
 # infinita. Con -ffreestanding no llega a pasar, pero asi la correccion de
 # memcpy no depende de un efecto secundario de otro flag. Ver lib/string.c.
-$(BUILD)/lib/string.o: lib/string.c lib/string.h | $(BUILD)/lib
+$(BUILD)/lib/string.o: lib/string.c | $(BUILD)/lib
 	@echo "  CC-L  $< (sin reconocimiento de patrones)"
 	@$(CC) $(UCFLAGS) -fno-tree-loop-distribute-patterns -c $< -o $@
 
@@ -136,11 +143,12 @@ $(LIBC): $(LIBCOBJ)
 # importa: el enlazador recorre los archivos una vez y solo saca de ellos
 # lo que ya sabe que le falta, asi que una biblioteca puesta antes que
 # quien la usa no aporta nada.
-$(BUILD)/%.elf: user/%.c user/syscall.h user/sd.c user/sd.h \
-                $(CRT0) $(LIBC) \
-                $(INCDIR)/ipc_abi.h $(INCDIR)/fs_abi.h user/user.ld | $(BUILD)
+# Compila y enlaza de una vez, asi que el fichero de dependencias hay que
+# nombrarlo a mano: -MMD lo deduce del -o, y aqui el -o es un ejecutable.
+$(BUILD)/%.elf: user/%.c $(CRT0) $(LIBC) user/user.ld | $(BUILD)
 	@echo "  CC-U  user/$*.c"
-	@$(CC) $(UCFLAGS) $(ULDFLAGS) $(CRT0) user/$*.c $(EXTRA_$*) $(LIBC) -o $@
+	@$(CC) $(UCFLAGS) -MF $(BUILD)/$*.elf.d $(ULDFLAGS) $(CRT0) user/$*.c \
+	       $(EXTRA_$*) $(LIBC) -o $@
 
 # Lo que se empotra en el kernel es el ELF tal cual. Antes era un binario
 # plano con una cabecera que nos habiamos inventado; ahora el formato ya

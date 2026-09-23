@@ -66,11 +66,18 @@ static inline int64_t revisar(int64_t r)
 /* --- Descriptores ------------------------------------------------------
  * El 0 es la entrada y el 1 la salida, por costumbre. Quien arranca el
  * programa puede ponerles lo que quiera, y el programa no se entera. */
+/* Las dos pasan por revisar(), como todo lo demas desde el paso 48.
+ *
+ * Eran las unicas que no, y se noto en cuanto alguien pregunto POR QUE:
+ * el kernel decia -EINTR y aqui llegaba tal cual, asi que quien miraba
+ * errno veia lo que hubiera de antes. Un read interrumpido por una senyal
+ * y una entrada que se acaba son cosas distintas y tienen que contestar
+ * cosas distintas. */
 static inline int64_t write(int fd, const void *buf, uint64_t n)
-{ return syscall3(SYS_write, (uint64_t)fd, (uint64_t)buf, n); }
+{ return revisar(syscall3(SYS_write, (uint64_t)fd, (uint64_t)buf, n)); }
 
 static inline int64_t read(int fd, void *buf, uint64_t n)
-{ return syscall3(SYS_read, (uint64_t)fd, (uint64_t)buf, n); }
+{ return revisar(syscall3(SYS_read, (uint64_t)fd, (uint64_t)buf, n)); }
 
 static inline int64_t pipe(int fds[2])
 { return syscall2(SYS_pipe, (uint64_t)fds, 0); }
@@ -119,6 +126,22 @@ static inline void *sbrk(int64_t delta)
 /* Esperar a que termine un proceso y recoger su codigo de salida. Vuelve
  * -1 si ya no existe o si nos interrumpio una senyal. */
 static inline int64_t waitpid(uint64_t pid) { return syscall2(SYS_waitpid, pid, 0); }
+
+/* Preguntar sin quedarse esperando. Devuelve el codigo de salida, o
+ * -EAGAIN si ese proceso sigue vivo. Es lo que necesita un shell para
+ * enterarse de que un trabajo de segundo plano ha terminado sin bloquearse
+ * en el, y de paso para recogerlo: un hijo que nadie espera se queda de
+ * zombi. */
+static inline int64_t waitpid_ya(uint64_t pid)
+{ return syscall2(SYS_waitpid, pid, WNOHANG); }
+
+/* El grupo, o sea el trabajo. Con pid 0 se refiere a uno mismo, y con
+ * pgid 0 el grupo pasa a llamarse como el propio pid: "formo el mio". */
+static inline int64_t setpgid(uint64_t pid, uint64_t pgid)
+{ return syscall2(SYS_setpgid, pid, pgid); }
+
+static inline int64_t getpgid(uint64_t pid)
+{ return syscall2(SYS_getpgid, pid, 0); }
 static inline void yield(void)            { syscall2(SYS_yield, 0, 0); }
 static inline uint64_t getpid(void)       { return (uint64_t)syscall2(SYS_getpid, 0, 0); }
 static inline void sleep(uint64_t ticks)  { syscall2(SYS_sleep, ticks, 0); }
@@ -149,9 +172,15 @@ static inline int64_t realpath(const char *ruta, char *salida)
                                           { return syscall2(SYS_realpath, (uint64_t)ruta,
                                                             (uint64_t)salida); }
 
-/* --- Solo para init ---------------------------------------------------
- * Arrancar un programa de los que el kernel lleva dentro, y decir quien
- * manda en la consola. A cualquier otro proceso le contestan -1. */
+/* --- Arrancar lo empotrado, y repartir la consola ---------------------
+ *
+ * bootstrap sigue siendo solo de init: es la unica forma de llegar a los
+ * programas que el kernel lleva dentro.
+ *
+ * consola() ya no. Poner un grupo en primer plano lo puede hacer init o
+ * cualquiera cuyo grupo la tenga ya, que es la regla que necesita un
+ * shell para ceder la consola al trabajo que arranca y recuperarla
+ * cuando termina. */
 static inline int64_t bootstrap(const char *nombre, char *const argv[],
                                 char *const envp[], uint64_t dispositivo)
 {
@@ -159,8 +188,8 @@ static inline int64_t bootstrap(const char *nombre, char *const argv[],
                     (uint64_t)envp, dispositivo);
 }
 
-static inline int64_t consola(uint64_t pid)
-{ return syscall2(SYS_consola, pid, 0); }
+static inline int64_t consola(uint64_t pgid)
+{ return syscall2(SYS_consola, pgid, 0); }
 
 /* Copiar una cadena con tope. Hace falta en varios programas. */
 static inline void ucopiar(char *dst, const char *src, uint64_t max)

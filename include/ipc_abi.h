@@ -60,7 +60,14 @@ struct message {
 #define SYS_spawn        11    /* (buffer, bytes, argv[], envp[]) -> pid|-1*/
 #define SYS_clock_rate   12    /* (id) -> Hz de un reloj de la placa        */
 #define SYS_read         13    /* (fd, buffer, bytes) -> leidos | 0 | -1    */
-#define SYS_waitpid      14    /* (pid) -> 0 cuando ese proceso termina     */
+#define SYS_waitpid      14    /* (pid, banderas) -> codigo de salida       */
+
+/* Esperar sin esperar. Sin esto, un shell con trabajos en segundo plano no
+ * puede enterarse de que uno ha terminado sin quedarse bloqueado en el, y
+ * un hijo al que nadie recoge se queda de zombi. Devuelve -EAGAIN si ese
+ * proceso sigue vivo, que con el convenio del paso 48 no se confunde con
+ * ningun codigo de salida. */
+#define WNOHANG           1
 #define SYS_sbrk         15    /* (delta) -> tope viejo del monton          */
 #define SYS_fork         16    /* () -> pid del hijo en el padre, 0 en el hijo */
 #define SYS_freepages    17    /* () -> paginas de 4 KB libres en el sistema */
@@ -133,9 +140,28 @@ struct message {
 #define DEV_UART          1
 #define DEV_EMMC          2
 
-/* Ceder la consola a un proceso: quien la tenga recibe el Ctrl-C y lee del
- * teclado. Solo init, que es quien decide que hay en primer plano. */
-#define SYS_consola      36   /* (pid) -> 0 | -1                            */
+/* --- Grupos de procesos, o el trabajo en vez del proceso --------------
+ *
+ * Lo que una persona teclea no es un proceso: es un TRABAJO. "cat x | wc"
+ * son dos procesos y una sola cosa, y cuando pulsa Ctrl-C quiere parar la
+ * cosa, no uno de los dos. Un grupo es exactamente eso: un nombre para
+ * "esto de aqui", y su nombre es el pid del primero que lo formo.
+ *
+ * Se HEREDA en el fork -un hijo pertenece al trabajo de su padre- y
+ * SOBREVIVE al exec, igual que el directorio actual: el programa cambia,
+ * pero de que trabajo forma parte no.
+ *
+ * setpgid lo tienen que llamar LOS DOS, el padre despues del fork y el
+ * hijo antes del exec. Escrito una sola vez hay una carrera en cualquiera
+ * de los dos sitios, y en el capitulo del README esta por que. */
+#define SYS_setpgid      48   /* (pid, pgid) -> 0 | -1                      */
+#define SYS_getpgid      49   /* (pid) -> pgid | -1                         */
+
+/* Ceder la consola a un GRUPO: el que la tenga es el de primer plano, y a
+ * el va el Ctrl-C. Puede cederla init, o cualquiera cuyo grupo la tenga ya
+ * -que es como se la devuelve un shell a si mismo cuando el trabajo que
+ * puso delante termina-. */
+#define SYS_consola      36   /* (pgid) -> 0 | -1                           */
 
 /* --- La hora -----------------------------------------------------------
  *

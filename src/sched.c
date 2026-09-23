@@ -937,7 +937,7 @@ static void fd_cerrar_todos(struct task *t)
  * de una llamada al sistema y su estado no es coherente; despues no hay
  * ocasion, porque ya se ha ido.
  */
-static volatile uint64_t consola_pid;      /* quien manda en la consola */
+static volatile uint64_t consola_pgid;     /* que GRUPO esta en primer plano */
 
 static void kcopy(void *dst, const void *src, uint64_t n);   /* mas abajo */
 
@@ -985,8 +985,92 @@ int task_set_handler(int sig, uint64_t manejador, uint64_t trampolin)
     return 0;
 }
 
-void task_set_console(uint64_t pid) { consola_pid = pid; }
-uint64_t task_console_pid(void)      { return consola_pid; }
+void task_set_console(uint64_t pgid) { consola_pgid = pgid; }
+uint64_t task_console_pid(void)       { return consola_pgid; }
+
+/* Meter un proceso en un grupo.
+ *
+ * Solo se puede mover a uno mismo o a un hijo, y solo mientras el hijo no
+ * se haya convertido ya en otro programa. Esa segunda regla es la de Unix
+ * y no es burocracia: en cuanto el hijo hace exec, el shell ya no sabe
+ * que esta ejecutando ahi dentro, y mover de trabajo a un programa que ya
+ * corre es cambiarle el suelo de sitio.
+ *
+ * Aqui la simplificamos a "a uno mismo o a un hijo", porque sin
+ * close-on-exec ni sesiones no hay forma de distinguir el antes del
+ * despues sin apuntar una bandera mas. */
+int task_set_pgid(uint64_t pid, uint64_t pgid)
+{
+    if (!current) return -ESRCH;
+    if (!pid)  pid  = current->pid;
+    if (!pgid) pgid = pid;
+
+    uint64_t flags = sched_lock_irqsave();
+
+    struct task *t = by_pid(pid);
+    int r = 0;
+
+    if (!t || !t->pgd)                              r = -ESRCH;
+    else if (t != current && t->parent != current->pid) r = -EPERM;
+    else t->pgid = pgid;
+
+    sched_unlock_irqrestore(flags);
+    return r;
+}
+
+/* Poner un grupo en primer plano.
+ *
+ * "Solo init" era una frontera de privilegio, pero no la correcta: quien
+ * tiene que ceder la consola al trabajo que acaba de arrancar es el
+ * shell, y el shell no es init. Y la regla de verdad no habla de quien
+ * eres sino de que llevas, como el testigo de una carrera:
+ *
+ *   1. init siempre, porque es quien la reparte cuando no queda nadie.
+ *   2. Si tu grupo la tiene ahora mismo, puedes pasarla.
+ *   3. Si la tiene un grupo que formaron hijos tuyos, puedes recuperarla.
+ *      Es lo que hace un shell cuando el trabajo que puso delante termina:
+ *      se la habia prestado, y se la devuelve a si mismo.
+ *   4. Si no la tiene nadie vivo, que se la quede quien la pida. El grupo
+ *      al que se le dio se ha muerto entero.
+ *
+ * Lo que la regla impide es lo que tiene que impedir: que un proceso de
+ * segundo plano se ponga delante por su cuenta y se quede con el teclado
+ * del que esta sentado ahi. */
+int task_dar_consola(uint64_t pgid)
+{
+    if (!current) return -EPERM;
+    if (current->pid == task_init_pid()) { task_set_console(pgid); return 0; }
+
+    uint64_t flags = sched_lock_irqsave();
+    uint64_t tiene = consola_pgid;
+
+    int mio = (current->pgid == tiene);
+    int de_un_hijo = 0, vivo = 0;
+
+    if (!mio && tiene)
+        for (int i = CORES; i < MAX_TASKS; i++) {
+            struct task *t = &tasks[i];
+            if (t->state == TASK_UNUSED || !t->pgd || t->state == TASK_ZOMBIE) continue;
+            if (t->pgid != tiene) continue;
+            vivo = 1;
+            if (t->parent == current->pid) { de_un_hijo = 1; break; }
+        }
+
+    int ok = mio || de_un_hijo || !vivo;
+    if (ok) consola_pgid = pgid;
+
+    sched_unlock_irqrestore(flags);
+    return ok ? 0 : -EPERM;
+}
+
+int64_t task_get_pgid(uint64_t pid)
+{
+    uint64_t flags = sched_lock_irqsave();
+    struct task *t = pid ? by_pid(pid) : current;
+    int64_t r = (t && t->pgd) ? (int64_t)t->pgid : -ESRCH;
+    sched_unlock_irqrestore(flags);
+    return r;
+}
 
 /* --- El primer proceso ------------------------------------------------
  *
@@ -1057,19 +1141,41 @@ int task_bootstrap(const char *nombre, const struct args *args,
     return -1;
 }
 
-/* Ctrl-C. Va al proceso de primer plano, que aqui se define de la forma
- * mas simple que funciona: el duenyo de la consola, o el hijo al que este
- * esperando. Un Unix de verdad lleva grupos de procesos y un grupo de
- * primer plano; esto es la misma idea sin la contabilidad. */
+/* Ctrl-C. Va al GRUPO de primer plano, y a todos los que haya dentro.
+ *
+ * Antes iba al duenyo de la consola, o al hijo al que este estuviera
+ * esperando: una cadena de un solo eslabon, y por eso fallaba en los dos
+ * casos que importan. En "a | b" el shell espera primero a 'a', asi que
+ * Ctrl-C mataba a 'a' y dejaba a 'b' vivo leyendo de una tuberia que ya
+ * no tenia quien escribiera. Y a un nieto -un programa que se bifurca- no
+ * llegaba nunca.
+ *
+ * Los dos fallos son el mismo: se estaba buscando UN proceso cuando lo
+ * que el usuario quiere parar es un TRABAJO, que puede tener varios. La
+ * cadena no se arregla haciendola mas larga; se arregla dejando de
+ * seguirla y preguntando quien pertenece al grupo.
+ *
+ * Se hacen dos pasadas y no una: primero se apuntan los pid con el
+ * cerrojo cogido, y luego se senyalan sin el, porque task_signal lo
+ * vuelve a pedir. Recorrer la tabla llamando a task_signal desde dentro
+ * seria un interbloqueo contra uno mismo. */
 void task_console_interrupt(void)
 {
+    uint64_t destinos[MAX_TASKS];
+    int n = 0;
+
     uint64_t flags = sched_lock_irqsave();
-    uint64_t destino = consola_pid;
-    struct task *t = destino ? by_pid(destino) : 0;
-    if (t && t->waiting_for) destino = t->waiting_for;
+    uint64_t grupo = consola_pgid;
+
+    if (grupo)
+        for (int i = CORES; i < MAX_TASKS && n < MAX_TASKS; i++)
+            if (tasks[i].state != TASK_UNUSED && tasks[i].pgd &&
+                tasks[i].state != TASK_ZOMBIE && tasks[i].pgid == grupo)
+                destinos[n++] = tasks[i].pid;
+
     sched_unlock_irqrestore(flags);
 
-    if (destino) task_signal(destino, SIGINT);
+    for (int i = 0; i < n; i++) task_signal(destinos[i], SIGINT);
 }
 
 /* ¿Puede el KERNEL escribir en esa direccion del proceso?
@@ -1272,18 +1378,27 @@ int task_alive(uint64_t pid)
  *
  * Que la tarea haya desaparecido del todo tambien vale como "termino": el
  * recolector puede haber pasado por ahi antes de que nos despertaramos. */
-int task_wait(uint64_t pid, int64_t *codigo)
+int task_wait(uint64_t pid, int64_t *codigo, int banderas)
 {
     uint64_t flags = sched_lock_irqsave();
     int      ret   = 0;
 
-    if (current) current->waiting_for = pid;
+    /* Con WNOHANG NO se apunta la espera. 'waiting_for' existia para que
+     * Ctrl-C supiera a quien seguir, y ya no sirve para eso; lo que si
+     * hace todavia es decir que este proceso esta parado en un hijo, y
+     * quien pregunta sin bloquearse no lo esta. */
+    if (current && !(banderas & WNOHANG)) current->waiting_for = pid;
 
     for (;;) {
         struct task *t = by_pid(pid);
 
         if (!t) {                          /* ya no existe: nada que contar */
             if (codigo) *codigo = -1;
+            break;
+        }
+
+        if (t->state != TASK_ZOMBIE && (banderas & WNOHANG)) {
+            ret = -EAGAIN;                   /* sigue vivo; vuelve luego */
             break;
         }
 
@@ -1298,7 +1413,7 @@ int task_wait(uint64_t pid, int64_t *codigo)
         }
 
         if (wq_wait(&exit_wq) < 0) {       /* nos ha interrumpido una senyal */
-            ret = -1;
+            ret = -EINTR;
             break;
         }
     }
@@ -1883,6 +1998,12 @@ int task_fork(struct trap_frame *f)
     t->waiting_for = 0;
     t->parent      = padre->pid;
 
+    /* El grupo se hereda, como el directorio actual: un hijo forma parte
+     * del mismo TRABAJO que su padre mientras nadie diga lo contrario. Es
+     * lo que hace que Ctrl-C sobre "sh" alcance a un nieto sin que nadie
+     * lleve un arbol. */
+    t->pgid        = padre->pgid;
+
     /* El nombre se copia, no se apunta: el del padre puede vivir en el
      * padre, y el padre puede morirse antes. */
     uint64_t o = 0;
@@ -2021,6 +2142,11 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     if (name) t->name = name;
     else      nombre_de_args(t, args);
     t->pid       = next_pid++;
+
+    /* Un proceso que no nace de un fork no tiene de quien heredar un
+     * trabajo, asi que forma el suyo y le da su propio nombre. De ahi
+     * sale que el pgid de un grupo sea siempre el pid del primero. */
+    t->pgid      = t->pid;
     t->counter   = TASK_QUANTUM;
     t->ticks_run = 0;
 

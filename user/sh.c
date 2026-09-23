@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "syscall.h"
 #include "fs_abi.h"
 
@@ -28,18 +29,38 @@ static char           nombre[FS_PATH_MAX];
 /* --- Leer una linea, con eco y borrado ------------------------------- */
 /* El eco lo hace el shell, no el kernel: quien lee es quien decide como
  * se ve lo que se escribe. */
-/* Devuelve los caracteres leidos, o -1 si se ha acabado la entrada.
+/* Devuelve los caracteres leidos, LINEA_FIN si se ha acabado la entrada, o
+ * LINEA_CORTE si una senyal corto la lectura.
  *
- * Esa segunda posibilidad no existia hasta que read() pudo fallar. Sin
- * distinguirla, un shell cuya entrada se cierra se queda dando vueltas
- * imprimiendo prompts vacios para siempre. */
+ * Los dos ultimos eran el mismo -1 hasta este paso, y costo un fallo: con
+ * el Ctrl-C yendo ya al grupo de primer plano, el shell es quien lo
+ * recibe mientras estas escribiendo. El manejador hacia su trabajo -no
+ * morirse- pero la lectura volvia con -1, el shell leia "se acabo la
+ * entrada" y se despedia educadamente. La senyal no lo mataba: lo
+ * convencia de irse.
+ *
+ * Que dos cosas distintas devuelvan el mismo numero no da guerra hasta
+ * que una de las dos empieza a pasar de verdad. */
+#define LINEA_FIN    (-1)
+#define LINEA_CORTE  (-2)
+
 static int64_t leer_linea(void)
 {
     uint64_t n = 0;
 
     for (;;) {
+        errno = 0;
         int k = getchar();
-        if (k < 0) return -1;                    /* se acabo la entrada */
+        if (k < 0) {
+            if (errno == EINTR) {
+                /* El cubo se quedo marcado con el error de la lectura que
+                 * no llego a serlo. Sin limpiarlo, el siguiente getchar
+                 * devuelve EOF sin ni siquiera mirar el teclado. */
+                clearerr(stdin);
+                return LINEA_CORTE;
+            }
+            return LINEA_FIN;                    /* se acabo la entrada */
+        }
         char c = (char)k;
 
         if (c == '\r' || c == '\n') {
@@ -425,6 +446,112 @@ static int preparar(struct orden *o, const char *linea)
 }
 
 
+/* --- Los trabajos -----------------------------------------------------
+ *
+ * Un trabajo es lo que el usuario escribio en una linea, que puede ser
+ * mas de un proceso: "cat x | wc" son dos. Se le pone un numero pequenyo
+ * -[1], [2]- porque el pid no le dice nada a nadie, y se guarda el grupo,
+ * que es lo unico que hace falta para hablarle entero.
+ */
+#define MAX_TRABAJOS  8
+
+static struct trabajo {
+    int      usado;
+    int      numero;                 /* el [1] que se ensenya */
+    uint64_t pgid;
+    uint64_t pids[2];
+    int      npids;
+    char     orden[80];
+} trabajos[MAX_TRABAJOS];
+
+static int siguiente_numero = 1;
+static uint64_t mi_grupo;            /* el del propio shell */
+
+static void anotar(uint64_t pgid, uint64_t p1, uint64_t p2, const char *orden)
+{
+    for (int i = 0; i < MAX_TRABAJOS; i++) {
+        if (trabajos[i].usado) continue;
+
+        struct trabajo *t = &trabajos[i];
+        t->usado  = 1;
+        t->numero = siguiente_numero++;
+        t->pgid   = pgid;
+        t->npids  = 0;
+        t->pids[t->npids++] = p1;
+        if (p2) t->pids[t->npids++] = p2;
+        ucopiar(t->orden, orden, sizeof(t->orden));
+
+        printf("  [%d] %lu\n", t->numero, (unsigned long)pgid);
+        return;
+    }
+    printf("  no caben mas trabajos en segundo plano\n");
+}
+
+/* Recoger los que hayan terminado, SIN esperar a ninguno.
+ *
+ * Se llama antes de cada prompt, que es el unico momento en que el shell
+ * no esta haciendo otra cosa. Un Unix de verdad se entera por SIGCHLD en
+ * cuanto pasa; esto se entera un poco tarde, y para lo que hay que
+ * ensenyar da igual.
+ *
+ * Lo que NO da igual es recogerlos: un hijo al que su padre nunca espera
+ * se queda de zombi hasta que el padre muere, y un shell no muere nunca.
+ */
+static void recoger(void)
+{
+    for (int i = 0; i < MAX_TRABAJOS; i++) {
+        struct trabajo *t = &trabajos[i];
+        if (!t->usado) continue;
+
+        int quedan = 0;
+        for (int k = 0; k < t->npids; k++) {
+            if (!t->pids[k]) continue;
+            if (waitpid_ya(t->pids[k]) == -EAGAIN) quedan++;
+            else t->pids[k] = 0;            /* recogido */
+        }
+
+        if (!quedan) {
+            printf("  [%d] hecho    %s\n", t->numero, t->orden);
+            t->usado = 0;
+        }
+    }
+}
+
+static void listar_trabajos(void)
+{
+    int hay = 0;
+    for (int i = 0; i < MAX_TRABAJOS; i++)
+        if (trabajos[i].usado) {
+            printf("  [%d] %lu  %s\n", trabajos[i].numero,
+                   (unsigned long)trabajos[i].pgid, trabajos[i].orden);
+            hay = 1;
+        }
+    if (!hay) printf("  no hay trabajos en segundo plano\n");
+}
+
+/* Ceder la consola a un grupo y esperarlo, y recuperarla pase lo que
+ * pase. Esto es lo que hace que Ctrl-C alcance al trabajo entero y no al
+ * shell, y lo que devuelve el teclado al shell cuando el trabajo acaba.
+ *
+ * Es un prestamo, y como todo prestamo lo importante es la linea de
+ * despues: si el shell se olvidara de recuperarla, el teclado se quedaria
+ * apuntando a un grupo que ya no existe y Ctrl-C no volveria a servir. */
+static int64_t en_primer_plano(uint64_t pgid, uint64_t p1, uint64_t p2)
+{
+    consola(pgid);
+
+    int64_t codigo = waitpid(p1);
+    if (p2) codigo = waitpid(p2);
+
+    consola(mi_grupo);
+    return codigo;
+}
+
+/* No hace nada, y eso es lo que tiene que hacer: lo unico que se busca es
+ * que la accion por defecto -morirse- no ocurra. La linea a medias se
+ * pierde y sale un prompt nuevo. */
+static void sigint(int sig) { (void)sig; }
+
 static void quejarse(const char *que)
 {
     printf("  ");
@@ -479,6 +606,12 @@ static int interna(char *orden, const char *der)
         return 1;
     }
 
+    if (orden[0] == 'j' && orden[1] == 'o' && orden[2] == 'b' &&
+        orden[3] == 's' && !orden[4]) {
+        listar_trabajos();
+        return 1;
+    }
+
     if (orden[0] == 'p' && orden[1] == 'w' && orden[2] == 'd' && !orden[3]) {
         char aqui[FS_PATH_MAX];
         getcwd(aqui, sizeof(aqui));
@@ -489,7 +622,7 @@ static int interna(char *orden, const char *der)
     return 0;
 }
 
-static void una(char *orden)
+static void una(char *orden, int fondo, const char *entera)
 {
     /* Un solo troceo, del que sale todo: los argumentos, el nombre del
      * programa y a donde van la entrada y la salida. */
@@ -507,6 +640,24 @@ static void una(char *orden)
 
     int64_t pid = fork();
     if (pid == 0) {
+        /* El hijo se pone en SU grupo antes de hacer nada mas.
+         *
+         * Y el padre hace lo mismo justo despues del fork, con la misma
+         * llamada y el mismo efecto. No es una de las dos veces escrita
+         * dos veces: son dos carreras distintas, y cada linea tapa una.
+         *
+         * Si solo lo hiciera el hijo, el padre podria llegar a ceder la
+         * consola -consola(pid)- antes de que el hijo se hubiera
+         * colocado, y el Ctrl-C iria a un grupo vacio.
+         *
+         * Si solo lo hiciera el padre, el hijo podria llegar al exec y
+         * hasta terminar antes de que el padre lo moviera, y setpgid
+         * sobre alguien que ya no esta devuelve -ESRCH.
+         *
+         * Escrito en los dos sitios, gane quien gane la carrera el
+         * resultado es el mismo. Es de las pocas veces en que repetir una
+         * llamada es lo correcto y no un descuido. */
+        setpgid(0, 0);
         if (aplicar(o.hay, o.ent, o.sal) < 0) exit(1);
         exec(img, bytes, o.argv, environ);
         printf("  no he podido convertirme en el programa\n");
@@ -516,9 +667,13 @@ static void una(char *orden)
     munmap((const char *)img);
     if (pid < 0) { printf("  no he podido bifurcarme\n"); return; }
 
+    setpgid((uint64_t)pid, (uint64_t)pid);      /* la otra mitad de la carrera */
+
+    if (fondo) { anotar((uint64_t)pid, (uint64_t)pid, 0, entera); return; }
+
     /* El codigo de salida del hijo. Solo se dice si no es cero, que es
      * como se comporta cualquier shell: lo normal no se anuncia. */
-    int64_t codigo = waitpid((uint64_t)pid);
+    int64_t codigo = en_primer_plano((uint64_t)pid, (uint64_t)pid, 0);
     if (codigo != 0)
         printf("  [salida %ld]\n", (long)codigo);
 }
@@ -535,7 +690,7 @@ static void una(char *orden)
  * del fichero y se quedara esperando para siempre. Por eso el padre
  * tambien cierra los suyos.
  */
-static void tuberia(char *izq, char *der)
+static void tuberia(char *izq, char *der, int fondo, const char *entera)
 {
     /* Dos ordenes preparadas a la vez, cada una con su propio almacen de
      * texto. De ahi que 'struct orden' lo lleve dentro y no comparta
@@ -573,6 +728,7 @@ static void tuberia(char *izq, char *der)
 
     int64_t p1 = fork();
     if (p1 == 0) {
+        setpgid(0, 0);                   /* el primero FORMA el grupo */
         dup2(fds[1], 1);                 /* mi salida es la tuberia */
         closefd(fds[0]);
         closefd(fds[1]);
@@ -585,8 +741,14 @@ static void tuberia(char *izq, char *der)
         exit(1);
     }
 
+    setpgid((uint64_t)p1, (uint64_t)p1);
+
     int64_t p2 = fork();
     if (p2 == 0) {
+        /* Y el segundo se mete en el del primero. Los dos procesos son UN
+         * trabajo: lo que el usuario escribio es "cat x | wc", no dos
+         * cosas, y cuando pulse Ctrl-C quiere parar eso. */
+        setpgid(0, (uint64_t)p1);
         dup2(fds[0], 0);                 /* mi entrada es la tuberia */
         closefd(fds[0]);
         closefd(fds[1]);
@@ -602,8 +764,13 @@ static void tuberia(char *izq, char *der)
     munmap((const char *)img1);
     munmap((const char *)img2);
 
-    if (p1 > 0) waitpid((uint64_t)p1);
-    if (p2 > 0) waitpid((uint64_t)p2);
+    if (p1 <= 0 || p2 <= 0) return;
+
+    setpgid((uint64_t)p2, (uint64_t)p1);
+
+    if (fondo) { anotar((uint64_t)p1, (uint64_t)p1, (uint64_t)p2, entera); return; }
+
+    en_primer_plano((uint64_t)p1, (uint64_t)p1, (uint64_t)p2);
 }
 
 int main(int argc, char **argv)
@@ -613,11 +780,32 @@ int main(int argc, char **argv)
     printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
     printf("  se arrancan con fork + exec, se encadenan con | y se\n");
     printf("  redirigen con <, > y >>\n");
+    printf("  Con & van al fondo, y 'jobs' dice cuales siguen ahi\n");
     printf("  Hay directorios (cd, pwd, mkdir) y entorno (export, env, $VAR)\n");
     printf("  Prueba: ls / mkdir docs / cd docs / cat /hola.txt > copia.txt\n");
     printf("          cd .. / ls docs / wc < hola.txt / salir\n");
 
+    /* El shell tiene que saber cual es su propio grupo para recuperar la
+     * consola cuando un trabajo de primer plano termina. */
+    mi_grupo = (uint64_t)getpgid(0);
+
+    /* Y tiene que sobrevivir a su propio Ctrl-C.
+     *
+     * Ahora que la senyal va al GRUPO de primer plano y el shell es quien
+     * esta delante mientras escribes, un Ctrl-C en el prompt le llegaria a
+     * el, y la accion por defecto lo mataria. Antes no pasaba porque la
+     * senyal se la mandaban al hijo; el mecanismo nuevo es mas correcto y
+     * por eso destapa esto.
+     *
+     * Atraparla y no hacer nada es exactamente lo que hace cualquier
+     * shell: la linea a medias se pierde y sale un prompt limpio. */
+    signal(SIGINT, sigint);
+
     for (;;) {
+        /* Antes del prompt, y no en otro sitio: es el unico momento en que
+         * el shell no esta esperando a nadie. */
+        recoger();
+
         /* El prompt lleva el directorio: sin eso, con subdirectorios, se
          * pierde uno a la segunda orden. */
         char aqui[FS_PATH_MAX];
@@ -625,11 +813,34 @@ int main(int argc, char **argv)
         printf("\n%s $ ", aqui);
 
         int64_t largo = leer_linea();
+
+        /* Un Ctrl-C mientras escribias: la linea a medias se tira y sale
+         * un prompt nuevo. Es lo que hace cualquier shell, y es lo unico
+         * que puede hacer, porque no sabe si ibas a terminar la frase. */
+        if (largo == LINEA_CORTE) { printf("\n"); continue; }
+
         if (largo < 0) {                         /* fin de la entrada */
             printf("\n  se acabo la entrada, me voy\n");
             exit(0);
         }
         if (largo == 0) continue;
+
+        /* ¿Acaba en "&"? Se mira ANTES de partir por la tuberia, porque
+         * "a | b &" manda al fondo el trabajo entero y no solo la mitad
+         * de la derecha. El & no es de una orden, es de la linea. */
+        int fondo = 0;
+        {
+            char *fin = linea + largo;
+            while (fin > linea && (fin[-1] == ' ' || fin[-1] == '\n')) fin--;
+            if (fin > linea && fin[-1] == '&') { fondo = 1; fin[-1] = 0; }
+            else *fin = 0;
+        }
+
+        /* Una copia de la linea tal y como se escribio, para poder
+         * ensenyarla luego en la lista de trabajos: lo que viene ahora la
+         * parte en trozos con ceros por el medio. */
+        char entera[80];
+        ucopiar(entera, limpiar(linea), sizeof(entera));
 
         /* ¿Hay tuberia? Se parte la linea en dos y cada mitad es una orden
          * completa, con sus propios argumentos. */
@@ -657,7 +868,7 @@ int main(int argc, char **argv)
          * el que en cualquier Unix "cd" tampoco lo es. */
         if (interna(izq, der)) continue;
 
-        if (der) tuberia(izq, limpiar(der));
-        else     una(izq);
+        if (der) tuberia(izq, limpiar(der), fondo, entera);
+        else     una(izq, fondo, entera);
     }
 }

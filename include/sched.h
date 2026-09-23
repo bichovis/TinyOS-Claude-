@@ -89,6 +89,12 @@ struct task {
     struct waitqueue *wq;     /* en que cola duerme, 0 si no duerme          */
     int         interrumpido; /* 1 si lo desperto una senyal y no un aviso   */
     uint64_t    parent;       /* quien lo creo: el que recogera su salida    */
+
+    /* El grupo, o sea el TRABAJO del que forma parte. Se hereda en el
+     * fork y sobrevive al exec; vale el pid del primero que lo formo.
+     * Ctrl-C no va a un proceso, va a un grupo entero: ver
+     * task_console_interrupt(). */
+    uint64_t    pgid;
     int64_t     exit_code;    /* lo que devolvio al morir                    */
 
     /* Sus descriptores. El 0 es la entrada, el 1 la salida, y quien los
@@ -195,7 +201,10 @@ void task_yield(void);           /* ceder la CPU voluntariamente            */
 void task_sleep(uint64_t ticks);
 void task_exit(void);
 void task_exit_con(int64_t codigo);   /* y apunta lo que devolvio */
-int  task_wait(uint64_t pid, int64_t *codigo);  /* espera y recoge su salida */
+/* Espera y recoge su salida. Devuelve 0 y deja el codigo en 'codigo', o
+ * un errno negativo: -EINTR si una senyal corto la espera, -EAGAIN si se
+ * pidio WNOHANG y ese proceso sigue vivo. */
+int  task_wait(uint64_t pid, int64_t *codigo, int banderas);
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
 int  task_exec(const uint8_t *image, uint64_t size, const struct args *args,
@@ -237,7 +246,10 @@ int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
 /* --- Senyales --------------------------------------------------------- */
 int  task_signal(uint64_t pid, int sig);       /* apuntarsela a un proceso  */
 int  task_set_handler(int sig, uint64_t manejador, uint64_t trampolin);
-void task_set_console(uint64_t pid);           /* quien manda en la consola */
+void task_set_console(uint64_t pgid);          /* que GRUPO esta en primer plano */
+int  task_set_pgid(uint64_t pid, uint64_t pgid);
+int  task_dar_consola(uint64_t pgid);          /* y quien puede darla */
+int64_t task_get_pgid(uint64_t pid);
 uint64_t task_console_pid(void);               /* ...y quien la tiene ahora */
 void task_console_interrupt(void);             /* lo llama uart.c con Ctrl-C*/
 

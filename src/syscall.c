@@ -500,10 +500,20 @@ void syscall_dispatch(struct trap_frame *f)
         ret = sys_bootstrap(f);
         break;
 
+    /* Ceder la consola a un grupo.
+     *
+     * Antes era "solo init", que es una frontera de privilegio pero no es
+     * LA correcta: el shell tiene que poder poner delante al trabajo que
+     * acaba de arrancar y recuperarla cuando termine, y no es init.
+     *
+     * La regla de verdad no habla de quien eres sino de que tienes: puedes
+     * dar la consola si tu grupo la tiene ahora mismo. Es la misma idea
+     * que un testigo en una carrera -solo lo pasa quien lo lleva- y hace
+     * imposible que un proceso de segundo plano se ponga delante solo. A
+     * init se le deja igualmente, porque es quien tiene que devolverla
+     * cuando el shell entero se muere y no queda nadie que la lleve. */
     case SYS_consola:
-        if (!current || current->pid != task_init_pid()) { ret = -1; break; }
-        task_set_console(f->x[0]);
-        ret = 0;
+        ret = task_dar_consola(f->x[0]);
         break;
 
     case SYS_time:
@@ -578,9 +588,26 @@ void syscall_dispatch(struct trap_frame *f)
      * interrumpieron esperando. */
     case SYS_waitpid: {
         int64_t codigo = -1;
-        ret = (task_wait(f->x[0], &codigo) < 0) ? -1 : codigo;
+        int     r      = task_wait(f->x[0], &codigo, (int)f->x[1]);
+
+        /* El errno pasa por delante del codigo de salida: -EAGAIN quiere
+         * decir "no ha terminado", que no es lo mismo que "termino
+         * devolviendo -11". Con el convenio del paso 48 los dos caben en
+         * el mismo numero sin pisarse. */
+        ret = (r < 0) ? r : codigo;
         break;
     }
+
+    /* Los grupos. Mover a alguien de trabajo y preguntar en cual esta: sin
+     * privilegios de por medio, porque solo se puede tocar a uno mismo o a
+     * un hijo y eso ya es toda la frontera que hace falta. */
+    case SYS_setpgid:
+        ret = task_set_pgid(f->x[0], f->x[1]);
+        break;
+
+    case SYS_getpgid:
+        ret = task_get_pgid(f->x[0]);
+        break;
 
     /* --- Servicios para drivers de EL0 -------------------------------
      * Las cuatro llamadas que hacen falta para que un proceso lleve el

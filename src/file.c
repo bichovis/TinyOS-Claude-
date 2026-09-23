@@ -75,7 +75,7 @@ static int64_t pipe_read(struct pipe *p, uint64_t uva, uint64_t n)
 
         if (wq_wait(&p->hay_datos) < 0) {
             sched_unlock_irqrestore(flags);
-            return -1;                      /* nos interrumpio una senyal */
+            return -EINTR;                  /* nos interrumpio una senyal */
         }
     }
 
@@ -109,7 +109,7 @@ static int64_t pipe_write(struct pipe *p, uint64_t uva, uint64_t n)
 
         if (wq_wait(&p->hay_hueco) < 0) {
             sched_unlock_irqrestore(flags);
-            return -1;
+            return -EINTR;
         }
     }
 
@@ -148,8 +148,19 @@ static int64_t consola_read(uint64_t uva, uint64_t n)
 {
     if (n == 0) return 0;
 
+    /* -EINTR y no -1 a secas.
+     *
+     * El paso 48 puso a todo el kernel a decir POR QUE fallaba y este
+     * camino se quedo fuera, porque hasta ahora nadie preguntaba: un
+     * read() interrumpido y una entrada que se acaba se parecen mucho
+     * vistos desde arriba, y los dos valian -1.
+     *
+     * Dejan de parecerse en cuanto el shell tiene que atrapar Ctrl-C: si
+     * una senyal en mitad de la lectura se confunde con el fin de la
+     * entrada, el shell se despide y se va. Es literalmente lo que pasaba
+     * al escribir este paso. */
     int c = uart_getc_blocking();
-    if (c < 0) return -1;                   /* senyal */
+    if (c < 0) return -EINTR;               /* senyal */
 
     char b = (char)c;
     return (int64_t)copiar_a_usuario(uva, &b, 1);

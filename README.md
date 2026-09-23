@@ -105,6 +105,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 48   | errno, o hacer que el kernel diga por que   | hecho  |
 | 49   | Ficheros con buffer: FILE, fopen, fprintf   | hecho  |
 | 50   | Anyadir al final: O_APPEND y `>>`           | hecho  |
+| 51   | Grupos de procesos, segundo plano y Ctrl-C  | hecho  |
 
 ## Estructura
 
@@ -3785,6 +3786,218 @@ da ningun error**. El programa compila, el sistema arranca, y lo unico que
 pasa es que ese programa no esta en la tarjeta y el shell dice que no
 existe, que es lo mismo que dice cuando te equivocas al teclear.
 
+## El trabajo, y no el proceso
+
+Hasta este paso, Ctrl-C se repartia asi:
+
+    uint64_t destino = consola_pid;                    /* el shell */
+    struct task *t = by_pid(destino);
+    if (t && t->waiting_for) destino = t->waiting_for; /* ...o su hijo */
+    task_signal(destino, SIGINT);
+
+Una cadena de un solo eslabon, y el comentario que tenia encima ya decia
+lo que le faltaba: *"un Unix de verdad lleva grupos de procesos; esto es
+la misma idea sin la contabilidad"*. Resulta que la contabilidad era la
+idea.
+
+Falla en los dos casos que importan. En `a | b` el shell espera primero a
+`a`, asi que `waiting_for` vale `a` y `b` no se entera de nada. Y a un
+nieto -cualquier programa que se bifurque- no llega nunca, porque la
+cadena tiene un eslabon y hacen falta dos.
+
+Esto no es un razonamiento, es lo que hace el kernel del paso 50 con el
+mismo `lento 20 a | lento 20 b`:
+
+    [a] 7 de 20
+    [b] 7 de 20
+    ^C
+    [kernel] lento termina por la senyal 2
+    [b] 8 de 20
+    [b] 9 de 20
+    ...
+    [b] 20 de 20
+    [b] terminado
+
+`b` se queda ahi contando tan tranquilo mientras tu ya has pulsado
+Ctrl-C, has recuperado el prompt y crees que has parado lo que pediste.
+
+**Los dos fallos son el mismo, y no se arreglan haciendo la cadena mas
+larga.** Se estaba buscando UN proceso cuando lo que el usuario quiere
+parar es un TRABAJO. Lo que una persona escribe en una linea no es un
+proceso: `cat x | wc` son dos procesos y una sola cosa.
+
+### Un grupo es un nombre para "esto de aqui"
+
+Un grupo de procesos es exactamente eso, y su nombre es el pid del
+primero que lo formo. En la tabla de tareas es un campo:
+
+    uint64_t pgid;
+
+Se **hereda** en el `fork` y **sobrevive** al `exec`, igual que el
+directorio actual: el programa cambia, pero de que trabajo forma parte
+no. Por eso alcanza a un nieto sin que nadie lleve un arbol de
+parentescos: el nieto nacio dentro del grupo y ahi sigue.
+
+Y el reparto del Ctrl-C deja de seguir una cadena y pasa a preguntar
+quien pertenece al grupo de primer plano:
+
+    if (grupo)
+        for (int i = CORES; i < MAX_TASKS && n < MAX_TASKS; i++)
+            if (... && tasks[i].pgid == grupo)
+                destinos[n++] = tasks[i].pid;
+
+    sched_unlock_irqrestore(flags);
+    for (int i = 0; i < n; i++) task_signal(destinos[i], SIGINT);
+
+Dos pasadas y no una: primero se apuntan los pid con el cerrojo cogido y
+luego se senyalan sin el, porque `task_signal` lo vuelve a pedir.
+Recorrer la tabla llamandolo desde dentro seria un interbloqueo contra
+uno mismo.
+
+### El testigo de la consola
+
+Poner un grupo en primer plano era "solo init". Eso es una frontera de
+privilegio, pero no la correcta: quien tiene que ceder la consola al
+trabajo que acaba de arrancar es el shell, y el shell no es init.
+
+La regla nueva no habla de quien eres sino de que llevas, como el testigo
+de una carrera de relevos:
+
+1. **init siempre**, porque es quien la reparte cuando no queda nadie.
+2. **Si tu grupo la tiene ahora**, puedes pasarla.
+3. **Si la tiene un grupo que formaron hijos tuyos**, puedes recuperarla.
+   Es lo que hace el shell cuando el trabajo que puso delante termina: se
+   la habia prestado.
+4. **Si no la tiene nadie vivo**, que se la quede quien la pida.
+
+Lo que la regla impide es lo que tiene que impedir: que un proceso de
+segundo plano se ponga delante por su cuenta y se quede con el teclado de
+quien esta sentado ahi.
+
+### La carrera del setpgid, y por que se escribe dos veces
+
+En el shell, `setpgid` aparece dos veces por cada hijo: una en el hijo
+antes del `exec`, y otra en el padre justo despues del `fork`.
+
+    int64_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);              /* el hijo se coloca */
+        ...
+        exec(...);
+    }
+    setpgid((uint64_t)pid, (uint64_t)pid);   /* y el padre lo coloca */
+
+Parece lo mismo escrito dos veces y no lo es: **son dos carreras
+distintas, y cada linea tapa una.**
+
+- Si solo lo hiciera el hijo, el padre podria ceder la consola a ese
+  grupo antes de que el hijo se hubiera colocado, y el Ctrl-C iria a un
+  grupo vacio.
+- Si solo lo hiciera el padre, el hijo podria llegar al `exec` -y hasta
+  terminar- antes de que el padre lo moviera, y `setpgid` sobre alguien
+  que ya no esta devuelve `-ESRCH`.
+
+Escrito en los dos sitios, gane quien gane la carrera el resultado es el
+mismo. Es de las pocas veces en que repetir una llamada es lo correcto y
+no un descuido, y esta en el manual de POSIX por esto exactamente.
+
+## Segundo plano
+
+Con los grupos puestos, el `&` sale casi de balde: el trabajo se monta
+igual, pero no se le cede la consola y no se le espera. De ahi salen las
+dos propiedades que uno espera de un proceso de fondo, y las dos son la
+misma decision vista de dos lados: **no recibe el Ctrl-C porque no esta
+en primer plano, y no te bloquea porque no lo esperas.**
+
+El `&` se mira ANTES de partir la linea por la tuberia, porque
+`a | b &` manda al fondo el trabajo entero. El `&` no es de una orden, es
+de la linea.
+
+### Un hijo al que nadie espera
+
+Lo que no sale de balde es recogerlo. Un hijo cuyo padre nunca lo espera
+se queda de zombi hasta que el padre muere, y **un shell no muere nunca**.
+
+Para eso hace falta preguntar sin quedarse esperando, que es
+`WNOHANG`, y una forma de decir "todavia no" que no se confunda con un
+codigo de salida. Con el convenio del paso 48 eso ya estaba resuelto:
+
+    if (t->state != TASK_ZOMBIE && (banderas & WNOHANG)) {
+        ret = -EAGAIN;                   /* sigue vivo; vuelve luego */
+        break;
+    }
+
+El shell pregunta justo antes de cada prompt, que es el unico momento en
+que no esta haciendo otra cosa:
+
+    / $ lento 5 fondo &
+      [1] 11
+    / $ jobs
+      [1] 11  lento 5 fondo
+    / $
+      [1] hecho    lento 5 fondo
+
+Un Unix de verdad se entera en el acto, por `SIGCHLD`. Esto se entera un
+poco tarde, y para lo que hay que ensenyar da igual.
+
+## Dos cosas que devolvian el mismo -1
+
+Poner el Ctrl-C donde tiene que estar destapo un fallo que llevaba ahi
+desde siempre y que no podia verse antes.
+
+Ahora la senyal va al grupo de primer plano, y mientras escribes el grupo
+de primer plano es el del shell: **el Ctrl-C te lo comes tu**. Asi que el
+shell tiene que atraparlo, y atraparlo es facil -un manejador vacio, que
+es lo que hace cualquier shell-. Pero al atraparlo pasaba esto:
+
+    / $ hol^C
+      se acabo la entrada, me voy
+
+La senyal no lo mataba: **lo convencia de irse.** El manejador hacia su
+trabajo, pero la lectura volvia con -1, y -1 era a la vez "una senyal
+corto esto" y "se acabo la entrada". El shell leia lo segundo y se
+despedia educadamente.
+
+Que dos cosas distintas devuelvan el mismo numero no da guerra hasta que
+una de las dos empieza a pasar de verdad. La leccion del paso 48 -que el
+kernel diga POR QUE- se habia quedado corta justo en este camino, porque
+hasta hoy nadie preguntaba:
+
+    int c = uart_getc_blocking();
+    if (c < 0) return -EINTR;               /* antes: return -1 */
+
+Y de paso aparecio que `read` y `write` eran **las dos unicas llamadas
+que no pasaban por `revisar()`**, que es quien convierte el errno negativo
+del kernel en el `-1` y el `errno` que espera cualquier programa escrito
+para un Unix. El kernel decia `-EINTR` y arriba llegaba tal cual, asi que
+quien mirara `errno` veia lo que hubiera de antes.
+
+## El fallo mas caro de este paso tampoco estaba en el codigo
+
+Con las dos correcciones puestas, el shell seguia despidiendose. Y el
+codigo estaba bien.
+
+`lib/file.o` se estaba compilando con la version VIEJA de `user/syscall.h`.
+La regla de la libc listaba sus dependencias a mano:
+
+    $(BUILD)/lib/%.o: lib/%.c lib/stdio.h lib/string.h lib/stdlib.h
+
+`user/syscall.h` no esta en esa lista, asi que cambiarlo no recompilaba
+nada de la libc. El kernel llevaba `-MMD -MP` desde el principio; los
+programas de usuario y la libc, no.
+
+Una lista de cabeceras escrita a mano se queda corta en cuanto alguien
+anyade un `#include`, y lo peor es como se presenta: **no parece un fallo
+de construccion, parece un fallo de codigo.** Se lee el fuente, se ve
+correcto, se vuelve a leer, y lo que se esta ejecutando es otra cosa. Es
+la misma forma que tenia el fallo del paso 44, donde un `ls` de quince
+pasos atras seguia en la tarjeta.
+
+Ahora `-MMD -MP` esta tambien en `UCFLAGS`, y las tres familias de objetos
+entran en `DEPS`. Los `.elf` necesitan un `-MF` explicito porque su regla
+compila y enlaza de una vez, y `-MMD` deduce el nombre del fichero de
+dependencias del `-o`, que aqui es un ejecutable.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -3810,10 +4023,31 @@ existe, que es lo mismo que dice cuando te equivocas al teclear.
   correcto. (Lo que si se saco de el es la carga de un proceso, que son
   milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
   sin el y publica con el otra vez.)
-- El shell no tiene historial, ni segundo plano, ni tuberias de mas de
-  dos, ni `2>`: lee, carga, arranca y espera. Redirigir stderr pide poder
-  nombrar el descriptor de destino (`2>&1`), y eso es una sintaxis nueva,
-  no una llamada nueva.
+- El shell no tiene historial, ni tuberias de mas de dos, ni `2>`.
+  Redirigir stderr pide poder nombrar el descriptor de destino (`2>&1`), y
+  eso es una sintaxis nueva, no una llamada nueva.
+- Hay `&` y `jobs`, pero no `fg` ni `bg`: un trabajo que se manda al fondo
+  no se puede traer al frente. `fg` es dos lineas -ceder la consola a ese
+  grupo y esperarlo- y sin `bg` sirve de poco, porque para tener algo
+  parado que reanudar hacen falta `SIGTSTP` y `SIGCONT`, o sea Ctrl-Z, que
+  es una senyal que este sistema no tiene: aqui un proceso esta vivo o
+  muerto, nunca detenido.
+- No hay `SIGTTIN` ni `SIGTTOU`, asi que un proceso de segundo plano que
+  lea del teclado **roba las teclas** que ibas a escribirle al shell, por
+  turnos y sin avisar. En Unix eso es precisamente lo que cazan esas dos
+  senyales: leer desde el fondo te detiene en vez de dejarte competir.
+- No hay sesiones, ni proceso lider, ni `SIGHUP`. Con un solo terminal y
+  un solo shell, una sesion seria una etiqueta que no distingue nada.
+- Dos procesos que escriban a la vez en la consola se entrelazan letra a
+  letra: `lento a | lento b` saca las dos lineas trenzadas. El descriptor
+  de consola no tiene cerrojo, y ponerselo no bastaria mientras el kernel
+  y el `conserver` sigan siendo dos drivers sobre la misma UART.
+- Los trabajos terminados se recogen solo al sacar el prompt. Un Unix se
+  entera en el acto con `SIGCHLD`; aqui, si te vas a tomar un cafe con el
+  shell parado esperando una orden, el zombi espera contigo.
+- `task_wait` sigue pidiendo un pid concreto: no hay `wait(-1)` ni
+  "cualquiera de mis hijos". El shell puede porque se acuerda de los pid
+  de cada trabajo.
 - `strtol` sigue sin detectar desbordamiento, aunque ya hay `ERANGE` donde
   ponerlo.
 - `errno` es una variable global y no una por hilo. Con un solo hilo por
