@@ -50,6 +50,12 @@ static inline char kgetc(void)            { return (char)syscall2(SYS_read, 0, 0
 void *malloc(uint64_t n);
 void  free(void *p);
 
+/* Paginas de 4 KB libres en todo el sistema. */
+static inline uint64_t freepages(void) { return (uint64_t)syscall2(SYS_freepages, 0, 0); }
+
+/* Duplicarse. Devuelve el pid del hijo al padre, y 0 al hijo. */
+static inline int64_t fork(void)          { return syscall2(SYS_fork, 0, 0); }
+
 /* Pedirle memoria al kernel moviendo el tope del monton. Devuelve el tope
  * VIEJO: el principio de lo que acabas de conseguir. Con delta negativo,
  * la devuelve. */

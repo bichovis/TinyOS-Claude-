@@ -197,6 +197,14 @@ void exception_dispatch(struct trap_frame *f, uint64_t index)
         uint64_t ec  = (f->esr >> 26) & 0x3F;
         uint64_t iss = f->esr & 0x3F;
 
+        /* Fallo de PERMISOS (0b0011xx) sobre una pagina marcada COW: no es
+         * una violacion, es que le toca su copia. El proceso no llega a
+         * enterarse: se le da y se reintenta la instruccion. */
+        if (ec == 0x24 && (iss & 0x3C) == 0x0C && current && current->pgd) {
+            if (vmm_cow_fault(current->pgd, read_far(), current->asid))
+                return;
+        }
+
         if (ec == 0x24 && (iss & 0x3C) == 0x04) {
             if (task_grow_stack(read_far(), f->sp_el0)) {
                 /* Solo se cuentan las primeras. Un programa que se come un

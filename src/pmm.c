@@ -29,6 +29,20 @@ static uint64_t bitmap[BITMAP_WORDS];
  * peor error que puede cometer un gestor de memoria, porque no falla aqui
  * sino mucho despues y en otro sitio. */
 static struct spinlock pmm_lock = SPINLOCK("pmm");
+
+/* Cuantos la estan usando.
+ *
+ * Hasta ahora una pagina tenia un duenyo y punto, asi que sobraba. Con el
+ * copy-on-write puede tener varios: padre e hijo comparten las mismas
+ * paginas hasta que uno escribe. Liberar deja de significar "devuelvela" y
+ * pasa a significar "yo ya no la uso"; solo vuelve al bitmap cuando no la
+ * usa nadie.
+ *
+ * Un byte por pagina son 258 KB de .bss para el mapa entero. Es mucho para
+ * lo que hace, y la alternativa -una estructura dispersa con solo las
+ * paginas compartidas- es bastante mas codigo para ahorrar memoria que en
+ * esta placa sobra. */
+static uint8_t refs[MAX_PAGES];
 static uint64_t first_page;          /* primera pagina que podemos repartir */
 static uint64_t total, used;
 static uint64_t hint;                /* por donde seguir buscando           */
@@ -77,6 +91,7 @@ uint64_t pmm_alloc(void)
 
         if (!is_used(pfn)) {
             mark_used(pfn);
+            refs[pfn] = 1;
             used++;
             hint = pfn + 1;
 
@@ -100,6 +115,29 @@ uint64_t pmm_alloc(void)
     return 0;                        /* sin memoria */
 }
 
+/* Apuntarse como usuario de una pagina que ya existe. */
+void pmm_ref(uint64_t pa)
+{
+    uint64_t pfn = pa / PAGE_SIZE;
+    if (pfn < first_page || pfn >= MAX_PAGES) return;
+
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    if (is_used(pfn) && refs[pfn] < 255) refs[pfn]++;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+}
+
+uint64_t pmm_refs(uint64_t pa)
+{
+    uint64_t pfn = pa / PAGE_SIZE;
+    if (pfn < first_page || pfn >= MAX_PAGES) return 0;
+
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    uint64_t n = refs[pfn];
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return n;
+}
+
+/* "Yo ya no la uso". Solo vuelve al bitmap cuando no la usa nadie mas. */
 void pmm_free(uint64_t pa)
 {
     uint64_t pfn = pa / PAGE_SIZE;
@@ -107,8 +145,13 @@ void pmm_free(uint64_t pa)
 
     uint64_t flags = spin_lock_irqsave(&pmm_lock);
     if (is_used(pfn)) {              /* si no, es un doble free: lo ignoramos */
-        mark_free(pfn);
-        used--;
+        if (refs[pfn] > 1) {
+            refs[pfn]--;             /* queda gente usandola */
+        } else {
+            refs[pfn] = 0;
+            mark_free(pfn);
+            used--;
+        }
     }
     spin_unlock_irqrestore(&pmm_lock, flags);
 }
@@ -144,7 +187,7 @@ uint64_t pmm_alloc_contig(uint64_t n)
             continue;
         }
 
-        for (uint64_t k = 0; k < n; k++) mark_used(inicio + k);
+        for (uint64_t k = 0; k < n; k++) { mark_used(inicio + k); refs[inicio + k] = 1; }
         used += n;
 
         uint64_t pa = inicio * PAGE_SIZE;
@@ -168,6 +211,8 @@ void pmm_free_contig(uint64_t pa, uint64_t n)
     for (uint64_t k = 0; k < n; k++) {
         if (pfn + k < first_page || pfn + k >= last_page) continue;
         if (!is_used(pfn + k)) continue;
+        if (refs[pfn + k] > 1) { refs[pfn + k]--; continue; }
+        refs[pfn + k] = 0;
         mark_free(pfn + k);
         used--;
     }

@@ -858,6 +858,94 @@ static void nombre_de_args(struct task *t, const char *args)
     t->name = t->namebuf;
 }
 
+/* --- Bifurcarse ------------------------------------------------------
+ *
+ * Un proceso se duplica. El hijo sale de aqui con EL MISMO estado que el
+ * padre -los mismos registros, la misma pila, la misma posicion en el
+ * codigo- y la unica diferencia esta en x0: el padre recibe el pid del
+ * hijo y el hijo recibe un cero. De ahi sale el "if (fork() == 0)" de toda
+ * la vida.
+ *
+ * Y no se copia memoria. Los dos espacios apuntan a las mismas paginas,
+ * marcadas de solo lectura; la primera escritura de cualquiera de los dos
+ * es la que paga su copia. Bifurcar un proceso de 8 MB cuesta lo mismo que
+ * bifurcar uno de 8 KB: recorrer la tabla.
+ */
+int task_fork(struct trap_frame *f)
+{
+    struct task *padre = current;
+    if (!padre || !padre->pgd) return -1;   /* un hilo de kernel no se bifurca */
+
+    uint64_t flags = sched_lock_irqsave();
+    struct task *t = 0;
+
+    for (int i = CORES; i < MAX_TASKS; i++)
+        if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
+    if (!t) { sched_unlock_irqrestore(flags); return -1; }
+
+    t->state = TASK_BLOCKED;                /* ranura reservada */
+    t->name  = "(bifurcando)";
+    t->stack = 0;
+    t->pgd   = 0;
+    sched_unlock_irqrestore(flags);
+
+    uint64_t asid = 0;
+    uint64_t *pgd = vmm_fork(padre->pgd, padre->asid, &asid);
+    if (!pgd) goto fail;
+
+    uint64_t kstack = kstack_alloc((int)(t - tasks));
+    if (!kstack) { vmm_destroy_pgd(pgd, asid); goto fail; }
+    *(uint64_t *)kstack = STACK_MAGIC;
+
+    /* El contexto del hijo es una copia del que tiene el padre ahora mismo
+     * en su pila de kernel: los mismos registros y el mismo punto de
+     * retorno. Solo cambia x0. */
+    struct trap_frame *tf =
+        (struct trap_frame *)(kstack + PAGE_SIZE - sizeof(struct trap_frame));
+    /* kcopy y no "*tf = *f": una asignacion de estructura de 288 bytes la
+     * convierte gcc en una llamada a memcpy, y aqui no hay libc. */
+    kcopy(tf, f, sizeof(*tf));
+    tf->x[0] = 0;
+
+    flags = sched_lock_irqsave();
+
+    t->stack     = kstack;
+    t->pgd       = pgd;
+    t->asid      = asid;
+    t->pid       = next_pid++;
+    t->counter   = TASK_QUANTUM;
+    t->ticks_run = 0;
+    t->mmio_va   = padre->mmio_va;
+    t->brk_base  = padre->brk_base;
+    t->brk       = padre->brk;
+    t->stack_low = padre->stack_low;
+
+    /* El nombre se copia, no se apunta: el del padre puede vivir en el
+     * padre, y el padre puede morirse antes. */
+    uint64_t o = 0;
+    for (const char *s = padre->name; *s && o < sizeof(t->namebuf) - 1; s++)
+        t->namebuf[o++] = *s;
+    t->namebuf[o] = 0;
+    t->name = t->namebuf;
+
+    kzero(&t->ctx, sizeof(t->ctx));
+    t->ctx.pc = (uint64_t)ret_to_user;
+    t->ctx.sp = (uint64_t)tf;
+
+    t->state = TASK_READY;
+    sched_kick_idle();
+
+    int pid = (int)t->pid;
+    sched_unlock_irqrestore(flags);
+    return pid;
+
+fail:
+    flags = sched_lock_irqsave();
+    t->state = TASK_UNUSED;
+    sched_unlock_irqrestore(flags);
+    return -1;
+}
+
 int task_create_user(const char *name, const uint8_t *image, uint64_t size,
                      uint64_t mmio_pa, const char *args)
 {

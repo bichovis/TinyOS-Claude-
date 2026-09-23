@@ -212,6 +212,132 @@ uint64_t *vmm_create_pgd(uint64_t *asid_out)
     return phys_to_virt(pa);         /* pmm_alloc ya la entrega a cero */
 }
 
+static void copiar_pagina(void *dst, const void *src)
+{
+    uint64_t *d = dst;
+    const uint64_t *s = src;
+    for (uint64_t i = 0; i < PAGE_SIZE / 8; i++) d[i] = s[i];
+}
+
+/* --- Duplicar un espacio de direcciones sin copiarlo ------------------
+ *
+ * Es el truco entero del fork. Se recorre la tabla del padre y se monta
+ * la misma en el hijo, apuntando a LAS MISMAS paginas fisicas. No se copia
+ * ni un byte de datos: se copian punteros.
+ *
+ * A cambio, todo lo que era escribible pasa a solo lectura y marcado COW
+ * EN LOS DOS. En el padre tambien, y eso es lo que mas cuesta ver: si el
+ * padre conservara su permiso de escritura, escribiria en paginas que ya
+ * no son solo suyas y el hijo veria cambios que no le corresponden.
+ *
+ * El sistema esta mintiendo a los dos: les dice que no pueden escribir
+ * cuando en realidad si pueden. La mentira se deshace, pagina a pagina y
+ * solo cuando hace falta, en vmm_cow_fault().
+ */
+uint64_t *vmm_fork(uint64_t *padre, uint64_t asid_padre, uint64_t *asid_hijo)
+{
+    uint64_t *hijo = vmm_create_pgd(asid_hijo);
+    if (!hijo) return 0;
+
+    for (uint64_t i1 = 0; i1 < 512; i1++) {
+        if (!(padre[i1] & PTE_VALID) || !(padre[i1] & PTE_TABLE)) continue;
+        uint64_t *l2 = phys_to_virt(padre[i1] & PTE_ADDR_MASK);
+
+        for (uint64_t i2 = 0; i2 < 512; i2++) {
+            if (!(l2[i2] & PTE_VALID) || !(l2[i2] & PTE_TABLE)) continue;
+            uint64_t *l3 = phys_to_virt(l2[i2] & PTE_ADDR_MASK);
+
+            for (uint64_t i3 = 0; i3 < 512; i3++) {
+                uint64_t e = l3[i3];
+                if (!(e & PTE_VALID)) continue;
+
+                uint64_t va = (i1 << 30) | (i2 << 21) | (i3 << 12);
+                uint64_t pa = e & PTE_ADDR_MASK;
+
+                /* El MMIO concedido a un driver se comparte tal cual: unos
+                 * registros de periferico no se copian ni tiene sentido
+                 * que se copien. */
+                if (((e >> 2) & 7) != MT_NORMAL) {
+                    vmm_map_in(hijo, va, pa, e & ~PTE_ADDR_MASK);
+                    continue;
+                }
+
+                if ((e & (3UL << 6)) == PTE_AP_RW_ALL) {
+                    e = (e & ~(3UL << 6)) | PTE_AP_RO_ALL | PTE_COW;
+                    l3[i3] = e;                  /* el padre, tambien */
+                }
+
+                pmm_ref(pa);
+                if (vmm_map_in(hijo, va, pa, e & ~PTE_ADDR_MASK) < 0) {
+                    pmm_free(pa);
+                    vmm_destroy_pgd(hijo, *asid_hijo);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /* Al padre se le han cambiado los permisos por debajo: lo que tenga en
+     * la TLB de su espacio ya no vale. */
+    __asm__ volatile(
+        "dsb ishst\n"
+        "tlbi aside1is, %0\n"
+        "dsb ish\n"
+        "isb\n"
+        :: "r"(asid_padre << 48) : "memory");
+
+    return hijo;
+}
+
+/* --- Deshacer la mentira ----------------------------------------------
+ *
+ * Alguien ha intentado escribir en una pagina marcada COW. Hay dos casos y
+ * la diferencia entre ellos es todo el ahorro del fork:
+ *
+ *   la usa uno solo  -> no hay nada que copiar, se le devuelve el permiso
+ *   la usan varios   -> ahora si, se le hace su copia privada
+ *
+ * El primer caso es el que hace que un fork seguido de exec no copie casi
+ * nada, y el que hace que si el padre muere, el hijo se quede con las
+ * paginas originales sin pagar una sola copia.
+ */
+int vmm_cow_fault(uint64_t *pgd, uint64_t va, uint64_t asid)
+{
+    uint64_t *t = pgd;
+
+    for (int n = 0; n < 2; n++) {
+        uint64_t i = n ? L2_INDEX(va) : L1_INDEX(va);
+        if (!(t[i] & PTE_VALID) || !(t[i] & PTE_TABLE)) return 0;
+        t = phys_to_virt(t[i] & PTE_ADDR_MASK);
+    }
+
+    uint64_t i = L3_INDEX(va);
+    uint64_t e = t[i];
+    if (!(e & PTE_VALID) || !(e & PTE_COW)) return 0;   /* no es asunto nuestro */
+
+    uint64_t pa    = e & PTE_ADDR_MASK;
+    uint64_t flags = (e & ~PTE_ADDR_MASK & ~PTE_COW & ~(3UL << 6)) | PTE_AP_RW_ALL;
+
+    if (pmm_refs(pa) <= 1) {
+        t[i] = pa | flags;                  /* ya no la comparte nadie */
+    } else {
+        uint64_t nueva = pmm_alloc();
+        if (!nueva) return 0;
+        copiar_pagina(phys_to_virt(nueva), phys_to_virt(pa));
+        t[i] = (nueva & PTE_ADDR_MASK) | flags;
+        pmm_free(pa);                       /* una referencia menos */
+    }
+
+    __asm__ volatile(
+        "dsb ishst\n"
+        "tlbi vae1is, %0\n"
+        "dsb ish\n"
+        "isb\n"
+        :: "r"((asid << 48) | (va >> PAGE_SHIFT)) : "memory");
+
+    return 1;
+}
+
 void vmm_destroy_pgd(uint64_t *pgd, uint64_t asid)
 {
     if (!pgd) return;

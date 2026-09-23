@@ -203,6 +203,20 @@ void syscall_dispatch(struct trap_frame *f)
      * decir que algo ha fallado. */
     /* Mover el tope del monton del proceso. Devuelve el tope VIEJO, que es
      * el principio de lo que se acaba de conseguir. */
+    /* Bifurcarse. El valor de retorno es lo unico que distingue a los dos:
+     * aqui se deja el pid del hijo, y en el frame del hijo se deja un
+     * cero. */
+    /* Cuanta memoria queda. No es informacion privilegiada -cualquiera
+     * puede deducirla pidiendo hasta que falle- y permite que un programa
+     * ensenye lo que cuesta de verdad una operacion. */
+    case SYS_freepages:
+        ret = (int64_t)pmm_free_pages();
+        break;
+
+    case SYS_fork:
+        ret = task_fork(f);
+        break;
+
     case SYS_sbrk:
         ret = (int64_t)task_sbrk((int64_t)f->x[0]);
         break;

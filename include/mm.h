@@ -82,6 +82,16 @@
 #define PTE_PXN          (1UL << 53)  /* prohibido ejecutar desde EL1       */
 #define PTE_UXN          (1UL << 54)  /* prohibido ejecutar desde EL0       */
 
+/* Los bits 55 a 58 de un descriptor los ignora el hardware: son para que
+ * el sistema operativo apunte lo que quiera. Aqui marcan una pagina que
+ * esta compartida y que hay que copiar en cuanto alguien escriba.
+ *
+ * Sin una marca asi no habria forma de distinguir "de solo lectura porque
+ * es codigo" de "de solo lectura porque todavia no te he dado tu copia", y
+ * son dos cosas muy distintas: la primera es una violacion y la segunda un
+ * tramite. */
+#define PTE_COW          (1UL << 55)
+
 #define PTE_ADDR_MASK    0x0000FFFFFFFFF000UL
 
 /* Combinaciones que usamos */
@@ -132,7 +142,9 @@ void     pmm_init(uint64_t ram_limit);
 uint64_t pmm_alloc(void);             /* una pagina de 4 KB, 0 si no hay    */
 uint64_t pmm_alloc_contig(uint64_t n);   /* n paginas SEGUIDAS              */
 void     pmm_free_contig(uint64_t pa, uint64_t n);
-void     pmm_free(uint64_t pa);
+void     pmm_free(uint64_t pa);       /* "yo ya no la uso"                  */
+void     pmm_ref(uint64_t pa);        /* "yo tambien la uso"                */
+uint64_t pmm_refs(uint64_t pa);       /* cuantos la usan                    */
 uint64_t pmm_total_pages(void);
 uint64_t pmm_free_pages(void);
 uint64_t pmm_used_pages(void);
@@ -161,6 +173,13 @@ uint64_t vmm_translate(uint64_t va);  /* pregunta al hardware: VA -> PA      */
 uint64_t *vmm_empty_pgd(void);        /* TTBR0 de un hilo de kernel      */
 uint64_t *vmm_create_pgd(uint64_t *asid_out);   /* tabla nueva + su ASID     */
 void      vmm_destroy_pgd(uint64_t *pgd, uint64_t asid);
+
+/* Duplicar un espacio de direcciones compartiendo sus paginas, marcadas
+ * para copiarse cuando alguien escriba. */
+uint64_t *vmm_fork(uint64_t *padre, uint64_t asid_padre, uint64_t *asid_hijo);
+
+/* Alguien ha escrito en una pagina COW. Devuelve 1 si lo ha resuelto. */
+int       vmm_cow_fault(uint64_t *pgd, uint64_t va, uint64_t asid);
 int       vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags);
 int       vmm_unmap_in(uint64_t *pgd, uint64_t va);  /* y devuelve la pagina */
 void      vmm_switch_to(uint64_t *pgd, uint64_t asid);  /* tabla + etiqueta  */

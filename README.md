@@ -77,6 +77,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 20   | Memoria para los procesos: sbrk y malloc    | hecho  |
 | 21   | Paginacion bajo demanda: la pila crece sola | hecho  |
 | 22   | Pagina de guarda en las pilas de kernel     | hecho  |
+| 23   | fork con copy-on-write                      | hecho  |
 
 ## Estructura
 
@@ -101,6 +102,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  cp.c        copia uno en otro       mem.c  ensenya el monton
                  umalloc.c   malloc/free de usuario, encima de sbrk
                  deep.c      recursion honda: se come la pila a proposito
+                 forkd.c     se bifurca y mide lo que NO cuesta hacerlo
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -830,6 +832,73 @@ El `STACK_MAGIC` sigue ahi, pero ha cambiado de papel: era el unico aviso y
 ahora es la segunda red, para el caso de que alguien salte por encima de la
 guarda de un brinco largo.
 
+## fork, y la mentira util
+
+Un proceso se duplica. El hijo sale con **el mismo estado** que el padre
+-los mismos registros, la misma pila, la misma posicion en el codigo- y la
+unica diferencia esta en `x0`: el padre recibe el pid del hijo y el hijo
+recibe un cero. De ahi sale el `if (fork() == 0)` de toda la vida.
+
+Y no se copia memoria. Los dos espacios apuntan a **las mismas paginas**,
+marcadas de solo lectura en ambos; la primera escritura de cualquiera de
+los dos es la que paga su copia.
+
+Lo que mas cuesta ver es que al padre tambien se le quita el permiso. Si lo
+conservara, escribiria en paginas que ya no son solo suyas y el hijo veria
+cambios que no le corresponden. **El sistema les esta mintiendo a los dos**:
+les dice que no pueden escribir cuando en realidad si pueden. La mentira se
+deshace, pagina a pagina y solo cuando hace falta, en el manejador de
+fallos.
+
+Ahi hay dos casos, y la diferencia entre ellos es todo el ahorro:
+
+    la usa uno solo   ->  no hay nada que copiar, se devuelve el permiso
+    la usan varios    ->  ahora si, se hace la copia privada
+
+El primero es el que hace que un `fork` seguido de un `exec` no copie casi
+nada, y el que hace que si el padre muere, el hijo se quede con las paginas
+originales sin pagar una sola copia.
+
+### Lo que cuesta de verdad
+
+    $ forkd
+      paginas libres al empezar : 245391
+      tras reservar y tocar 1 MB: 245134
+      [padre] el hijo es el pid 17
+      [padre] el fork ha costado 5 paginas
+              (si copiara el mega, serian 256 y pico)
+      [hijo]  la cambio a 222 y me voy
+      [padre] mi global sigue valiendo 111   <- aislado
+      [padre] paginas libres al final : 245134
+
+**Cinco paginas**: las tablas de traduccion del hijo y su pila de kernel.
+Bifurcar un proceso de 8 MB cuesta lo mismo que bifurcar uno de 8 KB,
+porque lo unico que se recorre es la tabla. Y al final la memoria vuelve
+entera: las copias que el hijo llego a pagar se liberaron al morir.
+
+### Las piezas que ya estaban
+
+Casi todo lo que hace falta para esto se construyo antes sin saber que era
+para esto:
+
+  - **ASIDs** (paso 10b), para que dos espacios convivan en la TLB
+  - **El manejador que reintenta** (paso 21), que ya sabia que un fallo
+    puede ser una peticion y no un error
+  - **Distinguir traduccion de permisos** en el `ISS`, que en el paso 21
+    servia para no confundir una pila que crece con una violacion, y aqui
+    sirve para reconocer una pagina que toca copiar
+
+Lo unico nuevo es un **contador de referencias por pagina** en el PMM.
+`pmm_free()` deja de significar "devuelvela" y pasa a significar "yo ya no
+la uso": solo vuelve al bitmap cuando no la usa nadie.
+
+Y un bit del descriptor. Los bits 55 a 58 los ignora el hardware y estan
+ahi para que el sistema operativo apunte lo que quiera; el 55 marca las
+paginas COW. Sin esa marca no habria forma de distinguir "de solo lectura
+porque es codigo" de "de solo lectura porque todavia no te he dado tu
+copia", y la primera es una violacion mientras que la segunda es un
+tramite.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -869,6 +938,13 @@ guarda de un brinco largo.
   delicado, porque el fallo llegaria estando ya dentro del kernel.
 - El monton de un proceso se mapea entero al pedirlo: `sbrk` es ansioso.
   Podria ser perezoso como la pila, y dar las paginas segun se tocaran.
+- El contador de referencias es un byte por pagina del mapa entero: 258 KB
+  de `.bss` para algo que casi siempre vale 1. Una estructura dispersa
+  ahorraria memoria a cambio de bastante mas codigo.
+- Una pagina no puede compartirse mas de 255 veces. Con `MAX_TASKS` en 24
+  no es un limite alcanzable, pero esta ahi.
+- No hay `exec`: un hijo recien bifurcado no puede sustituirse por otro
+  programa. Se puede `spawn`, que es otra cosa.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
   en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
   carga no hay nada que priorizar.
