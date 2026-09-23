@@ -23,6 +23,7 @@
 #include "uart.h"
 #include "sched.h"
 #include "smp.h"
+#include "ipc.h"
 
 /* --- [2] ARM local peripherals ---------------------------------------- */
 /* LOCAL_BASE lo define mmio.h: 0x40000000 fisico, visto desde el mapa
@@ -115,6 +116,46 @@ void irq_send_resched(uint64_t core)
         mmio_write(CORE_MBOX_SET(core, MBOX_RESCHED), 1);
 }
 
+/* --- Interrupciones para procesos de EL0 -----------------------------
+ *
+ * Un driver en espacio de usuario no puede recibir una interrupcion: las
+ * interrupciones son de EL1 y ahi no se entra sin privilegios. Lo que se
+ * le puede dar es un aviso.
+ *
+ * El trato es: cuando llega la interrupcion, el kernel la ENMASCARA y le
+ * manda un mensaje. El driver la atiende a su ritmo, ya en EL0, y cuando
+ * termina la vuelve a abrir. Enmascararla no es un detalle: si se dejara
+ * abierta, volveria a saltar inmediatamente -el periferico sigue
+ * pidiendo atencion- y el sistema se quedaria dando vueltas en el
+ * manejador sin llegar nunca a ejecutar al driver que iba a arreglarlo.
+ *
+ * Solo se puede pedir la de la UART. Dejar que un proceso se quedara con
+ * la del temporizador seria dejarle parar el planificador. */
+static int irq_puerto = -1;
+
+int irq_register(uint64_t irq, int puerto)
+{
+    if (irq != IRQ_UART || puerto < 0) return -1;
+    if (irq_puerto >= 0) return -1;      /* ya la lleva otro */
+    irq_puerto = puerto;
+    return 0;
+}
+
+/* El proceso que la tenia ha muerto: el kernel la recupera y la reabre. */
+void irq_release_port(int puerto)
+{
+    if (irq_puerto != puerto) return;
+    irq_puerto = -1;
+    mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
+}
+
+int irq_ack(uint64_t irq)
+{
+    if (irq != IRQ_UART) return -1;
+    mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
+    return 0;
+}
+
 void irq_handle(void)
 {
     uint64_t core = this_core();
@@ -141,8 +182,16 @@ void irq_handle(void)
     if (src & SRC_GPU) {
         /* Segunda pregunta: dentro del controlador [1], quien fue. */
         uint32_t p2 = mmio_read(IRQ_PENDING_2);
-        if (p2 & (1u << (IRQ_UART - 32)))
-            uart_irq();
+        if (p2 & (1u << (IRQ_UART - 32))) {
+            if (irq_puerto >= 0) {
+                /* Hay un driver en EL0 esperandola: se le avisa y se cierra
+                 * hasta que diga que ya. */
+                mmio_write(DISABLE_IRQS_2, 1u << (IRQ_UART - 32));
+                port_notify(irq_puerto, CMSG_IRQ);
+            } else {
+                uart_irq();              /* todavia la lleva el kernel */
+            }
+        }
     }
 
     /* Punto seguro para cambiar de hilo: el contexto del hilo interrumpido

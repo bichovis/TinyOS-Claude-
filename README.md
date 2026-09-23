@@ -81,6 +81,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 24   | exec: convertirse en otro programa          | hecho  |
 | 25   | Senyales, y Ctrl-C                          | hecho  |
 | 26   | Sueño interrumpible, descriptores y tuberias| hecho  |
+| 27   | El teclado, tambien en EL0                  | hecho  |
 
 ## Estructura
 
@@ -1111,6 +1112,80 @@ tabla dentro de la seccion critica, y `file_dup` lo pide por su cuenta.
 Un spinlock contra uno mismo, y el sintoma fue un cuelgue seco en el
 primer `|`.
 
+## El teclado, tambien en EL0
+
+La pantalla salio del kernel en el paso 8. El teclado tardo diecinueve
+pasos mas, y no por falta de ganas: **un proceso de EL0 no puede recibir
+interrupciones**. Las interrupciones entran por la VBAR, que es un registro
+de EL1, y saltan a una pila de EL1 con privilegios de EL1. No hay forma de
+que ese vector aterrice en espacio de usuario, y no la hay por diseño: si
+la hubiera, cualquier proceso podria quedarse con el temporizador.
+
+Asi que el driver de teclado parece imposible por definicion. La salida no
+es dar la interrupcion, sino el **aviso**:
+
+```
+    llega la IRQ 57
+      -> el kernel la enmascara y manda CMSG_IRQ al puerto del driver
+      -> el driver despierta, vacia la FIFO, hace irq_ack()
+      -> el kernel la vuelve a abrir
+```
+
+El kernel se queda solo con lo que de verdad exige privilegio: atender el
+vector y tocar el controlador de interrupciones. Son nueve lineas. Todo lo
+demas -saber que registro leer, cuantos bytes hay, que hacer con ellos- vive
+en `user/conserver.c`, en EL0, sin privilegios.
+
+**Por que hay que enmascararla.** Si se dejara abierta, volveria a saltar
+inmediatamente: el periferico sigue pidiendo atencion y seguira pidiendola
+hasta que alguien lea su FIFO, y quien va a leerla es un proceso que
+todavia no ha tenido ocasion de ejecutarse. El sistema se quedaria dando
+vueltas en el manejador, atendiendo una y otra vez la misma interrupcion,
+sin llegar nunca a planificar al unico que podia callarla. Enmascarar es lo
+que rompe ese circulo: la fuente se calla hasta que el driver dice que ya.
+
+**Lo bonito es lo que ve el driver.** Para `conserver.c`, una interrupcion
+no se distingue de cualquier otro mensaje: entra por el mismo `msg_recv` y
+se atiende en el mismo bucle que un `CMSG_PRINT`. No hay contexto de
+interrupcion, ni reentrada, ni carreras entre el manejador y el codigo
+normal, ni la regla de "aqui no puedes bloquear". Esa uniformidad no es un
+efecto secundario: es exactamente lo que se compra con un microkernel.
+
+**Lo que se queda dentro, y por que.** Dos cosas.
+
+El *buffer* de teclas sigue en el kernel. El driver lo llena con
+`SYS_console_push` y `read(0, ...)` lo vacia como siempre. Se podria haber
+hecho que cada `read` fuera un viaje de ida y vuelta al servidor, y seria
+mas puro, pero entonces el kernel necesitaria un puerto propio para recibir
+la respuesta y habria que inventar como se bloquea a un proceso esperando
+una contestacion que llega a otro. Lo que se gana es coherencia; lo que se
+paga son dos mecanismos nuevos. Aqui se eligio pagar menos: el driver esta
+fuera, que era el objetivo, y la cola se queda donde ya estaba.
+
+El *a quien interrumpe Ctrl-C* tambien. El driver ve el byte 3 y decide que
+significa "interrumpe" -eso es politica de terminal, y el terminal es el-
+pero no puede saber a quien: eso esta en la tabla de procesos. De ahi el
+reparto: `console_int()` avisa, y el kernel elige la victima. Es la misma
+frontera de siempre, dicha de otra forma: **el driver sabe de hardware, el
+kernel sabe de procesos.**
+
+**Un driver que se puede morir.** Decir "si tiene un bug muere el y el
+sistema sigue" solo vale si es verdad. Matando el conserver con SIGKILL, la
+interrupcion quedaria enmascarada esperando un `irq_ack` que no va a llegar
+nunca, y el teclado dejaria de existir hasta el siguiente reinicio. Por eso
+`ipc_release_ports()` llama a `irq_release_port()`: cuando muere el duenyo
+de un puerto, el kernel recupera la fuente y la reabre. Se puede comprobar:
+
+```
+    f  s  z            arrancar ficheros, consola y shell
+    kill 15 9          matar al driver de teclado
+    ls                 sigue respondiendo: la lleva el kernel otra vez
+```
+
+Con esto el kernel ya no toca ningun periferico de entrada/salida salvo
+para imprimir sus propios mensajes de arranque. La UART, la SD y el teclado
+estan los tres fuera.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -1118,10 +1193,14 @@ primer `|`.
   correcto. (Lo que si se saco de el es la carga de un proceso, que son
   milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
   sin el y publica con el otra vez.)
-- La entrada de consola sigue siendo del kernel: `SYS_read` la sirve, pero
-  no hay un servidor de teclado como lo hay de pantalla.
-- El shell no tiene tuberias, ni redireccion, ni historial, ni segundo
-  plano: lee, carga, arranca y espera.
+- El shell no tiene redireccion (`>`, `<`), ni historial, ni segundo plano,
+  ni tuberias de mas de dos: lee, carga, arranca y espera.
+- El buffer de teclas se queda en el kernel aunque el driver este fuera.
+  Es deliberado (ver "El teclado, tambien en EL0"), pero significa que el
+  kernel sigue sabiendo que es una consola.
+- Solo se puede pedir la interrupcion de la UART. La lista de fuentes que
+  un proceso puede reclamar esta escrita a mano en `irq_register()`; un
+  sistema serio la sacaria de un arbol de dispositivos.
 - El servidor de ficheros entiende FAT16 y solo mira el directorio raiz:
   nada de FAT32 ni de subdirectorios.
 - No hay diario ni nada que se le parezca: un corte de corriente a mitad de

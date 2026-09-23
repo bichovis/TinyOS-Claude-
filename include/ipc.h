@@ -20,6 +20,11 @@ struct port {
 void ipc_init(void);
 int  port_create(uint64_t owner_pid, int64_t want);                       /* id o -1      */
 int  port_send(int id, const struct message *m);            /* 0 o -1       */
+
+/* Enviar SIN bloquear, y tirar el mensaje si no cabe. Lo usa el kernel
+ * desde el manejador de interrupciones, donde esperar no es una opcion:
+ * quedarse ahi parado seria colgar la maquina entera. */
+int  port_notify(int id, uint64_t tipo);
 int  port_recv(int id, struct message *out, uint64_t pid);  /* 0 o -1       */
 void ipc_release_ports(uint64_t pid);   /* al morir un proceso              */
 void ipc_dump(void);

@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include "ipc.h"
 #include "mm.h"
+#include "irq.h"
 #include "sched.h"
 #include "irq.h"
 #include "spinlock.h"
@@ -147,6 +148,30 @@ int port_recv(int id, struct message *out, uint64_t pid)
  * Se llama desde task_exit(), que YA tiene sched_lock cogido y no lo va a
  * soltar hasta despues del cambio de contexto. Pedirlo aqui otra vez seria
  * un interbloqueo contra uno mismo. */
+int port_notify(int id, uint64_t tipo)
+{
+    if (id < 0 || id >= MAX_PORTS) return -1;
+
+    uint64_t f = sched_lock_irqsave();
+    struct port *p = &ports[id];
+    int ok = -1;
+
+    if (p->in_use && p->count < PORT_QUEUE) {
+        struct message *m = &p->q[p->tail];
+        m->from = 0;                     /* viene del kernel */
+        m->type = tipo;
+        m->len  = 0;
+        p->tail = (p->tail + 1) % PORT_QUEUE;
+        p->count++;
+        p->sent++;
+        wq_wake_one(&p->receivers);
+        ok = 0;
+    }
+
+    sched_unlock_irqrestore(f);
+    return ok;
+}
+
 void ipc_release_ports(uint64_t pid)
 {
     for (int i = 0; i < MAX_PORTS; i++) {
@@ -160,6 +185,16 @@ void ipc_release_ports(uint64_t pid)
              * teniendo el del monton, asi que no hay abrazo posible. */
             kfree(ports[i].q);
             ports[i].q = 0;
+
+            /* Si este puerto era el de un driver, devolverle la
+             * interrupcion al kernel. Sin esto, un driver que se muere se
+             * lleva el periferico con el: la fuente quedaria enmascarada
+             * esperando un irq_ack que ya no va a llegar nunca, y el
+             * teclado dejaria de existir hasta el siguiente reinicio.
+             *
+             * Que un driver pueda morirse es la gracia de tenerlo en EL0;
+             * solo cuenta si el sistema sabe recoger lo que suelta. */
+            irq_release_port(i);
         }
     }
 }

@@ -17,6 +17,7 @@
 #include "file.h"
 #include "ipc.h"
 #include "mbox.h"
+#include "irq.h"
 
 extern struct mutex *console_mutex(void);
 
@@ -292,6 +293,40 @@ void syscall_dispatch(struct trap_frame *f)
         ret = (task_wait(f->x[0], &codigo) < 0) ? -1 : codigo;
         break;
     }
+
+    /* --- Servicios para drivers de EL0 -------------------------------
+     * Las cuatro llamadas que hacen falta para que un proceso lleve el
+     * teclado: pedir la interrupcion, devolverla, entregar lo leido y
+     * decir que alguien ha pulsado Ctrl-C. */
+
+    case SYS_irq_register:
+        ret = irq_register(f->x[0], (int)f->x[1]);
+        break;
+
+    case SYS_irq_ack:
+        ret = irq_ack(f->x[0]);
+        break;
+
+    case SYS_console_push: {
+        char tmp[64];
+        uint64_t n = f->x[1];
+        if (n > sizeof(tmp)) n = sizeof(tmp);
+        if (!user_readable(f->x[0], n)) { ret = -1; break; }
+        copy_bytes(tmp, (const void *)f->x[0], n);
+        uart_push(tmp, n);
+        ret = 0;
+        break;
+    }
+
+    /* Quien decide que Ctrl-C significa "interrumpe" es el terminal, y el
+     * terminal ahora vive en EL0. Lo que NO puede saber un proceso es a
+     * quien hay que interrumpir: eso esta en la tabla de procesos, que es
+     * del kernel. De ahi el reparto: el driver detecta la tecla, el kernel
+     * decide a quien le cae. */
+    case SYS_console_int:
+        task_console_interrupt();
+        ret = 0;
+        break;
 
     case SYS_mmio_base:
         /* El kernel concede el MMIO al crear el proceso; aqui solo le

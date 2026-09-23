@@ -8,13 +8,36 @@
  * registros de la UART igual que lo hacia el driver del kernel en el paso 1,
  * solo que ahora, si tiene un bug, muere el y el sistema sigue.
  *
- * Su trabajo: recibir mensajes del puerto 0 y sacarlos por el puerto serie.
+ * Su trabajo: sacar por el puerto serie lo que le mandan, y meter en el
+ * sistema lo que se teclea. Las dos direcciones, en EL0.
+ *
+ * LO SEGUNDO ES LO DIFICIL, y merece explicacion. Un proceso de EL0 no
+ * puede recibir interrupciones: las interrupciones entran por la VBAR, que
+ * es de EL1, y ahi no se pisa sin privilegios. Un driver de usuario parece
+ * imposible por definicion.
+ *
+ * La salida es no darle la interrupcion, sino el aviso. El kernel se queda
+ * con la unica parte que de verdad necesita privilegio -atender el vector,
+ * enmascarar la fuente- y todo lo demas se convierte en un mensaje:
+ *
+ *     llega la IRQ 57 -> el kernel la enmascara y manda CMSG_IRQ al puerto
+ *                     -> el driver despierta, vacia la FIFO, y hace irq_ack
+ *                     -> el kernel la vuelve a abrir
+ *
+ * Para este proceso una interrupcion no se distingue de cualquier otro
+ * mensaje: entra por el mismo msg_recv y se atiende en el mismo bucle. No
+ * hay contexto de interrupcion, ni reentrada, ni carreras con el codigo
+ * normal. Esa uniformidad es la razon de ser del microkernel.
  */
 #include "syscall.h"
 
 #define UART_DR   0x00              /* registro de datos               */
 #define UART_FR   0x18              /* registro de estado              */
+#define UART_ICR  0x44              /* reconocer interrupciones        */
 #define FR_TXFF   (1u << 5)         /* FIFO de transmision llena       */
+#define FR_RXFE   (1u << 4)         /* FIFO de recepcion vacia         */
+#define INT_RX    (1u << 4)
+#define INT_RT    (1u << 6)
 
 static void hw_putc(uint64_t base, char c)
 {
@@ -39,6 +62,40 @@ static void hw_puts(uint64_t base, const char *s)
     hw_write(base, s, ustrlen(s));
 }
 
+/* Vaciar la FIFO de recepcion y entregar lo que traiga.
+ *
+ * Hay que vaciarla ENTERA: una sola interrupcion puede traer varios bytes,
+ * y si queda alguno dentro la UART la volveria a levantar en cuanto se
+ * desenmascare, con el agravante de que aqui el viaje de vuelta pasa por
+ * el planificador. */
+static void drenar(uint64_t base)
+{
+    volatile unsigned int *fr  = (volatile unsigned int *)(base + UART_FR);
+    volatile unsigned int *dr  = (volatile unsigned int *)(base + UART_DR);
+    volatile unsigned int *icr = (volatile unsigned int *)(base + UART_ICR);
+
+    char buf[32];
+    uint64_t n = 0;
+    int interrumpir = 0;
+
+    while (!(*fr & FR_RXFE)) {
+        char c = (char)(*dr & 0xFF);
+
+        /* Ctrl-C no es un caracter que leer: es una orden, y decidirlo es
+         * trabajo del terminal. Lo que este proceso NO puede saber es a
+         * quien hay que interrumpir -eso esta en la tabla de procesos- asi
+         * que de eso se encarga el kernel. */
+        if (c == 3) { interrumpir = 1; continue; }
+
+        if (n < sizeof(buf)) buf[n++] = c;
+    }
+
+    *icr = INT_RX | INT_RT;              /* reconocer en el propio chip */
+
+    if (n) console_push(buf, n);
+    if (interrumpir) console_int();
+}
+
 void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
 void _start(int argc, char **argv)
@@ -58,13 +115,30 @@ void _start(int argc, char **argv)
 
     /* A partir de aqui ya no volvemos a pedirle nada al kernel para
      * imprimir: escribimos en el hardware nosotros mismos. */
-    hw_puts(uart, "\n  [conserver] driver de consola vivo en EL0, puerto 0\n");
+    /* Pedir el teclado. A partir de este momento el kernel no vuelve a
+     * mirar la FIFO de recepcion: las teclas pasan por aqui. */
+    int teclado = (irq_register(IRQ_UART, (uint64_t)port) == 0);
+
+    hw_puts(uart, "\n  [conserver] driver de consola vivo en EL0, puerto 0");
+    hw_puts(uart, teclado ? ", con teclado\n" : ", solo salida\n");
+
+    /* Puede haber teclas esperando en la FIFO desde antes de registrarnos.
+     * Si no se vacian ahora, la UART no volvera a interrumpir -su nivel ya
+     * esta por encima del umbral- y el teclado naceria muerto. */
+    if (teclado) drenar(uart);
 
     char line[80];
     for (;;) {
         struct message m;
         if (msg_recv((uint64_t)port, &m) < 0)
             break;                       /* el puerto ha desaparecido */
+
+        /* Una interrupcion, atendida como un mensaje mas. */
+        if (m.type == CMSG_IRQ) {
+            drenar(uart);
+            irq_ack(IRQ_UART);
+            continue;
+        }
 
         if (m.type != CMSG_PRINT)
             continue;

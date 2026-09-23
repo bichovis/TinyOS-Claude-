@@ -25,6 +25,10 @@ struct message {
 
 /* Tipos de mensaje que entiende el servidor de consola */
 #define CMSG_PRINT     1
+#define CMSG_IRQ       2    /* lo manda el KERNEL: ha llegado una interrupcion */
+
+/* La unica interrupcion que un proceso puede pedir, por ahora. */
+#define IRQ_UART      57
 
 /* --- Numeros de llamada al sistema ------------------------------------ */
 #define SYS_write         1    /* (fd, buffer, bytes) -> escritos | -1     */
@@ -51,6 +55,22 @@ struct message {
 #define SYS_pipe         22    /* (int fds[2]) -> 0 | -1                     */
 #define SYS_close        23    /* (fd) -> 0 | -1                             */
 #define SYS_dup2         24    /* (viejo, nuevo) -> nuevo | -1               */
+
+/* --- Para los drivers de EL0 ------------------------------------------
+ * Un proceso no puede recibir interrupciones: las interrupciones son de
+ * EL1. Lo que si puede es pedir que se le conviertan en MENSAJES.
+ *
+ * Al llegar la interrupcion, el kernel la enmascara y manda un CMSG_IRQ al
+ * puerto que se le dijo. El driver la atiende cuando le toca -ya en EL0,
+ * como un mensaje mas de su bucle- y llama a irq_ack() para volver a
+ * abrirla. Que quede enmascarada mientras tanto es lo que evita que una
+ * interrupcion que nadie atiende inunde el sistema. */
+#define SYS_irq_register 25   /* (irq, puerto) -> 0 | -1                    */
+#define SYS_irq_ack      26   /* (irq) -> 0 | -1                            */
+
+/* El driver de consola le pasa al kernel lo que ha leido del teclado. */
+#define SYS_console_push 27   /* (buffer, bytes) -> 0 | -1                  */
+#define SYS_console_int  28   /* () -> Ctrl-C al proceso de primer plano    */
 
 /* --- Senyales ----------------------------------------------------------
  * Los numeros son los de siempre, para que no haya que aprenderselos otra

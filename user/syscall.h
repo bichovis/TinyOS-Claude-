@@ -127,6 +127,16 @@ static inline int64_t msg_recv(uint64_t port, struct message *m)
 /* --- MMIO concedido (solo para drivers) -------------------------------- */
 static inline uint64_t mmio_base(void)    { return (uint64_t)syscall2(SYS_mmio_base, 0, 0); }
 
+/* Para escribir un driver: pedir que una interrupcion llegue como mensaje,
+ * devolverla cuando ya esta atendida, y entregarle al kernel las teclas. */
+static inline int64_t irq_register(uint64_t irq, uint64_t puerto)
+                                          { return syscall2(SYS_irq_register, irq, puerto); }
+static inline int64_t irq_ack(uint64_t irq)
+                                          { return syscall2(SYS_irq_ack, irq, 0); }
+static inline int64_t console_push(const char *b, uint64_t n)
+                                          { return syscall2(SYS_console_push, (uint64_t)b, n); }
+static inline int64_t console_int(void)   { return syscall2(SYS_console_int, 0, 0); }
+
 /* Crear un proceso a partir de una imagen que tenemos en memoria.
  *
  * Que esto sea una llamada al sistema y no una funcion del kernel es lo

@@ -240,6 +240,27 @@ void uart_irq(void)
     if (interrumpir) task_console_interrupt();
 }
 
+/* Meter bytes en el buffer de recepcion desde fuera del driver.
+ *
+ * Cuando el teclado lo lleva un proceso de EL0, el kernel ya no toca la
+ * FIFO de la UART: las teclas le llegan por aqui, via SYS_console_push.
+ * De la mitad para abajo -el buffer, los que esperan, read()- nada cambia.
+ * Esa es la ventaja de haber separado el driver de la cola: se puede
+ * sustituir el hardware por un proceso sin tocar a quien lee. */
+void uart_push(const char *buf, uint64_t n)
+{
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t next = (rx_head + 1) % RXBUF_SIZE;
+        if (next == rx_tail) break;       /* lleno: se tira el resto */
+        rxbuf[rx_head] = buf[i];
+        rx_head = next;
+    }
+
+    uint64_t f = sched_lock_irqsave();
+    wq_wake_all(&rx_waiters);
+    sched_unlock_irqrestore(f);
+}
+
 /* Version bloqueante: en vez de preguntar cada 10 ms si ha llegado algo,
  * el hilo se duerme y la interrupcion de la UART lo despierta. Mientras
  * tanto no consume ni un ciclo. */
