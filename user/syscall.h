@@ -53,6 +53,10 @@ void  free(void *p);
 /* Paginas de 4 KB libres en todo el sistema. */
 static inline uint64_t freepages(void) { return (uint64_t)syscall2(SYS_freepages, 0, 0); }
 
+/* Convertirse en otro programa. Si sale bien no vuelve; si vuelve, fallo. */
+static inline int64_t exec(const void *imagen, uint64_t bytes, const char *args)
+{ return syscall3(SYS_exec, (uint64_t)imagen, bytes, (uint64_t)args); }
+
 /* Duplicarse. Devuelve el pid del hijo al padre, y 0 al hijo. */
 static inline int64_t fork(void)          { return syscall2(SYS_fork, 0, 0); }
 

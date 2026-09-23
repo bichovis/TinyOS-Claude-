@@ -858,6 +858,90 @@ static void nombre_de_args(struct task *t, const char *args)
     t->name = t->namebuf;
 }
 
+/* --- Convertirse en otro programa ------------------------------------
+ *
+ * fork duplica; exec sustituye. Juntos son la forma clasica de arrancar un
+ * programa en Unix, y cada uno hace una cosa sola: el proceso se bifurca y
+ * el hijo se convierte en otra cosa.
+ *
+ * Aqui hay una regla que no aparece en ninguna otra parte del kernel: NO
+ * HAY VUELTA ATRAS. En cuanto se tira el espacio de direcciones viejo, un
+ * fallo deja al proceso sin memoria, sin codigo y sin sitio al que volver.
+ * Por eso todo lo que puede fallar se hace ANTES: se construye el espacio
+ * nuevo entero, y solo cuando esta montado y no queda nada que pueda ir
+ * mal se cambia el de sitio.
+ *
+ * Y el orden importa por otro motivo: la imagen del programa nuevo vive en
+ * la memoria del proceso VIEJO. Si se tirara primero, no quedaria nada que
+ * leer. Se construye el espacio nuevo leyendo del viejo, que sigue siendo
+ * el activo, y se cambia al final.
+ *
+ * Devuelve argc, y eso no es capricho: el despachador de llamadas hace
+ * "f->x[0] = ret" al terminar, que es exactamente donde el programa nuevo
+ * espera encontrar su argc.
+ */
+int task_exec(const uint8_t *image, uint64_t size, const char *args,
+              struct trap_frame *f)
+{
+    struct task *t = current;
+    if (!t || !t->pgd) return -1;
+
+    uint64_t asid = 0;
+    uint64_t *pgd = vmm_create_pgd(&asid);
+    if (!pgd) return -1;
+
+    uint64_t entry = 0, tope = USER_BASE;
+    if (load_elf(pgd, image, size, &entry, &tope) < 0) goto fail;
+
+    uint64_t ustack = pmm_alloc();
+    if (!ustack) goto fail;
+
+    uint64_t argc = 0, argv = 0, sp = USER_STACK_TOP;
+    build_args(ustack, args, &argc, &argv, &sp);
+
+    if (vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA) < 0)
+        goto fail;
+
+    /* ---- A partir de aqui ya no se puede fallar ---- */
+
+    uint64_t *viejo_pgd  = t->pgd;
+    uint64_t  viejo_asid = t->asid;
+
+    uint64_t flags = sched_lock_irqsave();
+    t->pgd       = pgd;
+    t->asid      = asid;
+    t->brk_base  = tope;
+    t->brk       = tope;
+    t->stack_low = USER_STACK_TOP - PAGE_SIZE;
+
+    /* El MMIO concedido NO se hereda: se le dio al programa que habia, y
+     * ese programa ya no existe. Un driver que hace exec deja de ser un
+     * driver. */
+    t->mmio_va   = 0;
+
+    nombre_de_args(t, args);
+    sched_unlock_irqrestore(flags);
+
+    /* El espacio nuevo, activo YA: el viejo esta a punto de dejar de
+     * existir y TTBR0 todavia apunta a el. */
+    vmm_switch_to(pgd, asid);
+    vmm_destroy_pgd(viejo_pgd, viejo_asid);
+
+    /* Y el contexto, reescrito entero. El proceso no "vuelve" de esta
+     * llamada: aparece en el primer instante de otro programa. */
+    kzero(f, sizeof(*f));
+    f->elr    = entry;
+    f->spsr   = 0;                  /* EL0t, con las IRQ abiertas */
+    f->sp_el0 = sp;
+    f->x[1]   = argv;               /* x0 lo pone el despachador con argc */
+
+    return (int)argc;
+
+fail:
+    vmm_destroy_pgd(pgd, asid);
+    return -1;
+}
+
 /* --- Bifurcarse ------------------------------------------------------
  *
  * Un proceso se duplica. El hijo sale de aqui con EL MISMO estado que el

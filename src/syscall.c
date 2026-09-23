@@ -217,6 +217,29 @@ void syscall_dispatch(struct trap_frame *f)
         ret = task_fork(f);
         break;
 
+    /* Convertirse en otro programa. Si sale bien no "vuelve": el frame que
+     * se restaura al salir de aqui ya es el del programa nuevo. */
+    case SYS_exec: {
+        uint64_t buf = f->x[0], len = f->x[1], uargs = f->x[2];
+
+        if (len == 0 || len > 1024 * 1024) { ret = -1; break; }
+        if (!user_readable(buf, len))      { ret = -1; break; }
+
+        char args[128];
+        uint64_t i = 0;
+        for (; i < sizeof(args) - 1; i++) {
+            if (i == 0 || ((uargs + i) & (PAGE_SIZE - 1)) == 0)
+                if (!uargs || !user_readable(uargs + i, 1)) break;
+            char c = ((const char *)uargs)[i];
+            if (!c) break;
+            args[i] = c;
+        }
+        args[i] = 0;
+
+        ret = task_exec((const uint8_t *)buf, len, args, f);
+        break;
+    }
+
     case SYS_sbrk:
         ret = (int64_t)task_sbrk((int64_t)f->x[0]);
         break;

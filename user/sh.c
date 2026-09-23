@@ -173,7 +173,8 @@ void _start(int argc, char **argv)
     mi_puerto = port_create(-1);
     if (mi_puerto < 0) { kprint("  [sh] sin puertos\n"); exit(1); }
 
-    kprint("\n  TinyOS. Las ordenes son programas de la tarjeta.\n");
+    kprint("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
+    kprint("  y se arrancan con fork + exec.\n");
     kprint("  Prueba: ls / cat HOLA.TXT / hello uno dos / salir\n");
 
     for (;;) {
@@ -208,12 +209,29 @@ void _start(int argc, char **argv)
             continue;
         }
 
-        int64_t pid = spawn(imagen, bytes, linea);
-        free(imagen);                  /* el kernel ya lo ha copiado */
+        /* El par de toda la vida: bifurcarse y que el hijo se convierta en
+         * el programa. Cada uno hace una cosa sola, y por eso se pueden
+         * combinar: entre el fork y el exec cabe todo lo que un shell
+         * quiera preparar para el hijo sin afectarse a si mismo.
+         *
+         * El hijo hereda 'imagen' gracias al copy-on-write, asi que exec
+         * puede leer de ahi aunque sea memoria del shell: en ese momento
+         * ya es una copia suya. */
+        int64_t pid = fork();
+
+        if (pid == 0) {
+            exec(imagen, bytes, linea);
+            /* Si exec vuelve, es que ha fallado: el proceso sigue siendo
+             * el shell duplicado y lo unico sensato es irse. */
+            kprint("  no he podido convertirme en el programa\n");
+            exit(1);
+        }
+
+        free(imagen);                  /* la copia del padre */
         imagen = 0;
 
         if (pid < 0) {
-            kprint("  el kernel no ha querido arrancarlo\n");
+            kprint("  no he podido bifurcarme\n");
             continue;
         }
 

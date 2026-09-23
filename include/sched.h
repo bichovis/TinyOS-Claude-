@@ -111,6 +111,8 @@ void task_exit(void);
 int  task_wait(uint64_t pid);    /* espera a que ese pid termine            */
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
+int  task_exec(const uint8_t *image, uint64_t size, const char *args,
+               struct trap_frame *f);   /* y lo sustituye por otro programa  */
 
 /* Un fallo de traduccion en EL0 puede no ser un error: si cae justo debajo
  * de la pila, es que hace falta mas. Devuelve 1 si lo ha resuelto. */

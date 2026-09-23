@@ -44,6 +44,7 @@ struct message {
 #define SYS_sbrk         15    /* (delta) -> tope viejo del monton          */
 #define SYS_fork         16    /* () -> pid del hijo en el padre, 0 en el hijo */
 #define SYS_freepages    17    /* () -> paginas de 4 KB libres en el sistema */
+#define SYS_exec         18    /* (buffer, bytes, args) -> no vuelve         */
 
 /* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del
  * buzon de la GPU y solo contesta a esta lista corta. */

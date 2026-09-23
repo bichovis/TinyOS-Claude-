@@ -78,6 +78,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 21   | Paginacion bajo demanda: la pila crece sola | hecho  |
 | 22   | Pagina de guarda en las pilas de kernel     | hecho  |
 | 23   | fork con copy-on-write                      | hecho  |
+| 24   | exec: convertirse en otro programa          | hecho  |
 
 ## Estructura
 
@@ -899,6 +900,58 @@ porque es codigo" de "de solo lectura porque todavia no te he dado tu
 copia", y la primera es una violacion mientras que la segunda es un
 tramite.
 
+## exec, y la falta de marcha atras
+
+`fork` duplica; `exec` sustituye. Juntos son la forma clasica de arrancar
+un programa, y cada uno hace **una** cosa sola — que es justo lo que
+permite combinarlos: entre el `fork` y el `exec` cabe todo lo que un shell
+quiera preparar para el hijo sin afectarse a si mismo.
+
+Aqui hay una regla que no aparece en ninguna otra parte del kernel: **no
+hay vuelta atras**. En cuanto se tira el espacio de direcciones viejo, un
+fallo deja al proceso sin memoria, sin codigo y sin sitio al que volver.
+Por eso todo lo que puede fallar se hace ANTES, y el cambio de sitio ocurre
+cuando ya no queda nada que pueda ir mal.
+
+Y el orden importa por un segundo motivo, menos evidente: **la imagen del
+programa nuevo vive en la memoria del proceso viejo**. Si se tirara
+primero, no quedaria nada que leer. Se construye el espacio nuevo leyendo
+del viejo, que sigue siendo el activo, y se cambia al final — con un
+`vmm_switch_to` explicito, porque TTBR0 todavia apunta al que esta a punto
+de desaparecer.
+
+Un detalle que encaja solo: `task_exec()` devuelve **argc**. El despachador
+de llamadas hace `f->x[0] = ret` al terminar, y `x0` es exactamente donde
+el programa nuevo espera encontrar su argc. No hace falta ningun caso
+especial.
+
+El MMIO concedido **no** se hereda: se le dio al programa que habia, y ese
+programa ya no existe. Un driver que hace `exec` deja de ser un driver.
+
+### Dos formas de arrancar algo
+
+El proyecto tiene las dos, y la diferencia se ve mejor juntas:
+
+    spawn(imagen, bytes, args)      un paso: el kernel crea el proceso
+    fork() + exec(imagen, ...)      dos pasos: duplicarse y transformarse
+
+`spawn` es mas directo y es lo que usa `run`. Pero con `fork` y `exec` por
+separado, el hijo existe durante un rato **siendo todavia el padre**, y en
+ese rato se le puede preparar el terreno: cambiarle lo que va a heredar,
+cerrarle cosas, dejarle algo puesto. Con `spawn` ese hueco no existe. Es
+la razon por la que Unix eligio el par en vez de la llamada unica, y `sh`
+ya lo usa:
+
+    int64_t pid = fork();
+    if (pid == 0) {
+        exec(imagen, bytes, linea);
+        exit(1);                     /* si exec vuelve, es que fallo */
+    }
+    waitpid(pid);
+
+El hijo lee la imagen de la memoria del shell, y puede hacerlo porque el
+copy-on-write ya se la ha dado: en ese momento esos bytes son suyos.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -943,8 +996,6 @@ tramite.
   ahorraria memoria a cambio de bastante mas codigo.
 - Una pagina no puede compartirse mas de 255 veces. Con `MAX_TASKS` en 24
   no es un limite alcanzable, pero esta ahi.
-- No hay `exec`: un hijo recien bifurcado no puede sustituirse por otro
-  programa. Se puede `spawn`, que es otra cosa.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
   en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
   carga no hay nada que priorizar.
