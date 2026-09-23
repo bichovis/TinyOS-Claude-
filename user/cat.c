@@ -28,14 +28,21 @@ int main(int argc, char **argv)
 
         printf("\n  --- %s ---\n", argv[i]);
 
+        /* El cuerpo sale por stdout, el MISMO sitio por el que salieron
+         * las dos cabeceras.
+         *
+         * Antes esto era un write(1, ...) a pelo, y funcionaba de milagro:
+         * mientras stdout hablaba con la consola se vaciaba en cada salto
+         * de linea y el orden cuadraba. Con `cat fichero > otro` no hay
+         * saltos que valgan, las cabeceras se quedaban en el cubo hasta el
+         * final y aparecian DETRAS del contenido que anunciaban.
+         *
+         * Mezclar la libc y el descriptor a pelo en la misma salida es
+         * eso: dos colas distintas para la misma puerta. */
         char buf[256];
         int64_t n;
         while ((n = read((int)fd, buf, sizeof(buf))) > 0)
-            for (int64_t o = 0; o < n; ) {
-                int64_t k = write(1, buf + o, (uint64_t)(n - o));
-                if (k <= 0) break;
-                o += k;
-            }
+            fwrite(buf, 1, (size_t)n, stdout);
 
         closefd((int)fd);
         printf("  --- fin ---\n");

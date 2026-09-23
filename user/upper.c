@@ -4,6 +4,12 @@
  * inventarsela. Y no sabe de donde viene: si lo arranca el shell a secas,
  * del teclado; si lo arranca detras de una tuberia, del programa anterior.
  * Esa ignorancia es justamente lo que lo hace combinable.
+ *
+ * Y es el unico programa que sigue leyendo y escribiendo el descriptor a
+ * pelo, sin pasar por la libc. No es un olvido: un FILE hacia una tuberia
+ * se llena entero -512 bytes- antes de soltar nada, porque una tuberia no
+ * es un terminal y no hay a quien vaciar por lineas. Un filtro que retiene
+ * media pantalla deja de ser un filtro.
  */
 #include <stdlib.h>
 #include "syscall.h"

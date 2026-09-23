@@ -14,36 +14,26 @@
 #include "string.h"
 #include "syscall.h"
 
-#define VACIADO  128
-
+/* Un destino es o un FILE o un trozo de memoria.
+ *
+ * Antes habia un tercer caso: escribir a un descriptor a pelo, con su
+ * propio buffer de 128 bytes. Se ha ido, y no por ahorrar codigo. Si
+ * printf tiene un cubo y fputs tiene OTRO, lo que sale por pantalla no
+ * esta en el orden en que lo escribiste: cada uno se vacia cuando le
+ * toca. Un solo cubo por fichero, o el orden es mentira. */
 struct destino {
-    int     fd;          /* a donde escribir, o -1 si es a un buffer */
+    FILE   *f;           /* a donde escribir, o 0 si es a un buffer */
     char   *buf;
     size_t  cap;
     size_t  n;           /* ocupado del buffer */
     size_t  total;       /* caracteres producidos, quepan o no */
 };
 
-static void vaciar(struct destino *d)
-{
-    size_t o = 0;
-    while (o < d->n) {
-        int64_t k = write(d->fd, d->buf + o, d->n - o);
-        if (k <= 0) break;                /* la salida se cerro */
-        o += (size_t)k;
-    }
-    d->n = 0;
-}
-
 static void emitir(struct destino *d, char c)
 {
     d->total++;
 
-    if (d->fd >= 0) {
-        d->buf[d->n++] = c;
-        if (d->n == d->cap) vaciar(d);
-        return;
-    }
+    if (d->f) { fputc((unsigned char)c, d->f); return; }
 
     /* A un buffer: si no cabe se sigue CONTANDO pero no se guarda. Es lo
      * que hace que snprintf pueda decirte cuanto sitio habria hecho
@@ -209,7 +199,7 @@ static void formatear(struct destino *d, const char *fmt, va_list ap)
              * El truco es que el destino intermedio es un destino normal:
              * la misma maquinaria que usa snprintf. */
             char tmp[80];
-            struct destino t = { -1, tmp, sizeof(tmp) - 1, 0, 0 };
+            struct destino t = { 0, tmp, sizeof(tmp) - 1, 0, 0 };
 
             if (neg) emitir(&t, '-');
             numero(&t, entero, 10, 0, 0, 0, 0, 0);
@@ -247,7 +237,7 @@ static void formatear(struct destino *d, const char *fmt, va_list ap)
 
 int vsnprintf(char *buf, size_t cap, const char *fmt, va_list ap)
 {
-    struct destino d = { -1, buf, cap ? cap - 1 : 0, 0, 0 };
+    struct destino d = { 0, buf, cap ? cap - 1 : 0, 0, 0 };
     formatear(&d, fmt, ap);
     if (cap) buf[d.n] = 0;
     return (int)d.total;
@@ -262,39 +252,39 @@ int snprintf(char *buf, size_t cap, const char *fmt, ...)
     return n;
 }
 
-int printf(const char *fmt, ...)
+int vfprintf(FILE *f, const char *fmt, va_list ap)
 {
-    char acumulado[VACIADO];
-    struct destino d = { 1, acumulado, VACIADO, 0, 0 };
+    struct destino d = { f, 0, 0, 0, 0 };
+    formatear(&d, fmt, ap);
+    return ferror(f) ? -1 : (int)d.total;
+}
 
+int fprintf(FILE *f, const char *fmt, ...)
+{
     va_list ap;
     va_start(ap, fmt);
-    formatear(&d, fmt, ap);
+    int r = vfprintf(f, fmt, ap);
     va_end(ap);
-
-    vaciar(&d);
-    return (int)d.total;
+    return r;
 }
 
-int putchar(int c)
+int printf(const char *fmt, ...)
 {
-    char b = (char)c;
-    return (write(1, &b, 1) == 1) ? c : -1;
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    return r;
 }
+
+/* Estos tres eran llamadas directas al descriptor. Ahora pasan por el
+ * mismo FILE que printf, que es la unica forma de que un puts detras de
+ * un printf salga DETRAS. */
+int putchar(int c)          { return fputc(c, stdout); }
+int getchar(void)           { return fgetc(stdin); }
 
 int puts(const char *s)
 {
-    size_t n = strlen(s), o = 0;
-    while (o < n) {
-        int64_t k = write(1, s + o, n - o);
-        if (k <= 0) return -1;
-        o += (size_t)k;
-    }
-    return putchar('\n');
-}
-
-int getchar(void)
-{
-    char c;
-    return (read(0, &c, 1) == 1) ? (int)(unsigned char)c : -1;
+    if (fputs(s, stdout) < 0) return -1;
+    return fputc('\n', stdout);
 }

@@ -1,15 +1,28 @@
 /* stdlib.c - Lo que no cabe en otro sitio */
 #include "stdlib.h"
 #include <stdint.h>
+#include <stdio.h>
 #include "syscall.h"
 
-void exit(int codigo)
+void _exit(int codigo)
 {
     syscall2(SYS_exit, (uint64_t)codigo, 0);
 
     /* El kernel no devuelve de SYS_exit, pero el compilador no lo sabe y
      * noreturn le ha prometido que aqui no se sigue. */
     for (;;) ;
+}
+
+void exit(int codigo)
+{
+    /* Vaciar lo que quede en los cubos ANTES de irse.
+     *
+     * Sin esta linea, un programa que termina con un printf sin salto de
+     * linea no imprime nada: el texto se queda en el buffer de stdout y
+     * el proceso se lleva el buffer a la tumba. Es la diferencia entre
+     * exit() y _exit(), y es la unica que hay. */
+    fflush(0);
+    _exit(codigo);
 }
 
 /* --- El entorno -------------------------------------------------------

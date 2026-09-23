@@ -35,6 +35,11 @@ unsigned long strtoul(const char *s, char **fin, int base);
  * funcion que no es void". */
 void  exit(int codigo) __attribute__((noreturn));
 
+/* Salir SIN vaciar los buffers. Es lo que hay debajo de exit(), y lo que
+ * usa el hijo de un fork() cuando no quiere reimprimir lo que el padre
+ * dejo a medias en su cubo. */
+void  _exit(int codigo) __attribute__((noreturn));
+
 /* --- El entorno -------------------------------------------------------
  *
  * Un array de cadenas "NOMBRE=valor" terminado en cero, igual que argv.

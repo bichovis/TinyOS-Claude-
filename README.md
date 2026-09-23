@@ -3463,6 +3463,129 @@ sobre esa cosa: los bytes ya no estan. Que haya un codigo aparte para eso
 -y no un `EINVAL` generico- es una decision de hace cincuenta anyos que
 sigue siendo util.
 
+## Un cubo delante de cada fichero
+
+`printf` no escribia en la pantalla: escribia en un `write()`, y cada
+`write()` es una excepcion, un cambio de privilegio, un viaje por la tabla
+de vectores y la vuelta. Dos mil caracteres eran dos mil viajes.
+
+```
+    / $ libc
+      --- el cubo ---
+      stdout habla con un terminal
+      2000 caracteres con cubo:  4 llamadas a write()
+      2000 caracteres sin cubo:  2000 llamadas a write()
+      o sea 500 veces menos viajes al kernel
+```
+
+Un `FILE` es un descriptor con un cubo delante. Eso es todo lo que es. Lo
+que tiene miga es **cuando** se vacia, y de esa decision salen tres cosas
+que parecen no tener nada que ver entre si.
+
+**Primera: el mismo binario se comporta distinto segun a donde escriba.**
+
+```
+    / $ libc
+      stdout habla con un terminal
+    / $ libc > /sal.txt
+    / $ cat /sal.txt
+      stdout habla con un fichero
+```
+
+Con un terminal delante hay alguien **mirando**, y una salida que aparece a
+trozos de 512 bytes no sirve para seguir un programa: se vacia en cada
+salto de linea. Hacia un fichero no mira nadie mientras se escribe, asi que
+se llena el cubo entero. El criterio no es "que es mas rapido", es "que le
+sirve a quien lee".
+
+Y la pregunta se responde sin syscall nueva: se intenta `lseek` sobre el
+descriptor. Un fichero te deja moverte; la consola no, porque no tiene
+posicion. La respuesta llega **por el camino de atras**, como efecto
+secundario de una operacion que iba a otra cosa. (`errno` se guarda y se
+repone: esto es una pregunta, no un fallo.)
+
+**Segunda: la mentira mas vieja de depurar con printf.**
+
+```
+    / $ libc
+      --- lo que se pierde ---
+      salgo por exit()  y esto se lee
+      arriba hay UNA linea, no dos
+```
+
+Dos hijos escriben lo mismo, sin salto de linea al final. Uno sale por
+`exit()`, que vacia los cubos; el otro por `_exit()`, que es lo que pasa de
+verdad cuando un programa se muere de golpe. Solo se lee uno.
+
+Por eso **el ultimo `printf` que ves en pantalla no es el ultimo que se
+ejecuto**. Llevas cuarenta anyos de programadores buscando el fallo entre
+la linea que se imprimio y la siguiente, cuando el fallo estaba tres
+funciones mas adelante y lo que falta es lo que se quedo en el cubo.
+
+Quitar el `fflush(0)` de `exit()` hace desaparecer tambien la primera
+linea. La prueba mide algo.
+
+**Tercera: dos colas para la misma puerta.**
+
+`cat` imprimia sus cabeceras con `printf` y el contenido con `write(1,...)`
+a pelo. Funcionaba, y funcionaba **de milagro**: mientras stdout hablaba con
+la consola se vaciaba en cada salto de linea y el orden cuadraba por
+casualidad. En cuanto la salida fue a un fichero:
+
+```
+      ...contenido del fichero...
+      --- /sal.txt ---      <-- la cabecera, al final
+```
+
+Las cabeceras se quedaron en el cubo hasta el `exit` y salieron **detras**
+del contenido que anunciaban. Mezclar la libc y el descriptor a pelo en la
+misma salida es tener dos colas para la misma puerta.
+
+### Leer del terminal sin cubo, y por que
+
+Al leer, el cubo tiene un problema que no tiene al escribir: **el terminal
+no es tuyo**. Lo comparten todos los procesos por turnos. Si el shell se
+guarda 512 bytes "por si acaso", se esta quedando con lo que el usuario
+tecleo para el programa que viene despues, y ese programa espera algo que
+ya no va a llegar.
+
+De un fichero se lee de golpe porque el fichero es tuyo. Del terminal, de
+uno en uno.
+
+### Atar stdin a stdout
+
+Un programa que pregunta `nombre: ` sin salto de linea se quedaba mudo:
+la pregunta en el cubo, el programa esperando la respuesta. Le paso al
+shell en cuanto printf empezo a tener cubo -el prompt aparecia **un
+comando tarde**- y le habria pasado a todo lo que pregunte algo.
+
+La solucion no es acordarse de poner `fflush(stdout)` antes de cada
+lectura. Es que **leer vacie lo que haya pendiente de escribir**, una vez,
+en `fgetc`. Por eso en C nadie escribe un `fflush` antes de un `scanf`: no
+es que no haga falta, es que ya lo hace la lectura.
+
+### Lo que hay
+
+`fopen` `fclose` `fflush` `fread` `fwrite` `fgetc` `fputc` `ungetc`
+`fgets` `fputs` `fseek` `ftell` `rewind` `feof` `ferror` `clearerr`
+`fprintf` `vfprintf` `isatty`, y `printf`/`puts`/`putchar`/`getchar`
+reescritos encima de ellos para que haya **un solo cubo por fichero** y el
+orden de lo que sale sea el orden en que se escribio.
+
+Dos detalles que no son descuidos:
+
+- **Solo `"r"` o `"w"`,** no `"r+"`. Un fichero abierto para las dos cosas
+  necesita saber en que direccion se uso el cubo la ultima vez y vaciarlo
+  al cambiar de sentido; es la parte de stdio donde mas se equivoca todo
+  el mundo, y aqui no hace falta.
+- **`stderr` sin cubo,** a proposito. Es para lo que tienes que ver aunque
+  el programa se este cayendo.
+
+Y uno que si es un error facil: `ftell` **no** es la posicion del
+descriptor. Hay que descontar lo que queda por consumir en el cubo al leer,
+o sumar lo que queda por escribir. Sin eso, un `ftell` tras leer un solo
+caracter contesta 512.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -3580,6 +3703,15 @@ sigue siendo util.
   caza al instante, pero se caza. Darle mas de una pagina es cambiar un
   numero; darle paginacion bajo demanda como a la de usuario es mas
   delicado, porque el fallo llegaria estando ya dentro del kernel.
+- Un `FILE` que escribe a una **tuberia** se llena entero antes de soltar
+  nada, porque una tuberia no es un terminal. En un filtro interactivo eso
+  se nota: `upper` sigue leyendo y escribiendo el descriptor a pelo justo
+  por eso, y no porque se nos olvidara cambiarlo. La libc de verdad tiene
+  `setvbuf` para poder decidirlo desde fuera; aqui no lo hay.
+- No hay `"r+"`, ni `setvbuf`, ni `scanf`. Los dos primeros son decisiones;
+  el tercero es que aun no ha hecho falta.
+- `ungetc` acepta **uno** solo, y solo si antes se leyo algo del cubo. Es lo
+  que garantiza el estandar, y mas de uno obligaria a un buffer aparte.
 - El monton de un proceso se mapea entero al pedirlo: `sbrk` es ansioso.
   Podria ser perezoso como la pila, y dar las paginas segun se tocaran.
 - El contador de referencias es un byte por pagina del mapa entero: 258 KB

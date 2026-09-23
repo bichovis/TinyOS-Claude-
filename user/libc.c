@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#include <errno.h>
 #include "syscall.h"
 
 /* --- setjmp / longjmp ------------------------------------------------ */
@@ -176,7 +177,125 @@ static void prueba_monton(void)
     free(v);
 }
 
+/* --- Ficheros con buffer ---------------------------------------------- */
+
+#define PRUEBA "/tmp-libc.txt"
+
+static void prueba_buffer(void)
+{
+    printf("\n  --- el cubo ---\n");
+
+    /* Lo que cuesta NO tener cubo.
+     *
+     * Los mismos 2000 caracteres por los mismos dos caminos. Lo que se
+     * mide no es el tiempo -que tambien-, sino cuantas veces hay que
+     * cruzar a EL1: excepcion, cambio de privilegio, tabla de vectores,
+     * y vuelta. */
+    /* El mismo binario, dos comportamientos. Con `libc` a secas stdout
+     * habla con la consola y se vacia por lineas, porque hay alguien
+     * mirando; con `libc > fichero` no hay nadie, y se llena el cubo
+     * entero antes de bajar al kernel. */
+    printf("  stdout habla con %s\n", isatty(1) ? "un terminal" : "un fichero");
+
+    unsigned long antes = stdio_escrituras;
+
+    FILE *f = fopen(PRUEBA, "w");
+    if (!f) { printf("  MAL: no puedo crear %s: %s\n", PRUEBA, strerror(errno)); return; }
+    for (int i = 0; i < 2000; i++) fputc('a' + (i % 26), f);
+    fclose(f);
+
+    unsigned long con = stdio_escrituras - antes;
+
+    antes = stdio_escrituras;
+    int fd = (int)openf(PRUEBA, O_ESCRIBIR);
+    if (fd < 0) { printf("  MAL: no puedo reabrir: %s\n", strerror(errno)); return; }
+    for (int i = 0; i < 2000; i++) { char c = 'a' + (i % 26); write(fd, &c, 1); }
+    closefd(fd);
+
+    printf("  2000 caracteres con cubo:  %lu llamadas a write()\n", con);
+    printf("  2000 caracteres sin cubo:  2000 llamadas a write()\n");
+    printf("  o sea %lu veces menos viajes al kernel\n", 2000 / (con ? con : 1));
+
+    /* Orden. Antes de este paso printf tenia su propio cubo y fputs
+     * escribia al descriptor: lo segundo salia ANTES que lo primero. */
+    printf("  orden: uno");
+    fputs(" dos", stdout);
+    printf(" tres (tienen que ir en ese orden)\n");
+}
+
+static void prueba_leer(void)
+{
+    printf("\n  --- leer ---\n");
+
+    FILE *f = fopen(PRUEBA, "w");
+    if (!f) { printf("  MAL: no puedo crear\n"); return; }
+    fprintf(f, "primera\nsegunda\ntercera\n");
+    fclose(f);
+
+    f = fopen(PRUEBA, "r");
+    if (!f) { printf("  MAL: no puedo leer: %s\n", strerror(errno)); return; }
+
+    char linea[64];
+    int n = 0;
+    while (fgets(linea, sizeof(linea), f)) n++;
+    printf("  fgets encuentra %d lineas: %s\n", n, n == 3 ? "ok" : "MAL");
+    printf("  feof despues de la ultima: %s\n", feof(f) ? "ok" : "MAL");
+
+    /* ftell tiene que descontar lo que queda sin consumir en el cubo. Si
+     * se le olvida, devuelve el tamano del fichero entero desde el primer
+     * caracter leido. */
+    rewind(f);
+    int c = fgetc(f);
+    long donde = ftell(f);
+    printf("  ftell tras leer 1 caracter dice %ld: %s\n",
+           donde, donde == 1 ? "ok" : "MAL");
+
+    printf("  ungetc devuelve el caracter: %s\n",
+           (ungetc(c, f) == c && fgetc(f) == c) ? "ok" : "MAL");
+
+    fseek(f, 8, DESDE_INICIO);
+    fgets(linea, sizeof(linea), f);
+    printf("  fseek a 8 cae en \"segunda\": %s\n",
+           strncmp(linea, "segunda", 7) == 0 ? "ok" : "MAL");
+
+    fclose(f);
+    unlink(PRUEBA);
+}
+
+/* La mentira clasica de depurar con printf.
+ *
+ * Dos hijos escriben exactamente lo mismo. Uno sale por exit(), que vacia
+ * los cubos; el otro por _exit(), que es lo que pasa de verdad cuando un
+ * programa se muere de golpe. Solo se lee uno de los dos mensajes, y por
+ * eso el ultimo printf que ves en pantalla no es el ultimo que se
+ * ejecuto. */
+static void prueba_perdida(void)
+{
+    printf("\n  --- lo que se pierde ---\n");
+
+    /* Vaciar ANTES del fork. Si no, el hijo se lleva una copia del cubo
+     * del padre y lo que hay dentro sale impreso DOS veces, una por cada
+     * proceso. Es el error mas viejo de mezclar buffers con fork. */
+    fflush(stdout);
+
+    /* Los dos mensajes van SIN salto de linea al final, a proposito: asi
+     * se quedan en el cubo, porque stdout en un terminal se vacia por
+     * lineas y estas no han terminado. Lo unico que los separa es por
+     * donde sale cada proceso. */
+    int64_t h = fork();
+    if (h == 0) { printf("  salgo por exit()  y esto se lee"); exit(0); }
+    waitpid((uint64_t)h);
+    printf("\n");
+
+    h = fork();
+    if (h == 0) { printf("  salgo por _exit() y esto no se lee"); _exit(0); }
+    waitpid((uint64_t)h);
+
+    printf("  arriba hay UNA linea, no dos\n");
+}
+
 int main(int argc, char **argv)
+
 {
     (void)argc; (void)argv;
 
@@ -184,6 +303,9 @@ int main(int argc, char **argv)
     prueba_orden();
     prueba_numeros();
     prueba_monton();
+    prueba_buffer();
+    prueba_leer();
+    prueba_perdida();
 
     printf("\n  --- fin ---\n");
     return 0;
