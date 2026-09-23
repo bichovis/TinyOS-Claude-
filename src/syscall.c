@@ -201,6 +201,12 @@ void syscall_dispatch(struct trap_frame *f)
     /* Leer de la consola. Por ahora la entrada sigue siendo del kernel: es
      * el unico periferico que no se ha cedido, porque de el depende poder
      * decir que algo ha fallado. */
+    /* Mover el tope del monton del proceso. Devuelve el tope VIEJO, que es
+     * el principio de lo que se acaba de conseguir. */
+    case SYS_sbrk:
+        ret = (int64_t)task_sbrk((int64_t)f->x[0]);
+        break;
+
     case SYS_read:
         ret = (int64_t)(uint8_t)uart_getc_blocking();
         break;

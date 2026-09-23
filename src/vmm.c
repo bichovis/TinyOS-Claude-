@@ -84,6 +84,41 @@ int vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags)
     return 0;
 }
 
+/* Quitar una pagina del mapa y devolverla al gestor.
+ *
+ * Bajar sin crear: si por el camino no hay tabla, es que ahi no habia nada
+ * mapeado y no hay nada que hacer. Las tablas intermedias se quedan aunque
+ * se vacien; recogerlas costaria contar cuantas entradas les quedan vivas,
+ * y son 4 KB cada una. */
+int vmm_unmap_in(uint64_t *pgd, uint64_t va)
+{
+    uint64_t *t = pgd;
+
+    for (int nivel = 0; nivel < 2; nivel++) {
+        uint64_t i = nivel ? L2_INDEX(va) : L1_INDEX(va);
+        if (!(t[i] & PTE_VALID) || !(t[i] & PTE_TABLE)) return -1;
+        t = phys_to_virt(t[i] & PTE_ADDR_MASK);
+    }
+
+    uint64_t i = L3_INDEX(va);
+    if (!(t[i] & PTE_VALID)) return -1;
+
+    uint64_t pa = t[i] & PTE_ADDR_MASK;
+    t[i] = 0;
+
+    /* Borrar la entrada no basta: mientras la traduccion siga en la TLB, el
+     * proceso sigue llegando a una pagina que ya no es suya. */
+    __asm__ volatile(
+        "dsb ishst\n"
+        "tlbi vaae1is, %0\n"
+        "dsb ish\n"
+        "isb\n"
+        :: "r"(va >> PAGE_SHIFT) : "memory");
+
+    pmm_free(pa);
+    return 0;
+}
+
 int vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags)
 {
     return vmm_map_in(l1_table, va, pa, flags);

@@ -45,6 +45,17 @@ static inline void exit(int code)         { syscall2(SYS_exit, (uint64_t)code, 0
 /* Un caracter de la consola. Bloquea hasta que llegue. */
 static inline char kgetc(void)            { return (char)syscall2(SYS_read, 0, 0); }
 
+/* --- El monton del proceso (user/umalloc.c) ---------------------------
+ * Encima de sbrk(), el mismo asignador que usa el kernel para el suyo. */
+void *malloc(uint64_t n);
+void  free(void *p);
+
+/* Pedirle memoria al kernel moviendo el tope del monton. Devuelve el tope
+ * VIEJO: el principio de lo que acabas de conseguir. Con delta negativo,
+ * la devuelve. */
+static inline void *sbrk(int64_t delta)
+{ return (void *)(uint64_t)syscall2(SYS_sbrk, (uint64_t)delta, 0); }
+
 /* Esperar a que termine un proceso. Vuelve enseguida si ya no existe. */
 static inline void waitpid(uint64_t pid)  { syscall2(SYS_waitpid, pid, 0); }
 static inline void yield(void)            { syscall2(SYS_yield, 0, 0); }

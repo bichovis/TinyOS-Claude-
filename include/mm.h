@@ -88,10 +88,23 @@
 
 /* Mapa de un proceso de usuario. Vive abajo del todo porque TTBR0 es suyo
  * entero: el kernel ya no le ocupa ni una entrada. Empezamos en 4 MB y no
- * en 0 para que un puntero nulo (y sus vecinos) fallen en vez de acertar. */
+ * en 0 para que un puntero nulo (y sus vecinos) fallen en vez de acertar.
+ *
+ *   0x00400000  codigo y datos (lo que diga el ELF)
+ *               |
+ *               v  el monton crece hacia arriba desde donde acabe el ELF
+ *   0x0F000000  tope del monton
+ *   0x10000000  MMIO concedido, si es un driver
+ *               ^  la pila crece hacia abajo
+ *   0x20000000  tope de la pila
+ *
+ * Entre el monton y la pila hay un abismo de 256 MB a proposito: que
+ * crezcan el uno contra el otro y se toquen es un error clasico, y con
+ * esta distancia hace falta pedir mucho para llegar. */
 #define USER_BASE        0x00400000UL      /* codigo, en 4 MB              */
-#define USER_STACK_TOP   0x00800000UL      /* pila (crece hacia abajo)     */
+#define USER_HEAP_MAX    0x0F000000UL      /* hasta donde puede crecer     */
 #define USER_MMIO_BASE   0x10000000UL      /* MMIO concedido a un driver   */
+#define USER_STACK_TOP   0x20000000UL      /* pila (crece hacia abajo)     */
 #define USER_LIMIT       0x40000000UL      /* nada de usuario por encima   */
 
 /* --- Gestor de memoria fisica (pmm.c) --------------------------------- */
@@ -128,6 +141,7 @@ uint64_t *vmm_empty_pgd(void);        /* TTBR0 de un hilo de kernel      */
 uint64_t *vmm_create_pgd(uint64_t *asid_out);   /* tabla nueva + su ASID     */
 void      vmm_destroy_pgd(uint64_t *pgd, uint64_t asid);
 int       vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags);
+int       vmm_unmap_in(uint64_t *pgd, uint64_t va);  /* y devuelve la pagina */
 void      vmm_switch_to(uint64_t *pgd, uint64_t asid);  /* tabla + etiqueta  */
 uint64_t  vmm_translate_user(uint64_t va);      /* ¿puede EL0 LEER aqui?     */
 uint64_t  vmm_translate_user_w(uint64_t va);    /* ¿puede EL0 ESCRIBIR aqui? */

@@ -38,6 +38,8 @@ struct task {
     uint64_t   *pgd;          /* tabla TTBR0 propia; 0 = hilo de kernel      */
     uint64_t    asid;         /* etiqueta de su TLB; 0 = hilo de kernel      */
     uint64_t    mmio_va;      /* MMIO concedido a un driver de EL0; 0 si no  */
+    uint64_t    brk_base;     /* donde acaba el ELF: el suelo del monton     */
+    uint64_t    brk;          /* y hasta donde ha crecido                    */
     const char *name;
     char        namebuf[16]; /* para los que traen su nombre de argv[0]    */
 };
@@ -104,6 +106,7 @@ void task_yield(void);           /* ceder la CPU voluntariamente            */
 void task_sleep(uint64_t ticks);
 void task_exit(void);
 int  task_wait(uint64_t pid);    /* espera a que ese pid termine            */
+uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
 void sched_preempt(void);        /* lo llama irq_handle()                   */
 uint64_t sched_switches(void);   /* cambios de contexto totales             */

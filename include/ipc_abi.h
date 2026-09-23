@@ -41,6 +41,7 @@ struct message {
 #define SYS_clock_rate   12    /* (id) -> Hz de un reloj de la placa        */
 #define SYS_read         13    /* () -> un caracter de la consola           */
 #define SYS_waitpid      14    /* (pid) -> 0 cuando ese proceso termina     */
+#define SYS_sbrk         15    /* (delta) -> tope viejo del monton          */
 
 /* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del
  * buzon de la GPU y solo contesta a esta lista corta. */

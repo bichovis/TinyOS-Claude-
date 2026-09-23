@@ -452,6 +452,68 @@ static struct task *by_pid(uint64_t pid)
     return 0;
 }
 
+/* --- El monton de un proceso -----------------------------------------
+ *
+ * 'brk' es el tope: la primera direccion que el proceso todavia NO tiene.
+ * Moverlo hacia arriba es pedir memoria, hacia abajo devolverla, y el
+ * valor que se devuelve es el tope VIEJO, que es justo el principio de lo
+ * que se acaba de conseguir.
+ *
+ * Es la interfaz mas tonta que existe para pedir memoria y por eso es la
+ * que llevan los Unix desde 1971: el kernel no sabe de bloques ni de
+ * listas, solo de "hasta aqui". Repartir ese espacio en trozos es trabajo
+ * del proceso, y lo hace user/umalloc.c con el mismo algoritmo que usa el
+ * kernel para el suyo. Lo unico que cambia entre los dos asignadores es de
+ * donde sale la memoria: uno la pide al gestor de paginas y el otro aqui.
+ */
+uint64_t task_sbrk(int64_t delta)
+{
+    struct task *t = current;
+    uint64_t viejo = t->brk;
+
+    if (!t->pgd || delta == 0) return viejo;
+
+    uint64_t alineado_viejo = (viejo + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+
+    if (delta > 0) {
+        uint64_t nuevo = viejo + (uint64_t)delta;
+        if (nuevo < viejo || nuevo > USER_HEAP_MAX) return viejo;  /* no cabe */
+
+        uint64_t alineado_nuevo = (nuevo + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+
+        for (uint64_t va = alineado_viejo; va < alineado_nuevo; va += PAGE_SIZE) {
+            uint64_t pa = pmm_alloc();
+            if (!pa) {
+                /* Sin memoria a mitad: deshacer lo repartido y no mover el
+                 * tope. Media peticion es peor que ninguna, porque el
+                 * proceso creeria tener lo que pidio. */
+                for (uint64_t v = alineado_viejo; v < va; v += PAGE_SIZE)
+                    vmm_unmap_in(t->pgd, v);
+                return viejo;
+            }
+            if (vmm_map_in(t->pgd, va, pa, MM_USER_DATA) < 0) {
+                pmm_free(pa);
+                for (uint64_t v = alineado_viejo; v < va; v += PAGE_SIZE)
+                    vmm_unmap_in(t->pgd, v);
+                return viejo;
+            }
+        }
+        t->brk = nuevo;
+        return viejo;
+    }
+
+    /* Encoger. No se baja del suelo, que es donde acaba el ELF. */
+    uint64_t nuevo = viejo - (uint64_t)(-delta);
+    if (nuevo > viejo || nuevo < t->brk_base) return viejo;
+
+    uint64_t alineado_nuevo = (nuevo + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint64_t va = alineado_nuevo; va < alineado_viejo; va += PAGE_SIZE)
+        vmm_unmap_in(t->pgd, va);
+
+    t->brk = nuevo;
+    return viejo;
+}
+
 int task_alive(uint64_t pid)
 {
     uint64_t flags = sched_lock_irqsave();
@@ -577,7 +639,7 @@ static int load_segment(uint64_t *pgd, const uint8_t *img, uint64_t size,
  * La comprobacion es aburrida y es exactamente la que evita que un fichero
  * mal formado (o malicioso) consiga que el kernel mapee donde no debe. */
 static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
-                    uint64_t *entry)
+                    uint64_t *entry, uint64_t *tope)
 {
     if (size < sizeof(struct elf64_ehdr)) return -1;
 
@@ -597,7 +659,9 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
     const struct elf64_phdr *ph =
         (const struct elf64_phdr *)(img + eh->e_phoff);
 
-    int cargados = 0;
+    int      cargados = 0;
+    uint64_t fin      = USER_BASE;
+
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
         if (ph[i].p_memsz == 0) continue;
@@ -619,6 +683,7 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
         if (load_segment(pgd, img, size, va, ph[i].p_offset,
                          ph[i].p_filesz, mem, flags) < 0)
             return -1;
+        if (va + mem > fin) fin = va + mem;
         cargados++;
     }
 
@@ -627,6 +692,10 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
         eh->e_entry >= USER_STACK_TOP - PAGE_SIZE) return -1;
 
     *entry = eh->e_entry;
+
+    /* El monton del proceso empieza donde acaba su imagen, en la primera
+     * frontera de pagina que queda libre. */
+    *tope = (fin + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     return 0;
 }
 
@@ -748,8 +817,9 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
 
     uint64_t kstack_pa = 0;
     uint64_t entry     = 0;
+    uint64_t tope      = USER_BASE;
 
-    if (load_elf(pgd, image, size, &entry) < 0)
+    if (load_elf(pgd, image, size, &entry, &tope) < 0)
         goto fail;
 
     /* --- Pila de usuario: una pagina justo debajo de USER_STACK_TOP --- */
@@ -787,6 +857,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->stack     = kstack;
     t->pgd       = pgd;
     t->asid      = asid;
+    t->brk_base  = tope;
+    t->brk       = tope;
     if (name) t->name = name;
     else      nombre_de_args(t, args);
     t->pid       = next_pid++;

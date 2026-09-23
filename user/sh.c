@@ -16,13 +16,16 @@
 #include "fs_abi.h"
 
 #define MAX_LINEA   128
-#define MAX_IMG     (32 * 1024)
 
 static struct message m;
 static char           linea[MAX_LINEA];
 static char           nombre[32];
-static unsigned char  imagen[MAX_IMG];
 static int64_t        mi_puerto;
+
+/* La imagen ya no es un array estatico de 32 KB, que era a la vez
+ * desperdicio y techo: se pide del monton, del tamanyo exacto que diga el
+ * servidor de ficheros, y se devuelve al arrancar el programa. */
+static unsigned char *imagen;
 
 static void dec(uint64_t v)
 {
@@ -93,12 +96,47 @@ static void nombre_de(const char *orden)
  * manda a buscar el fallo al sitio equivocado. */
 static const char *motivo;
 
+/* Preguntar el tamanyo antes de leer: asi se pide justo eso y ni un byte
+ * mas. Antes daba igual porque el buffer era fijo. */
+static uint64_t tamano_de(const char *fichero)
+{
+    struct fs_request r;
+    r.port = (unsigned long)mi_puerto;
+    r.arg  = 0;
+    for (int i = 0; i < FS_NAME_MAX; i++) r.name[i] = 0;
+    ucopy(r.name, fichero, ustrlen(fichero) + 1);
+
+    m.type = FS_SIZE;
+    m.len  = sizeof(r);
+    ucopy(m.data, (const char *)&r, sizeof(r));
+
+    if (msg_send(PORT_FILES, &m) < 0) {
+        motivo = "no hay servidor de ficheros: arrancalo con 'f'";
+        return 0;
+    }
+    if (msg_recv((uint64_t)mi_puerto, &m) < 0) {
+        motivo = "el servidor de ficheros no ha contestado";
+        return 0;
+    }
+    if (m.type != FS_OK) {
+        motivo = "no esta en la tarjeta";
+        return 0;
+    }
+    return ((struct fs_info *)m.data)->size;
+}
+
 static uint64_t cargar(const char *fichero)
 {
     uint64_t total = 0;
     motivo = "";
 
-    while (total < MAX_IMG) {
+    uint64_t tam = tamano_de(fichero);
+    if (!tam) { if (!motivo[0]) motivo = "esta vacio"; return 0; }
+
+    imagen = malloc(tam);
+    if (!imagen) { motivo = "no me cabe en memoria"; return 0; }
+
+    while (total < tam) {
         struct fs_request r;
         r.port = (unsigned long)mi_puerto;
         r.arg  = total;
@@ -108,26 +146,21 @@ static uint64_t cargar(const char *fichero)
         m.len  = sizeof(r);
         ucopy(m.data, (const char *)&r, sizeof(r));
 
-        if (msg_send(PORT_FILES, &m) < 0) {
-            motivo = "no hay servidor de ficheros: arrancalo con 'f'";
-            return 0;
-        }
-        if (msg_recv((uint64_t)mi_puerto, &m) < 0) {
-            motivo = "el servidor de ficheros no ha contestado";
-            return 0;
-        }
-        if (m.type == FS_ERROR) {
-            motivo = "no esta en la tarjeta";
-            return 0;
+        if (msg_send(PORT_FILES, &m) < 0 ||
+            msg_recv((uint64_t)mi_puerto, &m) < 0) {
+            motivo = "el servidor de ficheros se ha ido a mitad";
+            break;
         }
         if (m.type != FS_OK || m.len == 0) break;   /* fin del fichero */
 
-        for (uint64_t i = 0; i < m.len; i++)
+        uint64_t n = m.len;
+        if (total + n > tam) n = tam - total;
+        for (uint64_t i = 0; i < n; i++)
             imagen[total + i] = (unsigned char)m.data[i];
-        total += m.len;
+        total += n;
     }
 
-    if (!total) motivo = "esta vacio";
+    if (!total) { free(imagen); imagen = 0; motivo = "esta vacio"; }
     return total;
 }
 
@@ -176,6 +209,9 @@ void _start(int argc, char **argv)
         }
 
         int64_t pid = spawn(imagen, bytes, linea);
+        free(imagen);                  /* el kernel ya lo ha copiado */
+        imagen = 0;
+
         if (pid < 0) {
             kprint("  el kernel no ha querido arrancarlo\n");
             continue;

@@ -74,6 +74,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 17   | Un interprete de ordenes en EL0             | hecho  |
 | 18   | Escritura en FAT16                          | hecho  |
 | 19   | kmalloc: el monton del kernel               | hecho  |
+| 20   | Memoria para los procesos: sbrk y malloc    | hecho  |
 
 ## Estructura
 
@@ -95,7 +96,8 @@ Tres cosas que QEMU perdona y el silicio no:
                  run.c       carga un programa de la tarjeta y lo arranca
                  sh.c        interprete de ordenes: lee, carga, arranca, espera
                  write.c     escribe un fichero      rm.c  lo borra
-                 cp.c        copia uno en otro
+                 cp.c        copia uno en otro       mem.c  ensenya el monton
+                 umalloc.c   malloc/free de usuario, encima de sbrk
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -678,6 +680,61 @@ colas vivas con sus cabeceras.
 pide ANTES de coger el del planificador, porque `kmalloc` puede tener que ir
 a por paginas y borrar 64 KB, y eso con los otros tres nucleos parados no.
 
+## Memoria para los procesos
+
+Un proceso tenia lo que declarase en tiempo de compilacion y nada mas: sus
+segmentos del ELF y una pagina de pila. Por eso `sh` llevaba un buffer
+estatico de 32 KB para cargar programas, que era a la vez desperdicio y
+techo.
+
+`sbrk(delta)` mueve el **tope** del monton: la primera direccion que el
+proceso todavia no tiene. Hacia arriba es pedir, hacia abajo devolver, y lo
+que se devuelve es el tope VIEJO, que es justo el principio de lo que se
+acaba de conseguir. Es la interfaz mas tonta que existe para pedir memoria,
+y por eso la llevan los Unix desde 1971: el kernel no sabe de bloques ni de
+listas, solo de "hasta aqui".
+
+Repartir ese espacio en trozos es trabajo del proceso, y `user/umalloc.c`
+lo hace con **el mismo algoritmo** que `src/kheap.c`. Merece la pena verlos
+juntos, porque lo unico que cambia entre un asignador de kernel y uno de
+usuario es de donde sale la memoria cuando se acaba:
+
+    el del kernel   se la pide al gestor de paginas   pmm_alloc_contig()
+    el del proceso  se la pide al kernel              sbrk()
+
+El resto —partir al reservar, fundir al liberar, la fragmentacion que
+aparece si no fundes— es identico, porque el problema es el mismo.
+
+La orden `mem` lo ensenya:
+
+    tope del monton (sbrk)   que acaba de pasar
+    4202496   al empezar: el monton esta vacio
+    4284416   despues de 64 bloques de 1 KB
+    4284416   despues de soltarlos: no baja, y es lo correcto
+    4284416   despues de pedir 48 KB de golpe
+
+Las dos ultimas lineas son las interesantes. `free()` **no baja el tope**:
+suelta el trozo en la lista del proceso para que el siguiente `malloc` lo
+reaproveche, y esta bien que sea asi — devolverlo al kernel para volver a
+pedirlo dos lineas despues serian dos llamadas al sistema tiradas. Y pedir
+48 KB de golpe **tampoco lo sube**, porque los 64 huecos de 1 KB se habian
+fundido en uno solo.
+
+### El mapa del proceso, ampliado
+
+La pila estaba en 8 MB y el codigo en 4, asi que un monton que creciera
+chocaba con ella en seguida. Ahora:
+
+    0x00400000  codigo y datos (lo que diga el ELF)
+                |  el monton crece hacia arriba
+    0x0F000000  tope del monton
+    0x10000000  MMIO concedido, si es un driver
+                ^  la pila crece hacia abajo
+    0x20000000  tope de la pila
+
+Los 256 MB de abismo entre el monton y la pila son a proposito: que crezcan
+el uno contra el otro y se toquen es un error clasico.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -705,7 +762,9 @@ a por paginas y borrar 64 KB, y eso con los otros tres nucleos parados no.
   idas y venidas por el IPC. Funciona y se nota.
 - El monton busca el primer hueco que valga, recorriendo la lista: es O(n)
   y basta a esta escala. Lo siguiente serian listas por tamanyos.
-- El monton nunca le devuelve paginas al PMM. Crece y no encoge.
+- El monton del kernel nunca le devuelve paginas al PMM. Crece y no encoge.
+  El de un proceso si sabe encoger, con `sbrk` negativo, pero `free()` no lo
+  usa nunca: haria falta saber que el trozo liberado esta justo en el tope.
 - `pmm_alloc_contig()` busca n paginas seguidas recorriendo el bitmap, asi
   que se vuelve lenta si la memoria se fragmenta. Cuando duela, lo que hay
   que traer es un asignador por compañeros ("buddy").

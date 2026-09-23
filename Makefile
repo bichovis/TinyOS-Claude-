@@ -27,19 +27,21 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem
 
 # Programas de usuario con mas de un fichero fuente
 EXTRA_fs := user/sd.c
 UCFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -ffreestanding -nostdlib \
            -nostartfiles -mcpu=cortex-a53 -mgeneral-regs-only -mstrict-align \
-           -fno-stack-protector -fno-pie -fno-common -Iuser -I$(INCDIR)
+           -fno-stack-protector -fno-pie -fno-common \
+           -ffunction-sections -fdata-sections -Iuser -I$(INCDIR)
 # -z max-page-size=4096 : sin esto el enlazador de AArch64 alinea los
 #                         segmentos a 64 KB y el ELF engorda quince veces
 # -s                    : fuera simbolos y secciones; al cargador no le
 #                         hacen falta y ocupan mas que el programa
 ULDFLAGS := -nostdlib -nostartfiles -T user/user.ld \
-            -Wl,--no-warn-rwx-segments -Wl,-z,max-page-size=4096 -s
+            -Wl,--no-warn-rwx-segments -Wl,-z,max-page-size=4096 -s \
+            -Wl,--gc-sections
 
 CSRCS   := $(wildcard $(SRCDIR)/*.c)
 ASRCS   := $(wildcard $(SRCDIR)/*.S)
@@ -64,10 +66,10 @@ $(BUILD)/%.S.o: $(SRCDIR)/%.S | $(BUILD)
 # se pasa a binario plano y se empotra en el kernel como un array de C.
 .PRECIOUS: $(BUILD)/%.elf $(BUILD)/%_bin.c
 
-$(BUILD)/%.elf: user/%.c user/syscall.h user/sd.c user/sd.h \
+$(BUILD)/%.elf: user/%.c user/syscall.h user/sd.c user/sd.h user/umalloc.c \
                 $(INCDIR)/ipc_abi.h $(INCDIR)/fs_abi.h user/user.ld | $(BUILD)
 	@echo "  CC-U  user/$*.c"
-	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c $(EXTRA_$*) -o $@
+	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c user/umalloc.c $(EXTRA_$*) -o $@
 
 # Lo que se empotra en el kernel es el ELF tal cual. Antes era un binario
 # plano con una cabecera que nos habiamos inventado; ahora el formato ya
@@ -102,7 +104,7 @@ sdtest: all | $(BUILD)
 	        $(BUILD)/sd.img 2>/dev/null | head -1 | awk '{print $$1}');       \
 	 diskutil eraseDisk "MS-DOS FAT16" TINYOS MBRFormat $$DEV >/dev/null;     \
 	 printf 'Hola desde la tarjeta SD.\nEste fichero lo ha puesto un Mac y lo va a leer TinyOS.\n' > /Volumes/TINYOS/HOLA.TXT; \
-	 for p in hello ls cat run write rm cp; do \
+	 for p in hello ls cat run write rm cp mem; do \
 	   cp $(BUILD)/$$p.elf /Volumes/TINYOS/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done;                         \
 	 sync; diskutil eject $$DEV >/dev/null
@@ -137,7 +139,7 @@ sdcard: all firmware
 	@cp config.txt $(BUILD)/sdcard/
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
 	@# Para el servidor de ficheros: algo que leer y algo que ejecutar.
-	@for p in hello ls cat run write rm cp; do \
+	@for p in hello ls cat run write rm cp mem; do \
 	   cp $(BUILD)/$$p.elf $(BUILD)/sdcard/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done
 	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de arranque de la Pi.\n' > $(BUILD)/sdcard/HOLA.TXT
