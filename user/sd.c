@@ -44,6 +44,7 @@
  * se consultan. Escribir un 1 las borra. */
 #define INT_CMD_DONE     (1u << 0)
 #define INT_DATA_DONE    (1u << 1)
+#define INT_WRITE_RDY    (1u << 4)
 #define INT_READ_RDY     (1u << 5)
 #define INT_ERROR_MASK   0xFFFF0000u
 
@@ -365,4 +366,39 @@ int sd_read_block(uint64_t lba, void *dst)
         out[i] = emmc[DATA];
 
     return wait_flag(INT_DATA_DONE, 100000);
+}
+
+int sd_write_block(uint64_t lba, const void *src)
+{
+    const uint32_t *in = src;
+
+    if (!emmc) {
+        anotar("sin inicializar", 0, 0);
+        return -1;
+    }
+    if (wait_idle(100000) < 0) return -1;
+
+    uint32_t arg = sdhc ? (uint32_t)lba : (uint32_t)(lba * 512);
+
+    emmc[BLKSIZECNT] = (1u << 16) | 512;
+
+    /* CMD24 = escribir un bloque. La unica diferencia con la lectura, en
+     * la orden, es que NO se pone TM_DAT_CARD2HOST: el sentido de los
+     * datos lo marca ese bit y nada mas. */
+    if (cmd(CMD_INDEX(24) | CMD_RESP_48 | CMD_CRCCHK_EN
+                          | CMD_ISDATA | TM_BLKCNT_EN,
+            arg) < 0)
+        return -1;
+
+    /* Y aqui la tarjeta avisa cuando esta lista para RECIBIR, no cuando
+     * tiene algo que dar. */
+    if (wait_flag(INT_WRITE_RDY, 100000) < 0) return -1;
+
+    for (int i = 0; i < 128; i++)
+        emmc[DATA] = in[i];
+
+    /* DATA_DONE aqui significa algo mas serio que en una lectura: la
+     * tarjeta ha terminado de grabar de verdad. Puede tardar, porque por
+     * dentro es memoria flash y tiene que borrar antes de escribir. */
+    return wait_flag(INT_DATA_DONE, 1000000);
 }

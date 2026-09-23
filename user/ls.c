@@ -22,7 +22,7 @@ void _start(int argc, char **argv)
         struct fs_request r;
         r.port = (unsigned long)mio;
         r.arg  = i;
-        for (int j = 0; j < 32; j++) r.name[j] = 0;
+        for (int j = 0; j < FS_NAME_MAX; j++) r.name[j] = 0;
 
         m.type = FS_LIST;
         m.len  = sizeof(r);

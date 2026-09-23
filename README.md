@@ -72,6 +72,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 15   | Servidor de ficheros: SD, FAT16 y `spawn`   | hecho  |
 | 16   | Procesos en ELF y argumentos                | hecho  |
 | 17   | Un interprete de ordenes en EL0             | hecho  |
+| 18   | Escritura en FAT16                          | hecho  |
 
 ## Estructura
 
@@ -92,6 +93,8 @@ Tres cosas que QEMU perdona y el silicio no:
                  ls.c        lista la tarjeta      cat.c  vuelca un fichero
                  run.c       carga un programa de la tarjeta y lo arranca
                  sh.c        interprete de ordenes: lee, carga, arranca, espera
+                 write.c     escribe un fichero      rm.c  lo borra
+                 cp.c        copia uno en otro
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -577,6 +580,54 @@ llama vive en un espacio de direcciones que puede desaparecer antes: por eso
 error — que un programa termine bien es lo normal, y decirlo en voz alta
 llena de ruido una sesion de shell. Ahi el silencio es la respuesta.
 
+## Escribir en FAT
+
+Leer un sistema de ficheros es seguir punteros. Escribirlo es **tocar tres
+sitios en el orden correcto**: los datos, la tabla FAT que dice que cluster
+va detras de cual, y la entrada de directorio que dice el tamanyo. Si solo
+se toca uno, el fichero queda a medias.
+
+    $ write NOTA.TXT hola mundo desde tinyos
+      escrito en NOTA.TXT
+    $ cp hello.elf copia.elf
+      copiados 8616 bytes en copia.elf
+    $ copia
+      >> Hola desde EL0. Soy un proceso de usuario.
+
+Ese `cp` es la prueba de fuego: 8616 bytes son casi noventa idas y venidas
+por el IPC y varios clusters encadenados. Y el resultado se **ejecuta**, que
+es una comprobacion mas dura que cualquier `cmp`: un solo byte mal y el ELF
+no carga.
+
+Visto desde fuera, con la imagen montada en el Mac:
+
+    cmp hello.elf /Volumes/TINYOS/COPIA.ELF   -> identicos
+    diskutil verifyVolume                     -> exit code 0
+
+Que lo valide una implementacion que no es la nuestra es lo mas parecido a
+una prueba que hay aqui.
+
+### Tres detalles que no perdonan
+
+**La FAT se escribe por duplicado.** Hay dos copias (a veces mas) porque es
+lo unico irremplazable del volumen: perder los datos de un fichero es perder
+un fichero, perder la FAT es perderlos todos. Escribir solo en la primera
+"funciona" hasta que alguien repara el disco con la segunda.
+
+**El tamanyo se apunta el ultimo.** Hasta que no esta en la entrada de
+directorio, los bytes escritos no existen para nadie.
+
+**Un tope duro al numero de clusters.** El BPB dice cuantos hay, pero la
+tabla FAT tiene 256 casillas por sector y no pueden ser mas de las que
+caben. Sin esa comprobacion, un BPB raro haria que el buscador de sitio
+libre escribiera *pasada* la tabla, encima del directorio raiz. Es el tipo
+de fallo que no avisa: la tarjeta sigue pareciendo correcta hasta que se
+pierde entera.
+
+Borrar, por cierto, es poner un `0xE5` en la primera letra del nombre y
+devolver los clusters. Los datos siguen ahi intactos — y por eso se pueden
+recuperar ficheros borrados mientras nadie escriba encima.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -588,8 +639,15 @@ llena de ruido una sesion de shell. Ahi el silencio es la respuesta.
   no hay un servidor de teclado como lo hay de pantalla.
 - El shell no tiene tuberias, ni redireccion, ni historial, ni segundo
   plano: lee, carga, arranca y espera.
-- El servidor de ficheros solo LEE, solo entiende FAT16 y solo mira el
-  directorio raiz. Nada de escribir, nada de FAT32, nada de subdirectorios.
+- El servidor de ficheros entiende FAT16 y solo mira el directorio raiz:
+  nada de FAT32 ni de subdirectorios.
+- No hay diario ni nada que se le parezca: un corte de corriente a mitad de
+  una escritura deja el volumen inconsistente, como en 1980.
+- Los ficheros nuevos no llevan fecha. FAT tiene campos para ella, pero la
+  Pi no tiene reloj de tiempo real y no hay de donde sacarla: mejor un cero
+  honesto que una fecha inventada.
+- La linea de ordenes son 128 caracteres, asi que `write` no puede crear
+  ficheros de mas de un centenar de bytes. Para mover volumen esta `cp`.
 - El reloj base del EMMC esta puesto a mano (41.666 MHz, el de la placa).
   Lo suyo seria preguntarselo a la GPU por el buzon, pero el buzon es del
   kernel y el driver vive en EL0.

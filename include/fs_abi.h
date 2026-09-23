@@ -16,23 +16,33 @@
 
 /* --- Peticiones (message.type) ---------------------------------------- */
 #define FS_SIZE        1     /* name -> tamanyo en bytes                   */
-#define FS_READ        2     /* name + arg=offset -> hasta 48 bytes        */
+#define FS_READ        2     /* name + arg=offset -> hasta FS_CHUNK bytes  */
 #define FS_LIST        3     /* arg=indice -> name y tamanyo de esa entrada*/
+#define FS_WRITE       4     /* name + arg=offset + data -> escribe        */
+#define FS_CREATE      5     /* name -> lo crea, o lo vacia si ya estaba   */
+#define FS_DELETE      6     /* name -> lo borra                           */
 
 /* --- Respuestas (message.type) ---------------------------------------- */
 #define FS_OK        100
 #define FS_ERROR     101     /* no existe, o la tarjeta fallo              */
 #define FS_EOF       102     /* no queda nada que leer ahi                 */
 
-/* Lo que va en message.data de una peticion. Ocupa los 48 bytes justos. */
+/* Lo que va en message.data de una peticion. Ocupa los 128 bytes justos.
+ *
+ * El nombre baja a 16 bytes porque un 8.3 son doce caracteres y el cero:
+ * lo que sobra se aprovecha para los datos, que es lo que escasea. */
+#define FS_NAME_MAX    16
+#define FS_CHUNK       96    /* bytes utiles por mensaje de lectura/escritura */
+
 struct fs_request {
-    unsigned long port;      /* a donde contestar                          */
-    unsigned long arg;       /* desplazamiento (READ) o indice (LIST)      */
-    char          name[32];  /* "HOLA.TXT", en mayusculas y formato 8.3    */
+    unsigned long port;              /* a donde contestar                  */
+    unsigned long arg;               /* desplazamiento, o indice en LIST   */
+    char          name[FS_NAME_MAX]; /* "HOLA.TXT", en formato 8.3         */
+    char          data[FS_CHUNK];    /* lo que se escribe                  */
 };
 
 /* En una respuesta a FS_SIZE o FS_LIST, esto es lo que va en data. */
 struct fs_info {
     unsigned long size;
-    char          name[32];
+    char          name[FS_NAME_MAX];
 };

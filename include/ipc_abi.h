@@ -7,14 +7,17 @@
  */
 #pragma once
 
-#define MSG_DATA_MAX   48
+/* 128 y no 48: una peticion de escritura tiene que llevar el nombre del
+ * fichero Y los datos en el mismo mensaje. Con 8 puertos de 8 mensajes,
+ * la cola entera del kernel son 10 KB de .bss. */
+#define MSG_DATA_MAX   128
 
 struct message {
     unsigned long from;             /* pid del remitente: lo pone el kernel */
     unsigned long type;             /* lo interpreta la aplicacion          */
     unsigned long len;              /* bytes utiles de data[]               */
     char          data[MSG_DATA_MAX];
-};                                  /* 72 bytes */
+};                                  /* 152 bytes */
 
 /* Puerto conocido: el servidor de consola es siempre el 0, para que los
  * clientes sepan a donde escribir sin necesitar un servicio de nombres. */

@@ -12,7 +12,8 @@
 #include <stdint.h>
 
 int sd_init(volatile uint32_t *base);          /* 0 si la tarjeta responde */
-int sd_read_block(uint64_t lba, void *dst);    /* 512 bytes, 0 si va bien  */
+int sd_read_block(uint64_t lba, void *dst);          /* 512 bytes, 0 si va bien */
+int sd_write_block(uint64_t lba, const void *src);   /* y al reves              */
 const char *sd_last_error(void);
 uint32_t    sd_host_version(void);      /* decide como se codifica el reloj */
 uint32_t    sd_base_clock(void);        /* Hz del reloj base del controlador*/
