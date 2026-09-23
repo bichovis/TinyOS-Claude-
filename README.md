@@ -93,6 +93,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 36   | exec con argv[]: cada uno a lo suyo         | hecho  |
 | 37   | Las senyales guardan la coma flotante       | hecho  |
 | 38   | rmdir y mv, o deshacer lo que se hizo       | hecho  |
+| 39   | Escribir nombres largos, y el ~1            | hecho  |
 
 ## Estructura
 
@@ -2539,6 +2540,82 @@ De "esta mal" a "no esta". Es peor informacion y es mejor dato.
 directorio", "no esta vacio" y "ya existe" mandan a sitios distintos, y
 juntarlos obliga a quien pregunta a adivinar.
 
+## Escribir nombres largos, y de donde sale el ~1
+
+Desde el paso 32 se **leian** nombres largos y no se escribian. Podias
+abrir `un nombre bastante largo.txt` y no podias crear ninguno parecido:
+el servidor se negaba, porque `a_8_3()` habria hecho un destrozo.
+
+Escribir la cadena VFAT es mecanico -trece caracteres por entrada, en
+orden inverso, con la suma repetida- y ya estaba medio hecho de leerla. Lo
+que tiene miga de verdad es otra cosa.
+
+**Todo fichero con nombre largo tiene TAMBIEN un nombre 8.3**, y hay que
+inventarselo. No es decoracion: es el que ve un sistema que no entienda
+VFAT, y es el que lleva la suma de comprobacion que ata la cadena a su
+duenyo. La receta es coger las primeras letras que valgan, tirar espacios
+y signos raros, subir a mayusculas y pegar `~1`. Si ya existe, `~2`.
+
+```
+    "con espacios.txt"         ->  CONESP~1.TXT
+    "un directorio largo"      ->  UNDIRE~1
+    "saludo de prueba.txt"     ->  SALUDO~1.TXT
+```
+
+Y con tres que colisionen, lo esperable:
+
+```
+    "nombre muy largo uno.txt"   ->  NOMBRE~1.TXT
+    "nombre muy largo dos.txt"   ->  NOMBRE~2.TXT
+    "nombre muy largo tres.txt"  ->  NOMBRE~3.TXT
+```
+
+**De aqui salio el `ENSA~209.ELF`** que aparecio en la tarjeta de verdad
+hace unos pasos. Cuando hay muchas colisiones el numero crece y se come
+las letras: primero `ENSAMB~1`, luego `ENSAM~10`, luego `ENSA~209`. Un
+nombre generado no es un nombre elegido, y se nota.
+
+Lo caro es comprobar que esta libre: hay que mirar el directorio entero
+por cada intento. Con directorios de decenas de entradas da igual; en un
+sistema de verdad esto se resuelve con un hash del nombre largo.
+
+**Huecos seguidos, no huecos sueltos.** Las entradas de nombre largo
+tienen que ir pegadas justo delante de la corta -asi es como se sabe
+cuales son suyas- asi que hace falta un hueco de N+1 entradas
+CONSECUTIVAS. Un sitio aqui y otro alla no vale, aunque sumen.
+
+**Y borrar tiene que llevarse la cadena.** Si se borrara solo la entrada
+corta, los trozos de delante se quedarian huerfanos, apuntando por su suma
+a un nombre que ya no existe. Se reconocen porque van pegados y repiten la
+suma; en cuanto una no cuadra, se para, porque lo de mas atras es de otro.
+
+Un detalle que costo un rato: `cached()` guarda **un** sector, asi que hay
+que leer la suma de comprobacion ANTES de empezar a recorrer hacia atras.
+La primera vuelta del bucle se lleva por delante el sector que tenias.
+
+## Que lo diga otro, otra vez
+
+La comprobacion util no es que TinyOS lea lo que TinyOS escribe. Aqui
+menos que nunca: escribir mal una cadena VFAT da un sistema de ficheros
+que se entiende perfectamente consigo mismo y que nadie mas sabe leer.
+
+```
+    $ fsck_msdos -n /dev/rdisk5s2
+    ** Phase 2 - Checking Directories        <- aqui se cazan las huerfanas
+    (limpio)
+
+    $ ls -1 /Volumes/DATA
+    'carpeta larga'
+    'otra vez muy largo.txt'
+```
+
+macOS lee los nombres que escribio TinyOS, y fsck no encuentra ni una
+entrada de nombre largo suelta despues de crear, renombrar de largo a
+corto, de corto a largo, mover a otro directorio y borrar.
+
+Y se cae un aviso que llevaba desde el paso 35: ya no hay que explicarle a
+nadie que los nombres nuevos tienen que caber en 8.3.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -2600,8 +2677,11 @@ juntarlos obliga a quien pregunta a adivinar.
 - `exec` sobre un ELF mapeado trae el fichero ENTERO, porque
   `user_range_ok` comprueba todo el rango antes de empezar. Solo cargar las
   paginas que el ELF usa de verdad exige lo del punto anterior.
-- Los nombres largos se LEEN pero no se escriben: un fichero creado desde
-  TinyOS se guarda en 8.3, en mayusculas y truncado.
+- El nombre corto que acompanya a uno largo se busca probando `~1`, `~2`…
+  y mirando el directorio entero en cada intento. Con muchas colisiones es
+  lento, y el numero se come las letras.
+- Un directorio no crece: si se queda sin huecos seguidos para una cadena
+  VFAT, no se puede crear el fichero aunque quede sitio en el disco.
 - De los nombres largos solo se entiende el ASCII. Lo de fuera sale como
   '?', a proposito: un byte truncado al azar daria un nombre que parece
   bueno y no abre nada.

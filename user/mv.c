@@ -88,8 +88,7 @@ int main(int argc, char **argv)
         return 1;
     default:
         printf("  no he podido mover %s\n", r.name);
-        printf("  (o no existe, o el destino esta en otra particion,\n");
-        printf("   o el nombre nuevo no cabe en 8.3)\n");
+        printf("  (o no existe, o el destino esta en otra particion)\n");
         return 1;
     }
 }

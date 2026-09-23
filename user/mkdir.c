@@ -42,9 +42,7 @@ int main(int argc, char **argv)
 
     if (m.type != FS_OK) {
         printf("  no he podido crear %s\n", r.name);
-        printf("  puede ser: que ya exista, que el directorio de encima no\n");
-        printf("  este, o que el nombre no quepa en 8.3 (hasta 8 letras,\n");
-        printf("  un punto y 3 mas, y sin espacios)\n");
+        printf("  (o ya existe, o el directorio de encima no esta)\n");
         exit(1);
     }
 

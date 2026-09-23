@@ -245,11 +245,7 @@ static int aplicar(int hay, const char *ent, const char *sal)
     }
     if (hay & 2) {
         int64_t fd = openf(sal, O_ESCRIBIR);
-        if (fd < 0) {
-            printf("  no puedo escribir %s\n", sal);
-            printf("  (los nombres nuevos tienen que caber en 8.3: sin espacios)\n");
-            return -1;
-        }
+        if (fd < 0) { printf("  no puedo escribir %s\n", sal); return -1; }
         dup2((int)fd, 1);
         closefd((int)fd);
     }

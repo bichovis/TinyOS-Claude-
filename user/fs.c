@@ -388,6 +388,7 @@ static uint32_t siguiente_cluster(struct volumen *v, uint32_t c);
  * antes, y se definen con el resto de la parte de lectura. */
 static void nombre_de_entrada(const struct lfn *l, const uint8_t *d,
                               char salida[FS_NAME_MAX]);
+static char mayus(char c);
 static void de_8_3(const uint8_t *d, char salida[FS_NAME_MAX]);
 static int  igual_sin_caja(const char *a, const char *b);
 
@@ -630,10 +631,203 @@ static int cabe_en_8_3(const char *n)
     return base >= 1 && base <= 8 && ext <= 3;
 }
 
+/* --- Inventar un nombre corto -----------------------------------------
+ *
+ * Todo fichero con nombre largo tiene TAMBIEN un nombre 8.3, y no es
+ * decoracion: es el que ve un sistema que no entienda las entradas VFAT, y
+ * es el que lleva la suma de comprobacion que ata la cadena. Hay que
+ * inventarselo, y tiene que ser unico dentro de su directorio.
+ *
+ * La receta: coger las primeras letras que valgan, tirar espacios y
+ * signos raros, subir a mayusculas, y pegar "~1" al final. Si ya existe,
+ * "~2", y asi. De ahi salen los HOLAMU~1.TXT de toda la vida.
+ *
+ * Y de ahi sale tambien el ENSA~209.ELF que aparecio en la tarjeta de
+ * verdad: cuando hay muchas colisiones, el numero crece y se come las
+ * letras. Un nombre generado no es un nombre elegido, y se nota.
+ *
+ * Lo caro es la comprobacion: hay que mirar el directorio entero por cada
+ * intento. Con directorios de decenas de entradas da igual; es de las
+ * cosas que en un sistema de verdad se resuelven con un hash. */
+static int vale_en_8_3(char c)
+{
+    if (c >= 'A' && c <= 'Z') return 1;
+    if (c >= '0' && c <= '9') return 1;
+    return c == '_' || c == '-' || c == '!' || c == '#' || c == '$' ||
+           c == '%' || c == '&' || c == '\'' || c == '(' || c == ')' ||
+           c == '@' || c == '^' || c == '{' || c == '}' || c == '~';
+}
+
+static void nombre_corto(const char *largo, int n, char salida[FS_NAME_MAX])
+{
+    /* La extension es lo que hay detras del ULTIMO punto. */
+    const char *punto = 0;
+    for (const char *p = largo; *p; p++) if (*p == '.') punto = p;
+
+    char base[8];
+    int b = 0;
+    for (const char *p = largo; *p && p != punto && b < 6; p++) {
+        char c = mayus(*p);
+        if (vale_en_8_3(c)) base[b++] = c;
+    }
+    if (!b) base[b++] = '_';               /* un nombre todo raro */
+
+    int o = 0;
+    for (int i = 0; i < b; i++) salida[o++] = base[i];
+
+    salida[o++] = '~';
+    if (n >= 100) salida[o++] = (char)('0' + (n / 100) % 10);
+    if (n >= 10)  salida[o++] = (char)('0' + (n / 10) % 10);
+    salida[o++] = (char)('0' + n % 10);
+
+    if (punto) {
+        salida[o++] = '.';
+        for (int i = 1; i <= 3 && punto[i]; i++) {
+            char c = mayus(punto[i]);
+            if (vale_en_8_3(c)) salida[o++] = c;
+        }
+    }
+    salida[o] = 0;
+}
+
+static int nombre_corto_libre(struct volumen *v, uint32_t dir, const char *largo,
+                              char salida[FS_NAME_MAX])
+{
+    for (int n = 1; n < 1000; n++) {
+        nombre_corto(largo, n, salida);
+
+        uint32_t l, o;
+        if (dir_lookup_en(v, dir, salida, -1, &l, &o) < 0) return 0;   /* libre */
+    }
+    return -1;                             /* mil colisiones: que se queje */
+}
+
+/* Buscar N huecos SEGUIDOS en un directorio.
+ *
+ * Seguidos y en ese orden, porque las entradas de nombre largo tienen que
+ * ir pegadas justo delante de la corta: asi es como se sabe cuales son
+ * suyas. Un hueco aqui y otro alla no vale.
+ *
+ * Devuelve el indice de entrada (no de sector) donde empieza el hueco. */
+static int hueco_seguido(struct volumen *v, uint32_t dir, int cuantas,
+                         uint32_t *donde)
+{
+    int seguidas = 0;
+    uint32_t inicio = 0;
+
+    for (uint32_t s = 0; ; s++) {
+        uint32_t lba;
+        if (dir_sector(v, dir, s, &lba) < 0) return -1;   /* directorio lleno */
+
+        uint8_t *b = cached(lba);
+        if (!b) return -1;
+
+        for (int e = 0; e < 512; e += 32) {
+            uint32_t indice = s * 16 + (uint32_t)(e / 32);
+            uint8_t *d = b + e;
+
+            if (d[0] == 0x00 || d[0] == 0xE5) {
+                if (!seguidas) inicio = indice;
+                if (++seguidas == cuantas) { *donde = inicio; return 0; }
+            } else {
+                seguidas = 0;
+            }
+        }
+    }
+}
+
+/* La entrada numero 'indice' de un directorio, para escribir en ella. */
+static uint8_t *entrada_en(struct volumen *v, uint32_t dir, uint32_t indice,
+                           uint32_t *lba, uint32_t *off)
+{
+    if (dir_sector(v, dir, indice / 16, lba) < 0) return 0;
+    *off = (indice % 16) * 32;
+    return cached(*lba);
+}
+
+/* Crear una entrada con nombre largo: la cadena VFAT y detras la corta.
+ *
+ * Los trozos van en orden INVERSO -el ultimo pedazo del nombre primero- y
+ * el primero que aparece lleva el bit 0x40. Cada uno repite la suma de
+ * comprobacion del nombre corto, que es lo que ata la cadena a su duenyo.
+ */
+static int dir_create_largo(struct volumen *v, uint32_t dir, const char *largo,
+                            uint8_t attr, uint32_t *lba, uint32_t *off)
+{
+    char corto[FS_NAME_MAX];
+    if (nombre_corto_libre(v, dir, largo, corto) < 0) return -1;
+
+    uint64_t len = 0;
+    while (largo[len]) len++;
+    if (len >= FS_NAME_MAX) return -1;
+
+    int trozos = (int)((len + 12) / 13);
+    if (trozos < 1 || trozos > 20) return -1;
+
+    uint32_t inicio;
+    if (hueco_seguido(v, dir, trozos + 1, &inicio) < 0) return -1;
+
+    char patron[11];
+    a_8_3(corto, patron);
+    uint8_t suma = suma_83((const uint8_t *)patron);
+
+    static const int hueco[13] = { 1,3,5,7,9, 14,16,18,20,22,24, 28,30 };
+
+    for (int t = trozos; t >= 1; t--) {
+        uint32_t l, o;
+        uint8_t *b = entrada_en(v, dir, inicio + (uint32_t)(trozos - t), &l, &o);
+        if (!b) return -1;
+
+        uint8_t *d = b + o;
+        for (int i = 0; i < 32; i++) d[i] = 0;
+
+        d[0]  = (uint8_t)(t | (t == trozos ? 0x40 : 0));
+        d[11] = 0x0F;
+        d[13] = suma;
+
+        for (int i = 0; i < 13; i++) {
+            uint64_t p = (uint64_t)(t - 1) * 13 + (uint64_t)i;
+            uint16_t c;
+
+            if (p < len)       c = (uint16_t)(unsigned char)largo[p];
+            else if (p == len) c = 0x0000;         /* el cero final */
+            else               c = 0xFFFF;         /* relleno */
+
+            d[hueco[i]]     = (uint8_t)(c & 0xFF);
+            d[hueco[i] + 1] = (uint8_t)(c >> 8);
+        }
+
+        if (escribir(l, b) < 0) return -1;
+    }
+
+    /* Y la corta, detras del todo. */
+    uint32_t l, o;
+    uint8_t *b = entrada_en(v, dir, inicio + (uint32_t)trozos, &l, &o);
+    if (!b) return -1;
+
+    int ultima = (b[o] == 0x00);
+    uint8_t *d = b + o;
+
+    for (int i = 0; i < 11; i++) d[i] = (uint8_t)patron[i];
+    for (int i = 11; i < 32; i++) d[i] = 0;
+    d[11] = attr;
+
+    if (ultima && o + 32 < 512) d[32] = 0x00;
+
+    if (escribir(l, b) < 0) return -1;
+
+    *lba = l;
+    *off = o;
+    return 0;
+}
+
 static int dir_create_en(struct volumen *v, uint32_t dir, const char *nombre, uint8_t attr,
                          uint32_t *lba, uint32_t *off)
 {
-    if (!cabe_en_8_3(nombre)) return -1;
+    /* Si cabe en 8.3 se escribe como siempre, sin cadena VFAT: un nombre
+     * corto no necesita que nadie lo explique. */
+    if (!cabe_en_8_3(nombre))
+        return dir_create_largo(v, dir, nombre, attr, lba, off);
 
     char patron[11];
     a_8_3(nombre, patron);
@@ -887,6 +1081,56 @@ static int entrada_borrar(uint32_t lba, uint32_t off)
     return escribir(lba, b);
 }
 
+/* En que numero de entrada cae un (sector, desplazamiento).
+ *
+ * Hace falta para llegar a las entradas de ANTES, que es donde vive la
+ * cadena de nombre largo. Cada sector tiene un LBA distinto, asi que
+ * basta con recorrer el directorio hasta encontrarlo. */
+static int indice_de(struct volumen *v, uint32_t dir, uint32_t lba, uint32_t off)
+{
+    for (uint32_t s = 0; ; s++) {
+        uint32_t l;
+        if (dir_sector(v, dir, s, &l) < 0) return -1;
+        if (l == lba) return (int)(s * 16 + off / 32);
+    }
+}
+
+/* Borrar una entrada Y su cadena de nombre largo.
+ *
+ * Si se borrara solo la corta, los trozos de delante se quedarian ahi,
+ * huerfanos: apuntando por su suma de comprobacion a un nombre que ya no
+ * existe. fsck lo llama "orphaned long file name" y lo limpia, pero
+ * mientras tanto cualquier sistema que los lea vera un nombre a medias.
+ *
+ * Se reconocen porque van pegados justo delante y repiten la suma del
+ * nombre corto. En cuanto uno no cuadra, se para: lo de mas atras es de
+ * otro. */
+static int entrada_borrar_todo(struct volumen *v, uint32_t dir,
+                               uint32_t lba, uint32_t off)
+{
+    int idx = indice_de(v, dir, lba, off);
+    if (idx < 0) return entrada_borrar(lba, off);
+
+    uint8_t *b = cached(lba);
+    if (!b) return -1;
+
+    /* La suma ANTES de tocar nada: cached() solo guarda un sector, y la
+     * primera vuelta del bucle se lo lleva por delante. */
+    uint8_t suma = suma_83(b + off);
+
+    for (int i = idx - 1; i >= 0; i--) {
+        uint32_t l, o;
+        uint8_t *p = entrada_en(v, dir, (uint32_t)i, &l, &o);
+        if (!p) break;
+        if (p[o + 11] != 0x0F || p[o + 13] != suma) break;   /* no es suya */
+
+        p[o] = 0xE5;
+        if (escribir(l, p) < 0) return -1;
+    }
+
+    return entrada_borrar(lba, off);
+}
+
 /* Borrar un directorio vacio. */
 static int dir_borrar(struct volumen *v, const char *ruta, int *motivo)
 {
@@ -906,7 +1150,7 @@ static int dir_borrar(struct volumen *v, const char *ruta, int *motivo)
      * dejaria una entrada apuntando a clusters que ya son de otro, que es
      * la peor de las dos formas de romperse: no se pierde un directorio,
      * se pierde lo que venga luego. */
-    if (entrada_borrar(lba, off) < 0) { *motivo = FS_ERROR; return -1; }
+    if (entrada_borrar_todo(v, dir, lba, off) < 0) { *motivo = FS_ERROR; return -1; }
     if (cluster) free_chain(v, cluster);
     return 0;
 }
@@ -985,7 +1229,7 @@ static int mover(struct volumen *v, const char *origen, const char *destino,
         }
     }
 
-    return entrada_borrar(lba_o, off_o);
+    return entrada_borrar_todo(v, dir_o, lba_o, off_o);
 }
 
 static int fichero_borrar(struct volumen *v, const char *nombre)
@@ -1000,10 +1244,10 @@ static int fichero_borrar(struct volumen *v, const char *nombre)
     /* Borrar en FAT es poner un 0xE5 en la primera letra del nombre. El
      * resto de la entrada se queda ahi, y por eso se pueden recuperar
      * ficheros borrados: nadie ha tocado ni los datos ni la cadena. */
-    uint8_t *b = cached(dlba);
-    if (!b) return -1;
-    b[doff] = 0xE5;
-    return escribir(dlba, b);
+    uint32_t d; char u[FS_NAME_MAX];
+    if (resolver(v, nombre, &d, u) < 0) return -1;
+
+    return entrada_borrar_todo(v, d, dlba, doff);
 }
 
 /* --- El nombre, en formato 8.3 ---------------------------------------- */
