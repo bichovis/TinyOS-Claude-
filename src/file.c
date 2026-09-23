@@ -41,27 +41,17 @@ void file_init(void) { mutex_init(&fs_mtx); }
 
 static uint64_t copiar_de_usuario(char *dst, uint64_t uva, uint64_t n)
 {
-    uint64_t i = 0;
-    while (i < n) {
-        if (!vmm_translate_user(uva + i)) break;
-        dst[i] = ((const char *)uva)[i];
-        i++;
-    }
-    return i;
+    return n - copy_from_user(dst, uva, n);       /* los que si cupieron */
 }
 
 static uint64_t copiar_a_usuario(uint64_t uva, const char *src, uint64_t n)
 {
-    uint64_t i = 0;
-    while (i < n) {
-        /* user_touch_w y no vmm_translate_user_w: despues de un fork la
-         * pagina puede estar compartida y de solo lectura, y entonces hay
-         * que darle su copia antes de escribir. */
-        if (!user_touch_w(uva + i)) break;
-        ((char *)uva)[i] = src[i];
-        i++;
-    }
-    return i;
+    /* Una pagina compartida por un fork es de solo lectura, asi que sttr
+     * falla: el manejador ve un fallo de permisos sobre memoria de
+     * usuario, hace la copia privada y reintenta. Antes eso se pedia a
+     * mano con user_touch_w; ahora sale del mismo camino que todo lo
+     * demas. */
+    return n - copy_to_user(uva, src, n);
 }
 
 /* --- La tuberia ------------------------------------------------------- */

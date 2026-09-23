@@ -97,6 +97,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 40   | Variables de entorno, y el PATH fuera       | hecho  |
 | 41   | El kernel aprende a fallar y recuperarse    | hecho  |
 | 42   | init: el kernel deja de saber que es un shell| hecho |
+| 43   | Una sola puerta, y fuera las demostraciones | hecho  |
 
 ## Estructura
 
@@ -2925,6 +2926,78 @@ Ahora el menu se aparta mientras la consola sea de otro. Es la diferencia
 entre ser el camino y ser una herramienta: el menu sigue ahi para depurar,
 pero manda quien tenga la consola.
 
+## Una sola forma de tocar memoria de usuario
+
+El paso anterior dejo el kernel con **dos** caminos para lo mismo:
+
+```c
+    user_readable(va, len) + leer el puntero a pelo   /* el viejo */
+    copy_from_user(dst, va, len)                      /* el nuevo */
+```
+
+Los dos funcionaban. El problema de tener dos es que el viejo dependia de
+que nadie se olvidara de llamarlo, y de que el rango que comprobaba fuera
+**el mismo** que luego se leia. Dos sitios que tienen que decir lo mismo
+acaban diciendo cosas distintas; es solo cuestion de cuantos pasos mas.
+
+Ahora solo queda el segundo, en todas las llamadas: mensajes, rutas,
+argumentos, `getcwd`, `realpath`, las teclas que entrega el driver de
+consola, las tuberias y el marco de senyal. La comprobacion la hace la MMU
+en cada acceso, y lo que falta llega por el camino del fallo de pagina.
+
+**Y de paso se aclaro que eran `user_touch_r` y `user_touch_w`.** Parecian
+verbos -"comprueba si puedo leer aqui"- y el codigo tenia que acordarse de
+cual tocaba. Ya no los llama nadie para acceder: son lo que hay **al otro
+lado del fallo**, y por eso ahora son uno solo con otro nombre:
+
+```c
+    int user_fault_fix(uint64_t va, int escritura);
+```
+
+Tres cosas arregla, en orden: un fichero mapeado que aun no se ha traido,
+una pagina compartida por un `fork` que toca copiar antes de escribir, y
+la pila que crece. No es un verbo que se llama: es el manejador.
+
+**Un detalle que salio bien.** Copiar una cadena con tope se resuelve
+copiando de golpe lo que quepa y buscando el cero dentro. Si el bloque se
+corta antes -porque la cadena estaba al final de lo mapeado- lo copiado
+sigue valiendo: solo hay que encontrar el cero ahi. Un bucle byte a byte
+seria mas obvio y mucho mas lento, y la version rapida sale de que
+`copy_from_user` diga **cuantos bytes faltaron** en vez de solo "fallo".
+
+## Y fuera las demostraciones
+
+`src/kernel.c` tenia 963 lineas. Ahora tiene 226.
+
+Se han ido nueve hilos contando cosas, un menu de veinticinco teclas, dos
+carreras de datos a proposito, un banco de memoria con y sin caches, y las
+demostraciones de aliasing, de paginas de solo lectura y de desbordar la
+pila del kernel.
+
+Eso **fue el proyecto** durante mucho tiempo, y merece decirse: mientras
+se aprendia como funciona cada pieza, la unica forma de ver una carrera de
+datos era provocarla y la unica forma de ver que la MMU traduce era
+imprimir la traduccion. Un menu de demostraciones era exactamente la
+herramienta correcta.
+
+Deja de serlo cuando hay un sistema. Ahora esas mismas cosas se hacen
+desde dentro, con programas: `mem` mide el monton, `fp` la coma flotante,
+`deep` desborda la pila, `malo` le da punteros falsos al kernel, `forkd`
+mide lo que no cuesta un `fork`. Y se pueden encadenar, redirigir y
+ejecutar desde un fichero, que es lo que no podia hacer un menu.
+
+Lo que queda en el kernel es lo que no puede estar en otro sitio:
+encender la UART, preguntar la RAM a la GPU, montar las tablas de
+paginas, despertar los otros tres nucleos, enrutar los pines de la SD
+-porque la pagina de GPIO lleva la UART al lado y darla entera seria
+regalar la consola- y arrancar init.
+
+```
+    [init] soy el pid 5, y arranco el sistema
+```
+
+Pid 5 y no 14: los nueve hilos de demostracion ya no estan.
+
 ## Limitaciones conocidas
 
 - La unica frontera de privilegio entre procesos es "eres init o no eres
@@ -2990,8 +3063,8 @@ pero manda quien tenga la consola.
 - `copy_from_user` y `copy_to_user` copian byte a byte. Las de verdad
   mueven palabras enteras y tienen varias entradas en la tabla, una por
   cada tamanyo de acceso.
-- Solo `exec` y `spawn` usan la copia que sabe fallar. Las demas llamadas
-  siguen comprobando el rango a mano y trayendo las paginas antes.
+- Ya no hay menu de depuracion en el kernel: si init no arranca, no hay
+  forma de interactuar con la maquina.
 - El nombre corto que acompanya a uno largo se busca probando `~1`, `~2`…
   y mirando el directorio entero en cada intento. Con muchas colisiones es
   lento, y el numero se come las letras.

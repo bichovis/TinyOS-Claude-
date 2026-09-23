@@ -270,7 +270,7 @@ static void exception_body(struct trap_frame *f, uint64_t index)
          * gestor de paginas, sale de un PROCESO DE EL0 al que hay que
          * preguntarle y esperar. Ver task_mmap en sched.c. */
         if (ec == 0x24 && (iss & 0x3C) == 0x04) {
-            if (task_mmap_fault(read_far()))
+            if (user_fault_fix(read_far(), 0))
                 return;                      /* a reintentar la instruccion */
         }
 
@@ -325,7 +325,7 @@ static void exception_body(struct trap_frame *f, uint64_t index)
 
         if (far >= USER_BASE && far < USER_LIMIT && current && current->pgd) {
 
-            if (escritura ? user_touch_w(far) : user_touch_r(far))
+            if (user_fault_fix(far, escritura))
                 return;                      /* arreglado: a reintentar */
         }
 

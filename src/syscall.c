@@ -26,33 +26,28 @@ extern struct mutex *console_mutex(void);
  * comprobar que el proceso tiene derecho a leerlo, y eso lo sabe la MMU.
  * 'at s1e0r' traduce como lo haria EL0; si falla, el puntero es invalido
  * por muy legible que sea para el kernel. */
-static int user_range_ok(uint64_t va, uint64_t len, int for_write)
-{
-    if (len == 0) return 1;
-    if (va < USER_BASE || va >= USER_LIMIT) return 0;
-    if (va + len < va || va + len > USER_LIMIT) return 0;   /* desbordamiento */
-
-    /* Comprobar pagina a pagina: el rango puede cruzar varias. */
-    for (uint64_t p = va & ~(PAGE_SIZE - 1); p < va + len; p += PAGE_SIZE) {
-        /* user_touch_r y no vmm_translate_user: la pagina puede no estar
-         * y poder estarlo. Ver user_touch_r en sched.c. */
-        uint64_t ok = for_write ? (uint64_t)user_touch_w(p)
-                                : (uint64_t)user_touch_r(p);
-        if (!ok) return 0;
-    }
-    return 1;
-}
-
-static int user_readable(uint64_t va, uint64_t len) { return user_range_ok(va, len, 0); }
-
-/* Solo mirar si el RANGO cae dentro del espacio de usuario, sin traer ni
- * tocar nada.
+/* --- Tocar memoria de un proceso, de una sola forma ------------------
  *
- * Sirve para lo que se va a leer con copy_from_user, que se defiende solo:
- * las paginas que falten llegan cuando se tocan, y un puntero malo
- * devuelve un error en vez de reventar. Traerse por adelantado un fichero
- * de doce KB para leer una cabecera de sesenta y cuatro bytes era pagar
- * por miedo. */
+ * Aqui habia dos caminos y habia que acordarse de cual tocaba:
+ *
+ *   user_readable() + un puntero a pelo   -> comprobaba a mano el rango,
+ *                                            traia las paginas por
+ *                                            adelantado y luego leia.
+ *   copy_from_user()                       -> dejaba comprobar al silicio
+ *                                            y sabia recuperarse.
+ *
+ * Los dos funcionaban. El problema de tener dos es que el primero
+ * dependia de que nadie se olvidara de llamarlo, y de que el rango que
+ * comprobaba fuera el mismo que luego se leia. Dos sitios que tienen que
+ * decir lo mismo acaban diciendo cosas distintas.
+ *
+ * Desde el paso 43 solo queda el segundo. La comprobacion la hace la MMU
+ * en cada acceso -ldtr y sttr usan permisos de EL0- y lo que falta llega
+ * por el camino del fallo de pagina. Lo que antes eran dos pasos que
+ * podian discrepar es ahora uno que no puede.
+ *
+ * Lo unico que se conserva a mano es el LIMITE del rango, y para otra
+ * cosa: saber si un tamanyo es razonable antes de ponerse a trabajar. */
 static int user_rango(uint64_t va, uint64_t len)
 {
     if (len == 0) return 1;
@@ -61,19 +56,28 @@ static int user_rango(uint64_t va, uint64_t len)
     return 1;
 }
 
-/* Traerse una ruta del espacio del proceso. Se para en el cero o al
- * llenarse, y devuelve -1 si no habia nada legible: un puntero invalido
- * tiene que ser un error, no una ruta vacia que luego signifique el
- * raiz. */
-/* Traerse el argv[] de un proceso: un array de punteros terminado en
- * cero, y detras de cada puntero una cadena.
+/* Traerse una cadena del proceso, con tope.
  *
- * Son DOS niveles de indireccion en memoria ajena, y cada uno hay que
- * comprobarlo por separado: el array puede salirse de lo mapeado a mitad,
- * y cada cadena tambien. Por eso se mira pagina a pagina mientras se
- * copia, en vez de fiarse de un tamanyo que el proceso no ha dicho.
- *
- * Devuelve -1 si algo no cuadra; 0 con a->n = 0 si no hay argumentos. */
+ * Se copia de golpe lo que quepa y se busca el cero dentro. Si el bloque
+ * se corta antes -porque la cadena estaba al final de lo mapeado- lo que
+ * se copio sigue valiendo: solo hay que encontrar el cero ahi dentro. Un
+ * bucle byte a byte seria mas obvio y mucho mas lento. */
+static int copiar_cadena(char *dst, uint64_t uva, uint64_t max)
+{
+    uint64_t falta = copy_from_user(dst, uva, max - 1);
+    uint64_t hay   = (max - 1) - falta;
+
+    for (uint64_t i = 0; i < hay; i++)
+        if (!dst[i]) return i ? 0 : -1;          /* cero encontrado */
+
+    return -1;            /* no cabe, o el puntero no vale */
+}
+
+static int copiar_ruta(char *dst, uint64_t uva)
+{
+    return copiar_cadena(dst, uva, FS_PATH_MAX);
+}
+
 static int copiar_args(struct args *a, uint64_t uargv)
 {
     a->n = 0;
@@ -82,78 +86,28 @@ static int copiar_args(struct args *a, uint64_t uargv)
     uint64_t escribe = 0;
 
     for (int i = 0; i < MAX_ARGS; i++) {
-        uint64_t pos = uargv + (uint64_t)i * 8;
-        if (!user_readable(pos, 8)) return -1;
-
-        uint64_t p = *(const uint64_t *)pos;
-        if (!p) break;                        /* el cero final */
+        uint64_t p;
+        if (copy_from_user(&p, uargv + (uint64_t)i * 8, 8) != 0) return -1;
+        if (!p) break;                            /* el cero final */
 
         a->off[a->n] = (uint16_t)escribe;
 
-        for (;;) {
-            if (escribe >= ARGS_BYTES - 1) return -1;   /* no cabe */
-            if ((p & (PAGE_SIZE - 1)) == 0 || escribe == a->off[a->n])
-                if (!user_readable(p, 1)) return -1;
+        if (copiar_cadena(a->buf + escribe, p, ARGS_BYTES - escribe) < 0)
+            return -1;
 
-            char c = *(const char *)p;
-            a->buf[escribe++] = c;
-            if (!c) break;
-            p++;
-        }
+        while (a->buf[escribe]) escribe++;
+        escribe++;                                /* el cero */
         a->n++;
     }
     return 0;
 }
 
-/* Una cadena corta del espacio del proceso, con tope propio. */
-static int copiar_cadena(char *dst, uint64_t uva, uint64_t max)
-{
-    if (!user_readable(uva, 1)) return -1;
-
-    uint64_t i = 0;
-    for (; i < max - 1; i++) {
-        if (!vmm_translate_user(uva + i)) break;
-        char c = ((const char *)uva)[i];
-        if (!c) break;
-        dst[i] = c;
-    }
-    dst[i] = 0;
-    return i ? 0 : -1;
-}
-
-static int copiar_ruta(char *dst, uint64_t uva)
-{
-    if (!user_readable(uva, 1)) return -1;
-
-    uint64_t i = 0;
-    for (; i < FS_PATH_MAX - 1; i++) {
-        if (!vmm_translate_user(uva + i)) break;
-        char c = ((const char *)uva)[i];
-        if (!c) break;
-        dst[i] = c;
-    }
-    dst[i] = 0;
-    return i ? 0 : -1;
-}
-static int user_writable(uint64_t va, uint64_t len) { return user_range_ok(va, len, 1); }
-
-/* --- Copias entre espacios de direcciones -----------------------------
- * Emisor y receptor no comparten ni una direccion, asi que el kernel copia
- * byte a byte desde el espacio activo a una variable propia (que vive en la
- * pila de kernel, visible siempre) y luego al destino. */
-static void copy_bytes(void *dst, const void *src, uint64_t n)
-{
-    uint8_t *d = dst;
-    const uint8_t *s = src;
-    while (n--) *d++ = *s++;
-}
-
 static int64_t sys_send(uint64_t port, uint64_t umsg)
 {
-    if (!user_readable(umsg, sizeof(struct message))) return -1;
+
 
     struct message m;
-    copy_bytes(&m, (const void *)umsg, sizeof(m));
+    if (copy_from_user(&m, umsg, sizeof(m)) != 0) return -1;
     m.from = current->pid;          /* el remitente NO se puede falsificar */
     if (m.len > MSG_DATA_MAX) m.len = MSG_DATA_MAX;
 
@@ -162,7 +116,7 @@ static int64_t sys_send(uint64_t port, uint64_t umsg)
 
 static int64_t sys_recv(uint64_t port, uint64_t umsg)
 {
-    if (!user_writable(umsg, sizeof(struct message))) return -1;
+
 
     struct message m;
     if (port_recv((int)port, &m, current->pid) < 0)
@@ -171,7 +125,7 @@ static int64_t sys_recv(uint64_t port, uint64_t umsg)
     /* Ojo: port_recv puede haber bloqueado al proceso y, al despertar,
      * seguimos en su espacio de direcciones porque schedule() restaura
      * TTBR0 con el contexto. Por eso este puntero sigue siendo valido. */
-    copy_bytes((void *)umsg, &m, sizeof(m));
+    if (copy_to_user(umsg, &m, sizeof(m)) != 0) return -1;
     return 0;
 }
 
@@ -345,7 +299,7 @@ void syscall_dispatch(struct trap_frame *f)
      * dos numeros escritos en un array suyo. */
     case SYS_pipe: {
         struct fichero *r = 0, *w = 0;
-        if (!user_writable(f->x[0], 2 * sizeof(int))) { ret = -1; break; }
+        if (!user_rango(f->x[0], 2 * sizeof(int))) { ret = -1; break; }
         if (file_pipe(&r, &w) < 0)                    { ret = -1; break; }
 
         int fr = task_fd_alloc(r);
@@ -405,8 +359,7 @@ void syscall_dispatch(struct trap_frame *f)
     case SYS_getcwd: {
         uint64_t n = f->x[1];
         if (n > FS_PATH_MAX) n = FS_PATH_MAX;
-        if (!user_writable(f->x[0], n)) { ret = -1; break; }
-        copy_bytes((void *)f->x[0], current->cwd, n);
+        if (copy_to_user(f->x[0], current->cwd, n) != 0) { ret = -1; break; }
         ret = 0;
         break;
     }
@@ -415,8 +368,7 @@ void syscall_dispatch(struct trap_frame *f)
         char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
         if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
         if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
-        if (!user_writable(f->x[1], FS_PATH_MAX)) { ret = -1; break; }
-        copy_bytes((void *)f->x[1], abs, FS_PATH_MAX);
+        if (copy_to_user(f->x[1], abs, FS_PATH_MAX) != 0) { ret = -1; break; }
         ret = 0;
         break;
     }
@@ -433,8 +385,7 @@ void syscall_dispatch(struct trap_frame *f)
         if (base < 0) { ret = -1; break; }
 
         if (f->x[1]) {
-            if (!user_writable(f->x[1], sizeof(uint64_t))) { ret = -1; break; }
-            copy_bytes((void *)f->x[1], &tam, sizeof(tam));
+            if (copy_to_user(f->x[1], &tam, sizeof(tam)) != 0) { ret = -1; break; }
         }
         ret = base;
         break;
@@ -512,8 +463,7 @@ void syscall_dispatch(struct trap_frame *f)
         char tmp[64];
         uint64_t n = f->x[1];
         if (n > sizeof(tmp)) n = sizeof(tmp);
-        if (!user_readable(f->x[0], n)) { ret = -1; break; }
-        copy_bytes(tmp, (const void *)f->x[0], n);
+        if (copy_from_user(tmp, f->x[0], n) != 0) { ret = -1; break; }
         uart_push(tmp, n);
         ret = 0;
         break;

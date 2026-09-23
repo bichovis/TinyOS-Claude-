@@ -208,7 +208,7 @@ uint64_t task_stack_pages(struct task *t);
 
 /* ¿Puede el kernel escribir ahi? Resuelve el copy-on-write y el
  * crecimiento de la pila si hace falta. */
-int  user_touch_w(uint64_t va);
+int  user_fault_fix(uint64_t va, int escritura);  /* lo llama el manejador */
 
 /* --- Descriptores ----------------------------------------------------- */
 uint64_t task_creados(void);                  /* hilos que han existido     */

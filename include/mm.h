@@ -197,7 +197,6 @@ int       vmm_map_in(uint64_t *pgd, uint64_t va, uint64_t pa, uint64_t flags);
 int       vmm_unmap_in(uint64_t *pgd, uint64_t va);  /* y devuelve la pagina */
 void      vmm_switch_to(uint64_t *pgd, uint64_t asid);  /* tabla + etiqueta  */
 uint64_t  vmm_translate_user(uint64_t va);      /* ¿puede EL0 LEER aqui?     */
-int       user_touch_r(uint64_t va);           /* ...y si no, traerla       */
 
 /* Copiar entre el kernel y un proceso SIN fiarse del puntero: si la
  * direccion no vale, esto vuelve con un numero en vez de reventar.

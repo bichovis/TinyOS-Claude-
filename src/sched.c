@@ -998,55 +998,60 @@ void task_console_interrupt(void)
  * Asi que aqui se intenta, por orden: ¿se puede ya?, ¿es una pagina
  * compartida que toca copiar?, ¿es la pila, que aun no ha crecido hasta
  * ahi? Y solo si nada de eso vale, que no. */
-/* Hacer que una direccion de usuario SE PUEDA LEER, trayendola si hace
- * falta. Es el gemelo de user_touch_w, y su aparicion marca un cambio de
- * idea.
+/* Arreglar un fallo de pagina sobre memoria de un proceso. Devuelve 1 si
+ * se ha podido.
  *
- * Hasta el paso 33, el kernel COMPROBABA la memoria de usuario antes de
- * tocarla: 'at s1e0r' decia si estaba, y si no estaba, error. Eso valia
- * mientras "estar mapeada" fuera una propiedad estable. Con ficheros
- * mapeados deja de serlo: la pagina no esta, pero puede estarlo si alguien
- * la pide. Comprobar antes de tocar devuelve un no que era un todavia no.
+ * ESTO YA NO LO LLAMA NADIE PARA ACCEDER. Desde el paso 43, el kernel
+ * toca memoria de usuario de una sola forma -copy_from_user y
+ * copy_to_user- y esas no preguntan: acceden, y si falla, se falla. Esta
+ * funcion es lo que hay al otro lado de ese fallo.
  *
- * Asi que se cambia comprobar por CONSEGUIR. El kernel ya no pregunta si
- * puede leer: hace lo que haga falta para poder, y solo falla cuando ya no
- * queda nada que intentar.
+ * Esa separacion es la que hacia falta. Antes habia dos verbos que
+ * parecian el mismo -"comprobar si puedo" y "conseguir que pueda"- y el
+ * codigo tenia que acordarse de cual usaba. Ahora hay uno solo, y esto no
+ * es un verbo: es el manejador.
  *
- * OJO: esto puede DORMIR -traer una pagina mapeada es un viaje al servidor
- * de ficheros- asi que no se puede llamar con un cerrojo cogido. Por eso
- * file.c copia a un buffer intermedio antes de entrar en sus secciones
- * criticas, y no al reves. */
-int user_touch_r(uint64_t va)
+ * Tres cosas se pueden arreglar, en este orden:
+ *   - un fichero mapeado del que aun no se ha traido la pagina;
+ *   - una pagina compartida por un fork, que toca copiar antes de
+ *     escribir;
+ *   - la pila, que crece hacia abajo cuando el proceso la necesita.
+ */
+int user_fault_fix(uint64_t va, int escritura)
 {
     if (!current || !current->pgd) return 0;
+
+    if (escritura) {
+        if (vmm_translate_user_w(va)) return 1;
+
+        if (vmm_cow_fault(current->pgd, va, current->asid) &&
+            vmm_translate_user_w(va)) return 1;
+
+        if (task_grow_stack(va, va) && vmm_translate_user_w(va)) return 1;
+        return 0;
+    }
 
     if (vmm_translate_user(va)) return 1;
-
     if (task_mmap_fault(va) && vmm_translate_user(va)) return 1;
-
     if (task_grow_stack(va, va) && vmm_translate_user(va)) return 1;
-
     return 0;
 }
 
-int user_touch_w(uint64_t va)
-{
-    if (!current || !current->pgd) return 0;
-
-    if (vmm_translate_user_w(va)) return 1;
-
-    if (vmm_cow_fault(current->pgd, va, current->asid) &&
-        vmm_translate_user_w(va)) return 1;
-
-    if (task_grow_stack(va, va) && vmm_translate_user_w(va)) return 1;
-
-    return 0;
-}
-
+/* El marco de senyal va en la pila del proceso, y la pila puede no estar
+ * toda ahi: crecer es lo suyo. Se escribe un byte en cada pagina para
+ * provocar el fallo que la trae, y si alguno no se puede es que no hay
+ * sitio y el proceso no puede recibir senyales.
+ *
+ * Con copy_to_user, "provocar el fallo" y "comprobar si se puede" son la
+ * misma operacion, que es justo lo que se buscaba al dejar un solo
+ * camino. */
 static int pila_escribible(uint64_t sp, uint64_t n)
 {
+    const char cero = 0;
+
     for (uint64_t p = sp & ~(uint64_t)(PAGE_SIZE - 1); p < sp + n; p += PAGE_SIZE)
-        if (!user_touch_w(p)) return 0;
+        if (copy_to_user(p, &cero, 1) != 0) return 0;
+
     return 1;
 }
 
