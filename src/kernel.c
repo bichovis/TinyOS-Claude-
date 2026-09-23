@@ -7,6 +7,7 @@
 #include "mm.h"
 #include "mmio.h"
 #include "mbox.h"
+#include "smp.h"
 #include "sched.h"
 #include "sync.h"
 #include "ipc.h"
@@ -349,6 +350,7 @@ static void menu(void)
     uart_puts("  v - dos direcciones virtuales, una pagina fisica\n");
     uart_puts("  r - pagina de solo lectura (FATAL: fallo de permisos)\n");
     uart_puts("  x - traducciones VA -> PA del kernel\n");
+    uart_puts("  j - estado de los cuatro nucleos\n");
     uart_puts("  b - medir velocidad de la memoria\n");
     uart_puts("  t - tiempo e interrupciones\n");
     uart_puts("  h - ayuda\n");
@@ -436,6 +438,10 @@ static void command(char c)
 
     case 'r':
         demo_readonly();
+        break;
+
+    case 'j':
+        smp_dump();
         break;
 
     case 'x':
@@ -549,6 +555,17 @@ void kernel_main(uint64_t dtb_ptr)
         uart_dec(before / after);
         uart_puts("\n");
     }
+
+    /* Tres cuartas partes de la maquina llevan aparcadas desde el paso 1.
+     * A partir de aqui estan encendidas, cada una con su pila y su MMU,
+     * compartiendo las tablas del kernel. Todavia no hacen nada: sin
+     * cerrojos de verdad no pueden tocar lo que es de todos. */
+    uart_puts("\n  Despertando los nucleos 1, 2 y 3...\n");
+    int vivos = smp_start_secondaries();
+    uart_puts("    han contestado ");
+    uart_dec((uint64_t)vivos);
+    uart_puts(" de 3\n");
+    smp_dump();
 
     uart_puts("\n  Arrancando hilos...\n");
     sched_init();

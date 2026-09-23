@@ -47,20 +47,56 @@
                   (25 << 16) | (1 << 24) | (1 << 26) | (3 << 28) | \
                   (2 << 30) | (2 << 32)
 
+// ==========================================================================
+//  Traza de arranque
+//
+//  boot.S corre antes de que exista uart.c, asi que si algo falla aqui no
+//  hay forma de contarlo... salvo escribiendo a pelo en el registro de
+//  datos de la PL011. En la Pi el firmware ya la deja configurada
+//  (enable_uart=1 en config.txt), asi que un 'str' basta.
+//
+//  Es la unica herramienta que hay para depurar esta parte en hardware
+//  real, donde no hay ni gdb ni printf: la maquina arranca o no arranca, y
+//  sin esto no dice por que. Poner a 1 para encenderla; imprime una letra
+//  por cada hito del arranque.
+// ==========================================================================
+#define BOOT_TRACE 0
+
+.macro trace ch
+#if BOOT_TRACE
+    mov     x16, #0x1000
+    movk    x16, #0x3F20, lsl #16    // 0x3F201000 = PL011 (fisico)
+8\@:
+    ldr     w17, [x16, #0x18]        // FR: registro de estado
+    tbnz    w17, #5, 8\@b            // TXFF: la cola esta llena, esperar
+    mov     w17, #\ch
+    str     w17, [x16]               // DR: y va el caracter
+#endif
+.endm
+
 .section ".text.boot"        // seccion que el linker coloca en 0x80000
 .global _start
 
 _start:
-    // --- 1. Aparcar los nucleos 1, 2 y 3 ---------------------------------
-    // MPIDR_EL1 identifica el nucleo actual. Los bits [7:0] son el "Aff0",
-    // es decir el numero de nucleo (0..3 en la Pi 3B).
-    mrs     x1, mpidr_el1
-    and     x1, x1, #0xFF
-    cbz     x1, el_descend           // si soy el nucleo 0 -> sigo arrancando
+    // --- 1. Todos los nucleos empiezan igual -----------------------------
+    // Ojo, que aqui no llega lo mismo en QEMU que en la placa:
+    //
+    //   QEMU     suelta los cuatro nucleos en 0x80000. Los tres de mas
+    //            acaban esperando en secondary_wait, mas abajo.
+    //   Pi 3B    solo suelta el nucleo 0. A los otros tres los tiene el
+    //            firmware en su propia spin-table, y para sacarlos de ahi
+    //            hay que escribirles una direccion en su buzon (ver
+    //            src/smp.c). Cuando salen, entran por secondary_entry.
+    //
+    // En los dos casos el reparto se hace en at_el1, mirando MPIDR.
+    b       el_descend
 
-park_core:
-    wfe                              // Wait For Event: duerme, consumo casi cero
-    b       park_core                // (los despertaremos en un paso futuro)
+    // Por aqui entran los nucleos 1-3 en hardware real: recien soltados por
+    // el firmware, sin pasar por nada de lo anterior y en EL2. Tienen que
+    // recorrer el mismo descenso que hizo el nucleo 0.
+.global secondary_entry
+secondary_entry:
+    b       el_descend
 
 
     // --- 2. Bajar hasta EL1 ----------------------------------------------
@@ -129,14 +165,30 @@ from_el2:
 
     // --- 3. Ya en EL1: instalar el stack ---------------------------------
 at_el1:
+    trace 'A'                        // hemos llegado a EL1
+
+    // x27 = el puntero al device tree, que el firmware nos dejo en x0. Hay
+    // que apartarlo: mas abajo llamamos a dcache_invalidate_all, que usa x0
+    // para leer CLIDR_EL1 y se lo lleva por delante.
+    mov     x27, x0
+
     // x9 = KERNEL_VA_BASE. A partir de aqui, toda direccion que venga del
     // enlazador hay que bajarla a fisico restandole esto.
     ldr     x9, =KERNEL_VA_BASE
 
+    // x28 = numero de nucleo, y ya no se toca en todo el arranque.
+    // MPIDR_EL1 identifica el nucleo actual; los bits [7:0] son el "Aff0".
+    mrs     x28, mpidr_el1
+    and     x28, x28, #0xFF
+
+    // Cada nucleo su pila: 16 KB hacia abajo desde __stack_top. El 0 se
+    // lleva la de arriba del todo, el 1 la siguiente, y asi.
     // Ojo: en EL1h el registro SP activo es SP_EL1, que esta sin inicializar.
     // Escribir en 'sp' aqui escribe en SP_EL1.
     ldr     x1, =__stack_top
     sub     x1, x1, x9               // ...en fisico, que la MMU aun no esta
+    lsl     x2, x28, #14             // 16 KB por nucleo
+    sub     x1, x1, x2
     mov     sp, x1
 
     // Permitir a EL1/EL0 usar FP/SIMD sin que la CPU lo atrape.
@@ -145,6 +197,22 @@ at_el1:
     mov     x1, #(3 << 20)           // CPACR_EL1.FPEN = 0b11
     msr     cpacr_el1, x1
     isb                              // que surta efecto antes de continuar
+
+    // AQUI NO se toca CPUECTLR_EL1.SMPEN, el bit que mete a este nucleo en
+    // el dominio de coherencia, y conviene saber por que.
+    //
+    // Es un registro "implementation defined" (S3_1_C15_C2_1), y que EL1
+    // pueda leerlo depende de lo que hayan dejado ACTLR_EL2 y ACTLR_EL3,
+    // o sea del firmware. QEMU lo deja pasar; en una Pi de verdad el
+    // acceso se atrapa, y una excepcion en este punto -con VBAR_EL1 aun
+    // sin poner- es una muerte silenciosa: ni un caracter por la UART.
+    //
+    // No hace falta: el armstub del firmware ya pone SMPEN en los cuatro
+    // nucleos antes de soltarlos. Este es el tipo de bit que se pone donde
+    // hay privilegio para ponerlo, y no donde a uno le viene bien.
+
+    // Y aqui se separan los caminos: el nucleo 0 construye, el resto espera.
+    cbnz    x28, secondary_wait
 
     // --- 4. Poner .bss a cero --------------------------------------------
     // El estandar de C exige que las globales sin inicializar valgan 0.
@@ -159,6 +227,7 @@ bss_loop:
     str     xzr, [x1], #8            // xzr = registro que siempre vale 0
     b       bss_loop                 // [x1], #8 = escribe y luego x1 += 8
 bss_done:
+    trace 'B'                        // .bss a cero
 
     // --- 5. Construir las tablas de traduccion de arranque ---------------
     //
@@ -209,6 +278,8 @@ tbl_loop:
     // TTBR0 y TTBR1 apuntan a la MISMA tabla: abajo queda un mapa de
     // identidad (para que la instruccion siguiente al encendido siga
     // existiendo) y arriba el mapa lineal del kernel.
+    trace 'C'                        // tablas construidas
+
     ldr     x13, =MAIR_VALUE
     msr     mair_el1, x13
     ldr     x13, =TCR_VALUE
@@ -222,12 +293,23 @@ tbl_loop:
     dsb     nsh
     isb
 
+    // Tirar lo que la cache de datos pudiera tener de antes del arranque.
+    // Ahora mismo esta apagada, asi que todo lo que hemos escrito (las
+    // tablas incluidas) esta en RAM de verdad y no perdemos nada. En cuanto
+    // pongamos SCTLR.C, cualquier linea residual pasaria a ser valida.
+    bl      dcache_invalidate_all
+    ldr     x9, =KERNEL_VA_BASE      // esa rutina se lleva x9 por delante
+
     mrs     x13, sctlr_el1
     orr     x13, x13, #(1 << 0)      // M: MMU
     orr     x13, x13, #(1 << 2)      // C: cache de datos
     orr     x13, x13, #(1 << 12)     // I: cache de instrucciones
     msr     sctlr_el1, x13
     isb                              // <- a partir de aqui hay traduccion
+
+    trace 'D'                        // MMU encendida (sigue valiendo la
+                                     // identidad, por eso 0x3F201000 aun
+                                     // se puede tocar)
 
     // --- 7. La mudanza ----------------------------------------------------
     // Seguimos ejecutando en 0x80xxx gracias al mapa de identidad. Este
@@ -237,6 +319,8 @@ tbl_loop:
     br      x13
 
 en_alto:
+    trace 'E'                        // ya ejecutando arriba
+
     // Ya estamos en 0xFFFFFF80_000xxxxx. El stack todavia apunta abajo.
     ldr     x1, =__stack_top
     mov     sp, x1
@@ -255,13 +339,89 @@ en_alto:
     isb
 
     // --- 8. Saltar a C ----------------------------------------------------
-    // x0 sigue conteniendo el puntero al dtb -> llega como 1er argumento.
+    // El puntero al dtb, de vuelta a x0: llega como 1er argumento.
+    mov     x0, x27
     bl      kernel_main
 
     // --- 9. Si kernel_main retorna, aparcamos este nucleo tambien ---------
 halt:
     wfe
     b       halt
+
+
+// ==========================================================================
+//  Los nucleos 1, 2 y 3
+//
+//  Llegan aqui en EL1, con la MMU apagada y con su propia pila fisica ya
+//  puesta, pero las tablas de traduccion todavia no existen: las esta
+//  construyendo el nucleo 0. Asi que lo primero es esperar.
+// ==========================================================================
+secondary_wait:
+    // Nuestra propia spin-table. smp_go vive en .data y NO en .bss, y eso
+    // es deliberado: .data llega del fichero ya inicializada, antes de que
+    // ejecute ningun nucleo. Una variable de .bss valdria basura hasta que
+    // el nucleo 0 la limpiara, y aqui hay nucleos leyendola antes de eso:
+    // uno podria leer un valor cualquiera distinto de cero y arrancar con
+    // las tablas a medio construir.
+    ldr     x1, =smp_go
+    sub     x1, x1, x9
+1:  wfe                              // dormido hasta que alguien haga 'sev'
+    ldr     x2, [x1]
+    cbz     x2, 1b
+
+    // --- Encender la MMU, con las tablas que ya hizo el nucleo 0 --------
+    // Aqui no se construye nada: se comparten. TTBR1 apunta a la misma
+    // tabla que el nucleo 0, que es justo lo que hace que el kernel sea uno
+    // solo visto desde los cuatro nucleos.
+    ldr     x13, =MAIR_VALUE
+    msr     mair_el1, x13
+    ldr     x13, =TCR_VALUE
+    msr     tcr_el1, x13
+    ldr     x10, =l1_table
+    sub     x10, x10, x9
+    msr     ttbr0_el1, x10
+    msr     ttbr1_el1, x10
+    isb
+
+    ic      iallu
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+
+    bl      dcache_invalidate_all
+    ldr     x9, =KERNEL_VA_BASE      // esa rutina se lleva x9 por delante
+
+    mrs     x13, sctlr_el1
+    orr     x13, x13, #(1 << 0)      // M
+    orr     x13, x13, #(1 << 2)      // C
+    orr     x13, x13, #(1 << 12)     // I
+    msr     sctlr_el1, x13
+    isb
+
+    ldr     x13, =secondary_high
+    br      x13
+
+secondary_high:
+    // La misma mudanza que hizo el nucleo 0: pila arriba y fuera el mapa
+    // de identidad.
+    ldr     x1, =__stack_top
+    lsl     x2, x28, #14
+    sub     x1, x1, x2
+    mov     sp, x1
+
+    ldr     x1, =empty_pgd
+    sub     x1, x1, x9
+    msr     ttbr0_el1, x1
+    dsb     ish
+    tlbi    vmalle1
+    dsb     ish
+    isb
+
+    mov     x0, x28                  // el numero de nucleo, como argumento
+    bl      secondary_main
+
+2:  wfi                              // si vuelve, a dormir
+    b       2b
 
 
 // ==========================================================================
@@ -284,3 +444,15 @@ l2_local:   .space 4096
 // Tabla vacia: el TTBR0 de un hilo que no tiene espacio de usuario.
 .global empty_pgd
 empty_pgd:  .space 4096
+
+
+// ==========================================================================
+//  La senyal de arranque de los nucleos 1-3
+//
+//  En .data y no en .bss: asi llega del fichero valiendo cero, antes de que
+//  ejecute un solo nucleo. Ver el comentario de secondary_wait.
+// ==========================================================================
+.section ".data.smp", "aw"
+.align 3
+.global smp_go
+smp_go: .quad 0

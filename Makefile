@@ -113,12 +113,16 @@ sdcard: $(BUILD)/kernel8.img firmware
 	@echo
 	@echo "Copialo a una SD con una particion FAT32, o usa:  make sd SD=/Volumes/TUSD"
 
-# Copia directamente a una SD ya montada
+# Copia directamente a una SD ya montada.
+# 'cp -R .../.' y no 'cp .../*': hay un subdirectorio (overlays/) y el glob
+# solo pasa nombres, asi que un cp a secas se lo salta y falla.
 sd: sdcard
 	@test -d "$(SD)" || { echo "No existe $(SD). Usa: make sd SD=/Volumes/TUSD"; exit 1; }
-	@cp $(BUILD)/sdcard/* "$(SD)/"
+	@cp -R $(BUILD)/sdcard/. "$(SD)/"
 	@sync
-	@echo "Copiado a $(SD). Expulsala y arranca la Pi."
+	@echo "Copiado a $(SD):"
+	@ls -R "$(SD)" | head -20
+	@echo "Expulsala y arranca la Pi."
 
 clean:
 	@rm -rf $(BUILD)

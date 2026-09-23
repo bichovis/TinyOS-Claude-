@@ -46,10 +46,12 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* Stack del nucleo 0: 16 KB creciendo hacia abajo desde __stack_top */
+    /* Pilas de los cuatro nucleos: 16 KB cada una, creciendo hacia abajo.
+     * El nucleo 0 se lleva la de arriba del todo (__stack_top) y cada
+     * nucleo N la suya, 16 KB mas abajo. Ver at_el1 en boot.S. */
     . = ALIGN(16);
     __stack_bottom = .;
-    . += 0x4000;
+    . += 0x4000 * 4;
     __stack_top = .;
 
     /* Alineado a 4 KB: a partir de aqui empieza la RAM que reparte el PMM */
