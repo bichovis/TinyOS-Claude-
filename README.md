@@ -98,6 +98,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 41   | El kernel aprende a fallar y recuperarse    | hecho  |
 | 42   | init: el kernel deja de saber que es un shell| hecho |
 | 43   | Una sola puerta, y fuera las demostraciones | hecho  |
+| 44   | Rutas largas y un reloj inventado           | hecho  |
 
 ## Estructura
 
@@ -128,6 +129,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  mkdir.c     crea un directorio
                  map.c       mapea un fichero y mide cuando se lee
                  init.c      el primer proceso: arranca todo lo demas
+                 fecha.c     ve y pone la hora
                  env.c       ensenya el entorno   echo.c  repite lo que le den
                  rmdir.c     borra un directorio vacio
                  mv.c        mueve y renombra: la misma operacion
@@ -2998,7 +3000,153 @@ regalar la consola- y arrancar init.
 
 Pid 5 y no 14: los nueve hilos de demostracion ya no estan.
 
+## Rutas largas y un reloj inventado
+
+Los dos primeros peldanyos de una escalera que lleva a compilar el sistema
+desde el propio sistema. Ninguno es espectacular; los dos hacian falta
+antes de nada.
+
+**Las rutas.** `FS_PATH_MAX` eran 64 bytes, y un arbol de fuentes tiene
+rutas de 150 sin despeinarse. El problema no era el numero: era que la
+ruta y el trozo de fichero salen **del mismo mensaje**, asi que alargar
+una encogia el otro.
+
+```
+    mensaje = puerto(8) + posicion(8) + ruta + datos
+```
+
+Se sube el mensaje de 256 a 512 bytes, y entonces caben 256 de ruta y 240
+de datos -que ademas hace las lecturas un 30% mas baratas-. Cuesta 16 KB
+mas de monton del kernel en las colas de los puertos.
+
+Que dos cosas sin relacion compitan por el mismo espacio es el sintoma de
+un protocolo que lo mete todo en un mensaje de tamanyo fijo. Lo limpio
+seria separarlas; mientras tanto, es un numero que se sube.
+
+## Un reloj en una maquina que no tiene ninguno
+
+La Pi **no tiene reloj de tiempo real**. No hay pila, no hay nada que siga
+contando con la maquina apagada: al arrancar no sabe que dia es y no hay
+forma de que lo averigue sola.
+
+Y sin fechas no hay `make`. Comparar marcas de tiempo *es* lo que hace
+make; sin ellas, o recompila todo siempre o hace cosas peores.
+
+Lo que la maquina si sabe es **cuanto lleva encendida**. Asi que el reloj
+es una suma:
+
+```c
+    hora = base + tiempo desde el arranque
+```
+
+y la base la pone alguien de fuera. Por defecto es la fecha en que se
+compilo el kernel, inyectada por el Makefile. Es una mentira util: no es
+la hora, pero cumple lo unico que hace falta -que un fichero escrito
+despues tenga una marca mayor que uno escrito antes- y no queda por detras
+de los fuentes, porque los fuentes los copio a la tarjeta esa misma
+maquina. `fecha AAAA-MM-DD hh:mm` la corrige, y eso solo lo puede hacer
+init: la hora es de la maquina entera.
+
+**Un reloj que solo sabe que el tiempo avanza, no que hora es.**
+
+**El formato de FAT cuenta su propia historia.** La fecha son dos palabras
+de 16 bits:
+
+```
+    fecha: anyo desde 1980 (7 bits) | mes (4) | dia (5)
+    hora:  hora (5) | minuto (6) | segundo PARTIDO POR DOS (5)
+```
+
+Los segundos van de dos en dos porque no cabian: con 5 bits llegas a 31,
+no a 59. Se decidio que dos segundos de precision bastaban, y ahi sigue
+cuarenta anyos despues. El anyo en 7 bits llega a 2107, que suena lejos y
+sin embargo alguien lo vera.
+
+**Y una trampa que solo se ve comparando con otro.** La primera version
+puso el reloj en UTC, y salio esto:
+
+```
+    2026-09-23 13:57        82  HOLA.TXT      <- lo escribio el Mac
+    2026-09-23 11:54       117  NUEVO.TXT     <- lo escribio TinyOS
+```
+
+Dos horas de menos. **FAT no tiene zona horaria**: guarda la hora del
+sitio donde se escribio el fichero, y punto. Con el reloj en UTC, todo lo
+que escribiera TinyOS apareceria mas viejo que lo que acababa de escribir
+el Mac... y make, que compara fechas, haria justo lo contrario de lo que
+se le pide.
+
+Un reloj mal puesto no es un detalle cosmetico cuando alguien ordena cosas
+con el. La epoca se inyecta ahora en hora local.
+
+**Y la comprobacion de que sirve para lo que se hizo:**
+
+```
+    2026-09-23 13:57       117  UNO.TXT
+    2026-09-23 13:58       117  DOS.TXT
+```
+
+Escritos con un minuto de diferencia, y el segundo es mas nuevo. Eso es
+todo lo que make necesita saber. macOS lee las mismas fechas, y
+`fsck_msdos` sigue limpia.
+
+## Un ls de hace quince pasos
+
+En la Pi, `ls` dentro de `/boot` daba esto:
+
+```
+    ÍÚ³j             9080 bytes
+    ÍÚ³j             8784 bytes
+```
+
+Parecia un fallo de FAT16, porque en FAT32 iba bien. No lo era, y los
+cuatro bytes lo decian todo: `0x6AB3DACD` al reves es un timestamp leido
+como texto. Lo que se estaba ensenyando en el sitio del nombre **era la
+fecha**.
+
+Es decir: un `ls` que leia `struct fs_info` con el reparto de campos
+ANTERIOR. Un binario viejo.
+
+**Tres decisiones mias se juntaron para que eso pasara**, y ninguna era
+obviamente mala por separado.
+
+**1. Meti el campo nuevo en medio.** `mtime` quedaba bonito entre `flags`
+y `name`. Puesto al final, un programa viejo habria seguido leyendo bien
+todo lo que ya conocia y simplemente no habria visto la fecha. La regla es
+vieja y la salte igual: **campos nuevos, al final; siempre.** No es
+compatibilidad de verdad -para eso hace falta una version en el protocolo-
+pero convierte "basura silenciosa" en "una cosa de menos".
+
+**2. `make sd` solo copiaba.** Los ejecutables que vivian en la particion
+de arranque antes del paso 35 se quedaron ahi para siempre, porque nadie
+los borro nunca. Una herramienta de despliegue que no borra deja el
+destino contando **la historia entera** en vez del estado actual. Ahora
+quita los `.ELF` que no pintan nada ahi, y lo dice.
+
+**3. El directorio actual iba primero en el PATH.** Y aqui esta lo bueno:
+este mismo documento explicaba, dos pasos atras, por que Unix **no** pone
+`.` en el PATH — entrar en un directorio ajeno y escribir `ls` podria
+ejecutar el `ls` que haya dejado su duenyo. Y yo lo habia descartado
+diciendo que aqui no hay varios usuarios, asi que no hay a quien enganyar.
+
+Era cierto y daba igual. `cd /boot` seguido de `ls` ejecutaba el viejo. No
+hacia falta un atacante: bastaba con una copia vieja.
+
+Ahora `.` va el ultimo, y se anyade la otra mitad de la regla de Unix: **si
+el nombre lleva una barra, no se busca en ningun sitio.** `./prog` y
+`/usr/bin/prog` dicen exactamente donde estan, y ponerse a buscar seria
+desobedecer.
+
 ## Limitaciones conocidas
+
+- El reloj arranca siempre en la misma base: dos sesiones seguidas empiezan
+  a la misma hora, asi que un fichero de ayer puede parecer mas nuevo que
+  uno de hoy. Lo cura un reloj de verdad, o que init guarde la hora al
+  salir.
+- No hay zonas horarias. El reloj esta en hora local porque FAT lo esta, y
+  el sistema no sabe cual es.
+- La lista de programas esta escrita tres veces en el Makefile (UPROGS,
+  sdtest y sdcard). Ya se han desincronizado una vez.
 
 - La unica frontera de privilegio entre procesos es "eres init o no eres
   init". Sin usuarios, sin grupos y sin capacidades.
@@ -3052,7 +3200,7 @@ Pid 5 y no 14: los nueve hilos de demostracion ya no estan.
   que copiar con `cp` y borrar.
 - No se lleva la cuenta de clusters libres del FSInfo de FAT32: se marca
   como desconocida y que la recalcule quien la quiera.
-- La ruta son 64 bytes y cada componente 8.3, o sea unos cinco niveles.
+- La ruta son 256 bytes; cada componente puede llevar nombre largo.
 - El anillo de entrada de la consola son 64 bytes y lo que no cabe se
   pierde. Ahora al menos lo dice; un terminal de verdad tendria control de
   flujo (XON/XOFF o RTS/CTS) y no perderia nada.
@@ -3078,9 +3226,6 @@ Pid 5 y no 14: los nueve hilos de demostracion ya no estan.
   todos.
 - No hay diario ni nada que se le parezca: un corte de corriente a mitad de
   una escritura deja el volumen inconsistente, como en 1980.
-- Los ficheros nuevos no llevan fecha. FAT tiene campos para ella, pero la
-  Pi no tiene reloj de tiempo real y no hay de donde sacarla: mejor un cero
-  honesto que una fecha inventada.
 - La linea de ordenes son 128 caracteres, asi que `write` no puede crear
   ficheros de mas de un centenar de bytes. Para mover volumen esta `cp`.
 - Un mensaje lleva 256 bytes, de los que 176 son datos utiles, asi que

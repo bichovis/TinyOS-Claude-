@@ -132,15 +132,24 @@ static uint64_t tamano_de(const char *fichero)
  * estaba escrita aqui dentro, y cambiarla queria decir recompilar el
  * sistema operativo.
  *
- * Que el directorio actual vaya primero es comodo y en Unix no se hace:
- * ahi "." no esta en el PATH por defecto, porque entrar en un directorio
- * ajeno y escribir "ls" podria ejecutar el "ls" que haya dejado su
- * duenyo. Aqui no hay varios usuarios, asi que no hay a quien enganyar.
- */
+ * EL DIRECTORIO ACTUAL VA EL ULTIMO, y eso se aprendio a golpes.
+ *
+ * Estaba primero, porque es comodo. En Unix "." ni siquiera esta en el
+ * PATH por defecto, y el argumento clasico es la seguridad: entrar en un
+ * directorio ajeno y escribir "ls" podria ejecutar el "ls" que haya
+ * dejado su duenyo.
+ *
+ * Aqui no hay varios usuarios, asi que ese argumento no aplicaba... y
+ * mordio igual, por otro sitio. En la particion de arranque habian
+ * quedado los ejecutables de hace unos pasos, de cuando vivian ahi. Un
+ * "cd /boot" seguido de "ls" no ejecutaba /usr/bin/LS.ELF: ejecutaba el
+ * viejo, que leia mal las respuestas del servidor y ensenyaba basura.
+ *
+ * No hacia falta un atacante. Bastaba con una copia vieja. */
 static const char *el_path(void)
 {
     const char *p = getenv("PATH");
-    return (p && *p) ? p : ".:/usr/bin";
+    return (p && *p) ? p : "/usr/bin:.";
 }
 
 /* El trozo numero 'n' del PATH, separando por ':'. Devuelve 0 al final. */
@@ -161,9 +170,18 @@ static int path_trozo(int n, char *dst, uint64_t max)
     return 1;
 }
 
-/* Deja en 'ruta' la absoluta que si existe, o devuelve 0. */
+/* Deja en 'ruta' la absoluta que si existe, o devuelve 0.
+ *
+ * REGLA DE UNIX: si el nombre lleva una barra, no se busca en ningun
+ * sitio. "./prog" y "/usr/bin/prog" dicen exactamente donde estan, y
+ * ponerse a buscar seria desobedecer. Solo los nombres pelados -"ls"-
+ * pasan por el PATH. */
 static int buscar_programa(const char *nom, char *ruta)
 {
+    for (const char *p = nom; *p; p++)
+        if (*p == '/')
+            return realpath(nom, ruta) == 0 && tamano_de(ruta);
+
     char dir[FS_PATH_MAX];
 
     for (int i = 0; path_trozo(i, dir, sizeof(dir)); i++) {

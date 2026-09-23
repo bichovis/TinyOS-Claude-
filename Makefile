@@ -6,6 +6,16 @@ CROSS   ?= aarch64-elf-
 CC      := $(CROSS)gcc
 OBJCOPY := $(CROSS)objcopy
 AR      := $(CROSS)ar
+
+# La fecha con la que nace el reloj del kernel, en HORA LOCAL y no en UTC.
+#
+# FAT no tiene zona horaria: guarda la hora del sitio donde se escribio el
+# fichero, y punto. Si el kernel arrancara en UTC, todo lo que escribiera
+# TinyOS apareceria dos horas mas viejo que lo que escribio el Mac hace un
+# momento... y make, que compara fechas, haria justo lo contrario de lo que
+# se le pide. Un reloj mal puesto no es un detalle cosmetico cuando alguien
+# ordena cosas con el.
+FECHA_LOCAL := $(shell python3 -c "import time; print(int(time.time()) + time.localtime().tm_gmtoff)")
 OBJDUMP := $(CROSS)objdump
 QEMU    ?= qemu-system-aarch64
 
@@ -22,13 +32,14 @@ CFLAGS  := -Wall -Wextra -Werror -O2 -std=c11 \
            -ffreestanding -nostdlib -nostartfiles \
            -mcpu=cortex-a53 -mgeneral-regs-only -mstrict-align \
            -fno-stack-protector -fno-pie -fno-common \
-           -I$(INCDIR) -MMD -MP
+           -I$(INCDIR) -MMD -MP \
+           -DFECHA_COMPILACION=$(FECHA_LOCAL)UL
 
 LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha
 
 # Programas de usuario con mas de un fichero fuente
 EXTRA_fs := user/sd.c
@@ -177,9 +188,9 @@ sdtest: all | $(BUILD)
 	 printf 'Mi nombre no cabe en 8.3.\n' > "$$D/un nombre bastante largo.txt"; \
 	 printf 'Y el mio tampoco, pero sin espacios.\n' > "$$D/ensamblador-de-prueba.txt"; \
 	 mkdir -p "$$D/ETC"; \
-	 printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=.:/usr/bin\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > "$$D/ETC/RC"; \
+	 printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > "$$D/ETC/RC"; \
 	 mkdir -p "$$D/USR/BIN"; \
-	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo; do \
+	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha malo; do \
 	   cp $(BUILD)/$$p.elf "$$D/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF"; \
 	 done;                         \
 	 sync; diskutil eject $$DEV >/dev/null
@@ -222,9 +233,9 @@ sdcard: all firmware
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
 	@printf 'Soy el de la particion de arranque, y cuelgo de /boot.\n' > $(BUILD)/sdcard/AVISO.TXT
 	@mkdir -p $(BUILD)/sddata/ETC
-	@printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=.:/usr/bin\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > $(BUILD)/sddata/ETC/RC
+	@printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > $(BUILD)/sddata/ETC/RC
 	@mkdir -p $(BUILD)/sddata/USR/BIN
-	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo; do \
+	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha malo; do \
 	   cp $(BUILD)/$$p.elf $(BUILD)/sddata/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done
 	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de datos de la Pi.\n' > $(BUILD)/sddata/HOLA.TXT
@@ -242,11 +253,29 @@ sdcard: all firmware
 # Copia directamente a una SD ya montada.
 # 'cp -R .../.' y no 'cp .../*': hay un subdirectorio (overlays/) y el glob
 # solo pasa nombres, asi que un cp a secas se lo salta y falla.
+# Copiar a la tarjeta BORRANDO ANTES lo que sobra.
+#
+# Esto solo copiaba, y eso resulto ser un fallo con dientes: los
+# ejecutables que vivian en la particion de arranque antes del paso 35 se
+# quedaron ahi para siempre. Con "." primero en el PATH, un "cd /boot" y
+# un "ls" ejecutaban el viejo, que leia mal las respuestas del servidor y
+# ensenyaba basura. Parecia un fallo de FAT16 y era una copia de hace
+# quince pasos.
+#
+# Una herramienta de despliegue que nunca borra deja el destino contando
+# la historia entera en vez del estado actual.
 sd: sdcard
 	@test -d "$(SD)" || { echo "No existe $(SD). Usa: make sd SD=/Volumes/boot DATA=/Volumes/DATA"; exit 1; }
+	@# Los .ELF no pintan nada en la particion de arranque desde el paso 35.
+	@if ls "$(SD)"/*.ELF >/dev/null 2>&1; then                            \
+	   echo "  quitando ejecutables viejos de $(SD):";                     \
+	   ls "$(SD)"/*.ELF | sed 's|.*/|    |';                               \
+	   rm -f "$(SD)"/*.ELF "$(SD)/HOLA.TXT";                               \
+	 fi
 	@cp -R $(BUILD)/sdcard/. "$(SD)/"
 	@if [ -n "$(DATA)" ]; then                                            \
 	   test -d "$(DATA)" || { echo "No existe $(DATA)"; exit 1; };        \
+	   rm -rf "$(DATA)/USR/BIN";                                          \
 	   cp -R $(BUILD)/sddata/. "$(DATA)/";                                \
 	   echo "Copiado a $(DATA) (el raiz).";                               \
 	 else                                                                 \

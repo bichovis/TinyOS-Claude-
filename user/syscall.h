@@ -144,6 +144,11 @@ static inline int64_t bootstrap(const char *nombre, char *const argv[],
 static inline int64_t consola(uint64_t pid)
 { return syscall2(SYS_consola, pid, 0); }
 
+/* La hora, en segundos desde 1970. Ver SYS_time: en esta maquina es un
+ * invento honesto, no un reloj. */
+static inline uint64_t ahora(void)  { return (uint64_t)syscall2(SYS_time, 0, 0); }
+static inline int64_t poner_hora(uint64_t s) { return syscall2(SYS_settime, s, 0); }
+
 /* Mapear un fichero: convertirlo en un puntero. No lo lee ahora; los
  * trozos van llegando segun se tocan. */
 static inline const char *mmap(const char *ruta, uint64_t *tam)

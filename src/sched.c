@@ -1520,7 +1520,7 @@ int task_create_user_str(const char *name, const uint8_t *image, uint64_t size,
      * En un Unix de verdad lo pone init leyendo ficheros de
      * configuracion. Aqui son dos lineas escritas a mano, y eso basta
      * para que el shell deje de llevar el PATH dentro del codigo. */
-    args_de_cadena(&e, "PATH=.:/usr/bin HOME=/ TERM=serie");
+    args_de_cadena(&e, "PATH=/usr/bin:. HOME=/ TERM=serie");
 
     return task_create_user(name, image, size, mmio_pa, &a, &e);
 }

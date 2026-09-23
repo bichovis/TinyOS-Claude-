@@ -424,6 +424,19 @@ void syscall_dispatch(struct trap_frame *f)
         ret = 0;
         break;
 
+    case SYS_time:
+        ret = (int64_t)reloj_ahora();
+        break;
+
+    /* Solo init: la hora es de la maquina entera, y dejar que cualquiera
+     * la cambie seria dejar que cualquiera mueva las fechas de todos los
+     * ficheros. */
+    case SYS_settime:
+        if (!current || current->pid != task_init_pid()) { ret = -1; break; }
+        reloj_poner(f->x[0]);
+        ret = 0;
+        break;
+
     case SYS_munmap:
         ret = task_munmap(f->x[0]);
         break;

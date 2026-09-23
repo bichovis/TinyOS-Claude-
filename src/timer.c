@@ -73,6 +73,41 @@ void timer_start_core(void)
     write_ctl(1);                       /* ENABLE=1, IMASK=0 -> que avise  */
 }
 
+/* --- El reloj de pared -------------------------------------------------
+ *
+ * La Pi no tiene reloj de tiempo real: al arrancar no sabe que dia es.
+ * Lo que si sabe es cuanto lleva encendida, asi que la hora es una suma y
+ * la base la pone alguien.
+ *
+ * FECHA_COMPILACION la inyecta el Makefile con la fecha de la maquina que
+ * compilo. No es la hora, pero cumple lo unico que hace falta para que
+ * make funcione: que un fichero escrito despues tenga una marca mayor que
+ * uno escrito antes. Y no queda atras de los fuentes, porque los fuentes
+ * se copiaron a la tarjeta con esta misma maquina.
+ *
+ * Lo que NO arregla: dos arranques seguidos empiezan en la misma base, asi
+ * que un fichero de la sesion de ayer puede parecer mas nuevo que uno de
+ * hoy. Eso solo lo cura un reloj de verdad o que init guarde la hora al
+ * salir, y esta en las limitaciones. */
+#ifndef FECHA_COMPILACION
+#define FECHA_COMPILACION 1700000000UL   /* noviembre de 2023, por decir algo */
+#endif
+
+static uint64_t reloj_base = FECHA_COMPILACION;
+
+uint64_t reloj_ahora(void)
+{
+    uint32_t hz = timer_hz();
+    if (!hz) return reloj_base;
+    return reloj_base + timer_now() / hz;
+}
+
+void reloj_poner(uint64_t segundos)
+{
+    uint32_t hz = timer_hz();
+    reloj_base = segundos - (hz ? timer_now() / hz : 0);
+}
+
 void timer_irq(void)
 {
     /* 'ticks' es el reloj del SISTEMA, no el de este nucleo. Si lo subieran

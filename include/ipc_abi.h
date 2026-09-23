@@ -10,17 +10,23 @@
 /* 128 y no 48: una peticion de escritura tiene que llevar el nombre del
  * fichero Y los datos en el mismo mensaje. Con 8 puertos de 8 mensajes,
  * la cola entera del kernel son 10 KB de .bss. */
-/* Un mensaje lleva 256 bytes de datos. Eran 128 hasta el paso 31, y
- * crecieron porque una peticion al servidor de ficheros tiene que llevar
- * ahora una RUTA entera y no un nombre de doce caracteres. Con 128 no
- * cabian las dos cosas: o la ruta era ridicula o el trozo de fichero se
- * quedaba en la mitad.
+/* Un mensaje lleva 512 bytes de datos: 128 hasta el paso 31, 256 hasta el
+ * 44, y ahora 512.
  *
- * Lo que cuesta: cada puerto tiene ocho huecos, y hay ocho puertos, asi
- * que el kernel pasa de 9,7 KB de colas a 17,9 KB. A cambio, FS_CHUNK
- * sube de 96 a 176 bytes y leer un fichero necesita casi la mitad de
- * viajes. */
-#define MSG_DATA_MAX         256
+ * Cada vez que crece es por lo mismo: la ruta y el trozo de fichero salen
+ * del MISMO mensaje, asi que alargar una encoge el otro. Con 256 bytes una
+ * ruta decente dejaba el trozo en 176, y una ruta de verdad -las de un
+ * arbol de fuentes pasan de 150 caracteres- no cabia de ninguna manera.
+ *
+ * Lo que cuesta: ocho puertos de ocho huecos pasan de 17,9 KB a 34 KB de
+ * monton del kernel. A cambio la ruta llega a 256 y el trozo sube de 176
+ * a 240, que ademas hace las lecturas un 30% mas baratas.
+ *
+ * Que dos cosas que no tienen nada que ver compitan por el mismo espacio
+ * es el sintoma de un protocolo que mete todo en un mensaje de tamanyo
+ * fijo. Lo limpio seria separar la ruta de los datos; mientras tanto,
+ * esto es un numero que se sube cuando hace falta. */
+#define MSG_DATA_MAX         512
 
 struct message {
     unsigned long from;             /* pid del remitente: lo pone el kernel */
@@ -130,6 +136,23 @@ struct message {
 /* Ceder la consola a un proceso: quien la tenga recibe el Ctrl-C y lee del
  * teclado. Solo init, que es quien decide que hay en primer plano. */
 #define SYS_consola      36   /* (pid) -> 0 | -1                            */
+
+/* --- La hora -----------------------------------------------------------
+ *
+ * La Pi NO TIENE RELOJ DE TIEMPO REAL. No hay pila, no hay nada que siga
+ * contando con la maquina apagada: al arrancar, el sistema no sabe que dia
+ * es y no hay forma de que lo averigue solo.
+ *
+ * Lo que si sabe es cuanto lleva encendida. Asi que el reloj es una suma:
+ *   hora = base + tiempo desde el arranque
+ * y 'base' la pone alguien de fuera. Por defecto es la fecha en que se
+ * compilo el kernel, que es una mentira util: no es la hora, pero ordena
+ * bien los ficheros que escriba este sistema, y eso es lo que necesita
+ * make. init puede corregirla con SYS_settime si /etc/fecha dice otra.
+ *
+ * Un reloj que solo sabe que el tiempo avanza, no que hora es. */
+#define SYS_time         37   /* () -> segundos desde 1970                  */
+#define SYS_settime      38   /* (segundos) -> 0 | -1   (solo init)         */
 
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */

@@ -926,6 +926,98 @@ static int dir_create(struct volumen *v, const char *ruta, uint32_t *lba, uint32
     return dir_create_en(v, dir, ultimo, 0x20, lba, off);
 }
 
+/* --- La fecha, en el formato de 1980 ----------------------------------
+ *
+ * FAT guarda la fecha en dos palabras de 16 bits, y el reparto de bits
+ * cuenta la historia de cuando se disenyo:
+ *
+ *   fecha: anyo desde 1980 (7 bits) | mes (4) | dia (5)
+ *   hora:  hora (5) | minuto (6) | segundo PARTIDO POR DOS (5)
+ *
+ * Los segundos van de dos en dos porque no cabian: con 5 bits llegas a 31,
+ * no a 59. Se decidio que un fichero con la hora a dos segundos de
+ * precision era suficiente, y ahi sigue cuarenta anyos despues.
+ *
+ * El anyo en 7 bits llega hasta 2107. Esa si es una fecha lejana... y sin
+ * embargo alguien la vera. */
+static void fecha_fat(uint64_t segundos, uint16_t *fecha, uint16_t *hora)
+{
+    uint64_t dias = segundos / 86400;
+    uint64_t resto = segundos % 86400;
+
+    uint32_t h = (uint32_t)(resto / 3600);
+    uint32_t m = (uint32_t)((resto % 3600) / 60);
+    uint32_t s = (uint32_t)(resto % 60);
+
+    /* De dias desde 1970 a anyo/mes/dia, contando anyos bisiestos a mano.
+     * Es el algoritmo aburrido y es el correcto; el listo con divisiones
+     * magicas se equivoca en los siglos. */
+    uint32_t anyo = 1970;
+    for (;;) {
+        int bis = (anyo % 4 == 0 && anyo % 100 != 0) || anyo % 400 == 0;
+        uint32_t largo = bis ? 366 : 365;
+        if (dias < largo) break;
+        dias -= largo;
+        anyo++;
+    }
+
+    int bis = (anyo % 4 == 0 && anyo % 100 != 0) || anyo % 400 == 0;
+    static const uint32_t meses[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+
+    uint32_t mes = 0;
+    for (; mes < 12; mes++) {
+        uint32_t largo = meses[mes] + ((mes == 1 && bis) ? 1u : 0u);
+        if (dias < largo) break;
+        dias -= largo;
+    }
+
+    if (anyo < 1980) anyo = 1980;          /* FAT no sabe de antes */
+
+    *fecha = (uint16_t)(((anyo - 1980) << 9) | ((mes + 1) << 5) | (dias + 1));
+    *hora  = (uint16_t)((h << 11) | (m << 5) | (s / 2));
+}
+
+/* Y de vuelta, para poder ensenyarla y para que make la compare. */
+static uint64_t fecha_unix(uint16_t fecha, uint16_t hora)
+{
+    if (!fecha) return 0;                  /* sin fecha */
+
+    uint32_t anyo = 1980 + (fecha >> 9);
+    uint32_t mes  = (fecha >> 5) & 0x0F;
+    uint32_t dia  = fecha & 0x1F;
+    if (mes < 1 || mes > 12 || dia < 1) return 0;
+
+    uint64_t dias = 0;
+    for (uint32_t a = 1970; a < anyo; a++)
+        dias += ((a % 4 == 0 && a % 100 != 0) || a % 400 == 0) ? 366 : 365;
+
+    static const uint32_t meses[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    int bis = (anyo % 4 == 0 && anyo % 100 != 0) || anyo % 400 == 0;
+    for (uint32_t m = 1; m < mes; m++)
+        dias += meses[m - 1] + ((m == 2 && bis) ? 1u : 0u);
+
+    dias += dia - 1;
+
+    return dias * 86400
+         + (uint64_t)((hora >> 11) & 0x1F) * 3600
+         + (uint64_t)((hora >> 5) & 0x3F) * 60
+         + (uint64_t)(hora & 0x1F) * 2;
+}
+
+/* Poner en una entrada la hora de ahora. Se llama al crear y al escribir,
+ * que son los dos momentos en que un fichero cambia. */
+static void tocar(uint8_t *d)
+{
+    uint16_t fecha, hora;
+    fecha_fat(ahora(), &fecha, &hora);
+
+    d[14] = (uint8_t)(hora & 0xFF);  d[15] = (uint8_t)(hora >> 8);   /* creacion */
+    d[16] = (uint8_t)(fecha & 0xFF); d[17] = (uint8_t)(fecha >> 8);
+    d[18] = (uint8_t)(fecha & 0xFF); d[19] = (uint8_t)(fecha >> 8);  /* acceso */
+    d[22] = (uint8_t)(hora & 0xFF);  d[23] = (uint8_t)(hora >> 8);   /* escritura */
+    d[24] = (uint8_t)(fecha & 0xFF); d[25] = (uint8_t)(fecha >> 8);
+}
+
 /* Leer y modificar un campo de la entrada de directorio. */
 static int dir_update(uint32_t lba, uint32_t off, uint32_t cluster, uint32_t tam)
 {
@@ -933,6 +1025,7 @@ static int dir_update(uint32_t lba, uint32_t off, uint32_t cluster, uint32_t tam
     if (!b) return -1;
 
     uint8_t *d = b + off;
+    tocar(d);
     d[26] = (uint8_t)(cluster & 0xFF);
     d[27] = (uint8_t)(cluster >> 8);
     d[28] = (uint8_t)(tam & 0xFF);
@@ -1316,7 +1409,7 @@ static int igual_sin_caja(const char *a, const char *b)
 
 /* Localizar lo que nombra una ruta: fichero o directorio, da igual. */
 static int buscar(struct volumen *v, const char *ruta, uint32_t *cluster, uint32_t *tam,
-                  uint32_t *flags)
+                  uint32_t *flags, uint64_t *mtime)
 {
     /* El raiz no tiene entrada de directorio en ninguna parte: no es hijo
      * de nadie. Asi que no se puede buscar, hay que saberlo.
@@ -1331,6 +1424,7 @@ static int buscar(struct volumen *v, const char *ruta, uint32_t *cluster, uint32
         *cluster = 0;
         *tam     = 0;
         if (flags) *flags = FS_ES_DIR;
+        if (mtime) *mtime = 0;
         return 0;
     }
 
@@ -1347,6 +1441,7 @@ static int buscar(struct volumen *v, const char *ruta, uint32_t *cluster, uint32
     *cluster = le16(b + off + 26);
     *tam     = le32(b + off + 28);
     if (flags) *flags = (b[off + 11] & 0x10) ? FS_ES_DIR : 0;
+    if (mtime) *mtime = fecha_unix(le16(b + off + 24), le16(b + off + 22));
     return 0;
 }
 
@@ -1358,7 +1453,8 @@ static int resolver_dir(struct volumen *v, const char *ruta, uint32_t *dir)
     if (ruta[0] != '/') return -1;
 
     uint32_t cluster, tam, flags;
-    if (buscar(v, ruta, &cluster, &tam, &flags) < 0) return -1;
+    uint64_t mtime;
+    if (buscar(v, ruta, &cluster, &tam, &flags, &mtime) < 0) return -1;
     if (!(flags & FS_ES_DIR)) return -1;
     *dir = cluster;
     return 0;
@@ -1417,6 +1513,7 @@ static int listar(struct volumen *v, uint32_t dir, uint32_t indice, struct fs_in
 
             out->size  = le32(d + 28);
             out->flags = (d[11] & 0x10) ? FS_ES_DIR : 0;
+            out->mtime = fecha_unix(le16(d + 24), le16(d + 22));
             for (int i = 0; i < FS_NAME_MAX; i++) out->name[i] = nombre[i];
             return 0;
         }
@@ -1665,6 +1762,7 @@ int main(int argc, char **argv)
         struct fs_request *r = (struct fs_request *)pet.data;
         uint64_t quien = r->port;
         uint32_t cluster = 0, tam = 0, flags = 0;
+        uint64_t mtime = 0;
 
         r->name[FS_PATH_MAX - 1] = 0;         /* venga de donde venga */
 
@@ -1680,12 +1778,13 @@ int main(int argc, char **argv)
         switch (pet.type) {
 
         case FS_SIZE:
-            if (buscar(v, ruta, &cluster, &tam, &flags) < 0) {
+            if (buscar(v, ruta, &cluster, &tam, &flags, &mtime) < 0) {
                 responder(quien, FS_ERROR, "", 0);
             } else {
                 struct fs_info info;
                 info.size  = tam;
                 info.flags = flags;
+                info.mtime = mtime;
 
                 /* Solo la ultima componente: quien pregunta por
                  * "/DOCS/A.TXT" ya sabe la ruta, lo que no sabe es como
@@ -1698,7 +1797,7 @@ int main(int argc, char **argv)
             break;
 
         case FS_READ: {
-            if (buscar(v, ruta, &cluster, &tam, &flags) < 0 ||
+            if (buscar(v, ruta, &cluster, &tam, &flags, &mtime) < 0 ||
                 (flags & FS_ES_DIR)) {
                 responder(quien, FS_ERROR, "", 0);
                 break;

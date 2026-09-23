@@ -48,9 +48,9 @@
  * La ruta son 64 bytes: con 8.3 por componente eso da unos cinco niveles,
  * de sobra para un volumen FAT16. Lo que sobra es para los datos, que es
  * lo que escasea. */
-#define FS_PATH_MAX    64
+#define FS_PATH_MAX   256
 #define FS_NAME_MAX    64    /* una componente suelta, con nombre largo    */
-#define FS_CHUNK      176    /* bytes utiles por mensaje de lectura/escritura */
+#define FS_CHUNK      240    /* bytes utiles por mensaje de lectura/escritura */
 
 struct fs_request {
     unsigned long port;              /* a donde contestar                  */
@@ -66,7 +66,27 @@ struct fs_info {
     unsigned long size;
     unsigned long flags;             /* FS_ES_DIR si es un directorio      */
     char          name[FS_NAME_MAX]; /* solo la componente, no la ruta     */
+    unsigned long mtime;             /* segundos desde 1970, 0 si no hay   */
 };
+
+/* CAMPOS NUEVOS, AL FINAL. SIEMPRE.
+ *
+ * 'mtime' se metio primero entre flags y name, que es donde quedaba bonito.
+ * El resultado fue que un "ls" viejo -uno que quedo en la tarjeta de un
+ * paso anterior- leyo el nombre en el sitio donde ahora estaba la fecha y
+ * ensenyo esto:
+ *
+ *     ÍÚ³j             9080 bytes
+ *
+ * Esos cuatro bytes son 0x6AB3DACD al reves: el timestamp, leido como
+ * texto. Y el sintoma no se parecia en nada a la causa, hasta el punto de
+ * que parecia un fallo de FAT16.
+ *
+ * Poniendolo al final, un programa viejo sigue leyendo bien todo lo que
+ * ya conocia y simplemente no ve el campo nuevo. No es compatibilidad de
+ * verdad -para eso hace falta una version en el protocolo- pero convierte
+ * "basura silenciosa" en "una cosa de menos", que es toda la diferencia
+ * cuando hay binarios viejos rodando. */
 
 /* Ojo a la tension entre los dos tamanyos: una componente puede tener 63
  * caracteres pero la RUTA entera sigue midiendo 64. O sea que un nombre
