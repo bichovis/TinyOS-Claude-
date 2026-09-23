@@ -6,7 +6,8 @@
  * vector +0x400. Estos envoltorios son toda la "libc" que hay.
  */
 #pragma once
-#include "ipc_abi.h"        /* el contrato compartido con el kernel */
+#include "ipc_abi.h"
+#include "fs_abi.h"        /* el contrato compartido con el kernel */
 
 typedef unsigned long uint64_t;
 typedef long          int64_t;
@@ -144,6 +145,42 @@ static inline int64_t bootstrap(const char *nombre, char *const argv[],
 static inline int64_t consola(uint64_t pid)
 { return syscall2(SYS_consola, pid, 0); }
 
+/* Copiar una cadena con tope. Hace falta en varios programas. */
+static inline void ucopiar(char *dst, const char *src, uint64_t max)
+{
+    uint64_t i = 0;
+    while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+/* --- Ficheros, como los espera cualquier libc ------------------------
+ * Debajo siguen estando los mensajes al servidor; lo que cambia es que ya
+ * no hay que conocerlos para usar un fichero. */
+static inline int64_t stat(const char *ruta, struct estado *e)
+{ return syscall2(SYS_stat, (uint64_t)ruta, (uint64_t)e); }
+
+static inline int64_t lseek(int fd, int64_t desp, int desde)
+{ return syscall3(SYS_lseek, (uint64_t)fd, (uint64_t)desp, (uint64_t)desde); }
+
+static inline int64_t unlink(const char *ruta)
+{ return syscall2(SYS_unlink, (uint64_t)ruta, 0); }
+
+static inline int64_t mkdir(const char *ruta)
+{ return syscall2(SYS_mkdir, (uint64_t)ruta, 0); }
+
+static inline int64_t rmdir(const char *ruta)
+{ return syscall2(SYS_rmdir, (uint64_t)ruta, 0); }
+
+static inline int64_t rename(const char *origen, const char *destino)
+{ return syscall2(SYS_rename, (uint64_t)origen, (uint64_t)destino); }
+
+static inline int64_t opendir(const char *ruta)
+{ return syscall2(SYS_opendir, (uint64_t)ruta, 0); }
+
+/* 1 si hay entrada, 0 si se acabo, -1 si algo fue mal. */
+static inline int64_t readdir(int fd, struct fs_info *info)
+{ return syscall2(SYS_readdir, (uint64_t)fd, (uint64_t)info); }
+
 /* La hora, en segundos desde 1970. Ver SYS_time: en esta maquina es un
  * invento honesto, no un reloj. */
 static inline uint64_t ahora(void)  { return (uint64_t)syscall2(SYS_time, 0, 0); }
@@ -155,6 +192,14 @@ static inline const char *mmap(const char *ruta, uint64_t *tam)
 {
     int64_t r = syscall2(SYS_mmap, (uint64_t)ruta, (uint64_t)tam);
     return r < 0 ? 0 : (const char *)(uint64_t)r;
+}
+
+/* Memoria nueva, a cero y escribible. No la lee de ningun sitio: las
+ * paginas aparecen cuando se tocan. */
+static inline void *mmap_anon(uint64_t bytes)
+{
+    int64_t r = syscall2(SYS_mmap_anon, bytes, 0);
+    return r < 0 ? 0 : (void *)(uint64_t)r;
 }
 
 static inline int64_t munmap(const char *p)

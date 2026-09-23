@@ -25,29 +25,19 @@
 #include "syscall.h"
 #include "fs_abi.h"
 
-static struct message m;
-
 /* ¿Contesta ya el servidor de ficheros?
  *
  * Arrancarlo no es tenerlo: tiene que hablar con la tarjeta, leer el MBR
  * y montar dos volumenes, y eso tarda. Preguntar por algo que existe
  * seguro es la unica forma de saber que esta listo; un "sleep" generoso
- * seria adivinar. */
-static int fs_responde(int64_t puerto)
+ * seria adivinar.
+ *
+ * Y se pregunta con stat(), como haria cualquiera. Ni siquiera init tiene
+ * que saber como se habla con el servidor. */
+static int fs_responde(void)
 {
-    struct fs_request r;
-    r.port = (unsigned long)puerto;
-    r.arg  = 0;
-    for (int i = 0; i < FS_PATH_MAX; i++) r.name[i] = 0;
-    r.name[0] = '/';
-
-    m.type = FS_SIZE;
-    m.len  = 0;
-    memcpy(m.data, (const char *)&r, sizeof(r));
-
-    if (msg_send(PORT_FILES, &m) < 0) return 0;
-    if (msg_recv((uint64_t)puerto, &m) < 0) return 0;
-    return m.type == FS_OK;
+    struct estado e;
+    return stat("/", &e) == 0;
 }
 
 /* Leer /etc/rc y meter en el entorno cada linea "NOMBRE=valor".
@@ -106,12 +96,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int64_t mio = port_create(-1);
-    if (mio < 0) { printf("  [init] sin puertos\n"); return 1; }
-
     /* 3. Esperarlo, preguntando. */
     int vueltas = 0;
-    while (!fs_responde(mio)) {
+    while (!fs_responde()) {
         if (++vueltas > 200) {           /* 200 x 25 ms = 5 segundos */
             printf("  [init] el servidor de ficheros no contesta\n");
             break;

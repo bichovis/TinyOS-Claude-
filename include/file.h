@@ -26,7 +26,7 @@ struct pipe {
     struct waitqueue hay_hueco;
 };
 
-enum { F_LIBRE = 0, F_CONSOLA, F_PIPE_R, F_PIPE_W, F_FICHERO };
+enum { F_LIBRE = 0, F_CONSOLA, F_PIPE_R, F_PIPE_W, F_FICHERO, F_DIRECTORIO };
 
 /* Un descriptor guarda la RUTA ENTERA, ya absoluta. Cabe de sobra, porque
  * el servidor no admite ninguna mas larga. */
@@ -68,6 +68,21 @@ int fs_es_directorio(const char *ruta);
 
 /* Abre un fichero de la tarjeta. modo es O_LEER u O_ESCRIBIR. */
 struct fichero *file_open(const char *nombre, int modo);
+
+/* Y un directorio, para recorrerlo. Un descriptor de directorio es lo
+ * mismo que uno de fichero con otra cosa dentro: en vez de por que byte
+ * vamos, por que ENTRADA vamos. */
+struct fichero *file_opendir(const char *ruta);
+int  file_readdir(struct fichero *f, void *info);
+
+int64_t file_seek(struct fichero *f, int64_t desplazamiento, int desde);
+
+/* Las operaciones sobre el nombre, que no necesitan descriptor. */
+int  fs_borrar(const char *ruta);
+int  fs_mkdir(const char *ruta);
+int  fs_rmdir(const char *ruta);
+int  fs_renombrar(const char *origen, const char *destino);
+int  fs_estado(const char *ruta, uint64_t *tam, uint64_t *mtime, uint64_t *flags);
 
 /* Crea una tuberia y devuelve sus dos extremos. 0 si va bien. */
 int     file_pipe(struct fichero **lectura, struct fichero **escritura);

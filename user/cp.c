@@ -1,44 +1,12 @@
-/* user/cp.c - Copiar un fichero de la tarjeta
+/* user/cp.c - Copiar un fichero
  *
- *   cp HELLO.ELF COPIA.ELF
- *
- * Lee de uno y escribe en otro, de trozo en trozo, sin guardarse el
- * fichero entero en memoria. Es la primera orden que mueve volumen de
- * verdad: copiar 8 KB son casi noventa idas y venidas por el IPC y varios
- * clusters encadenados en la FAT.
+ * Leer de uno y escribir en otro, que es literalmente lo que dice el
+ * nombre. Antes habia que componer peticiones para las dos mitades; ahora
+ * son dos descriptores y un bucle.
  */
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
 #include "syscall.h"
-#include "fs_abi.h"
-
-static struct message m;
-static int64_t        mio;
-static char           trozo[FS_CHUNK];
-
-/* Una peticion y su respuesta. Devuelve el tipo, y deja los datos (si los
- * hay) en m.data con m.len bytes. */
-static uint64_t pedir(uint64_t tipo, const char *nombre, uint64_t arg,
-                      const char *datos, uint64_t n)
-{
-    struct fs_request r;
-    r.port = (unsigned long)mio;
-    r.arg  = arg;
-
-    for (int i = 0; i < FS_PATH_MAX; i++) r.name[i] = 0;
-    memcpy(r.name, nombre, strlen(nombre) + 1);
-    for (uint64_t i = 0; i < FS_CHUNK; i++)
-        r.data[i] = (i < n && datos) ? datos[i] : 0;
-
-    m.type = tipo;
-    m.len  = n;
-    memcpy(m.data, (const char *)&r, sizeof(r));
-
-    if (msg_send(PORT_FILES, &m) < 0)    return FS_ERROR;
-    if (msg_recv((uint64_t)mio, &m) < 0) return FS_ERROR;
-    return m.type;
-}
 
 int main(int argc, char **argv)
 {
@@ -47,48 +15,37 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    mio = port_create(-1);
-    if (mio < 0) { printf("  [cp] sin puertos\n"); exit(1); }
+    int64_t o = openf(argv[1], O_LEER);
+    if (o < 0) { printf("\n  %s: no esta en la tarjeta\n", argv[1]); return 1; }
 
-    char ra[FS_PATH_MAX], rb[FS_PATH_MAX];
-    if (realpath(argv[1], ra) < 0 || realpath(argv[2], rb) < 0) {
-        printf("  [cp] ruta imposible\n");
-        exit(1);
-    }
-    const char *origen  = ra;
-    const char *destino = rb;
-
-    if (pedir(FS_SIZE, origen, 0, 0, 0) != FS_OK) {
-        printf("\n  ");
-        printf("%s", origen);
-        printf(": no esta en la tarjeta\n");
-        exit(1);
+    /* O_ESCRIBIR crea el fichero, y si ya estaba lo vacia. Eso es lo que
+     * significa copiar encima de algo. */
+    int64_t d = openf(argv[2], O_ESCRIBIR);
+    if (d < 0) {
+        printf("\n  no puedo escribir %s\n", argv[2]);
+        closefd((int)o);
+        return 1;
     }
 
-    if (pedir(FS_CREATE, destino, 0, 0, 0) != FS_OK) {
-        printf("\n  [cp] no he podido crear el destino\n");
-        exit(1);
-    }
+    char buf[256];
+    uint64_t total = 0;
+    int64_t n;
 
-    uint64_t off = 0;
-    for (;;) {
-        if (pedir(FS_READ, origen, off, 0, 0) != FS_OK) break;
-        if (m.len == 0) break;
-
-        uint64_t n = m.len;
-        for (uint64_t i = 0; i < n; i++) trozo[i] = m.data[i];
-
-        if (pedir(FS_WRITE, destino, off, trozo, n) != FS_OK) {
-            printf("\n  [cp] la tarjeta ha fallado escribiendo\n");
-            exit(1);
+    while ((n = read((int)o, buf, sizeof(buf))) > 0) {
+        for (int64_t p = 0; p < n; ) {
+            int64_t k = write((int)d, buf + p, (uint64_t)(n - p));
+            if (k <= 0) { printf("\n  se acabo el sitio\n"); n = -1; break; }
+            p += k;
         }
-        off += n;
+        if (n < 0) break;
+        total += (uint64_t)n;
     }
 
-    printf("\n  copiados ");
-    printf("%lu", off);
-    printf(" bytes en ");
-    printf("%s", destino);
-    printf("\n");
-    exit(0);
+    closefd((int)o);
+    closefd((int)d);
+
+    if (n < 0) return 1;
+
+    printf("\n  %s -> %s, %lu bytes\n", argv[1], argv[2], total);
+    return 0;
 }

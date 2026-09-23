@@ -154,6 +154,56 @@ struct message {
 #define SYS_time         37   /* () -> segundos desde 1970                  */
 #define SYS_settime      38   /* (segundos) -> 0 | -1   (solo init)         */
 
+/* Memoria nueva, a cero, escribible, y traida segun se toque.
+ *
+ * sbrk mueve UN tope: la memoria es un bloque contiguo que crece y
+ * encoge por arriba. Eso basta para un malloc pequenyo y se queda corto
+ * en cuanto alguien quiere un arena grande y poder soltarlo entero sin
+ * esperar a que se vacie lo que hay encima.
+ *
+ * mmap anonimo da tramos independientes: cada uno se pide, se usa y se
+ * suelta por su cuenta. Es como reserva memoria cualquier compilador, y
+ * por eso esta aqui. */
+#define SYS_mmap_anon    47   /* (bytes) -> direccion | -1                  */
+
+/* --- La superficie de fichero que espera una libc ---------------------
+ *
+ * Hasta aqui, cualquier programa que quisiera borrar un fichero tenia que
+ * saber COMO se habla con el servidor: componer un struct fs_request,
+ * crear un puerto, mandar el mensaje y esperar la respuesta. Cuarenta
+ * lineas para un unlink.
+ *
+ * Eso esta bien cuando el que escribe el programa esta aprendiendo como
+ * funciona un servidor de ficheros. Deja de estarlo en cuanto quieres
+ * portar codigo que ya existe: newlib no sabe nada de puertos, sabe de
+ * unlink(), stat() y lseek().
+ *
+ * El kernel ya hacia de intermediario para open, read y write. Estas
+ * completan el juego. La IPC sigue ahi debajo, intacta: lo que cambia es
+ * que ya no hay que conocerla para usar un fichero. */
+#define SYS_stat         39   /* (ruta, struct estado *) -> 0 | -1          */
+#define SYS_lseek        40   /* (fd, desplazamiento, desde) -> posicion    */
+#define SYS_unlink       41   /* (ruta) -> 0 | -1                           */
+#define SYS_mkdir        42   /* (ruta) -> 0 | -1                           */
+#define SYS_rmdir        43   /* (ruta) -> 0 | -1                           */
+#define SYS_rename       44   /* (origen, destino) -> 0 | -1                */
+#define SYS_opendir      45   /* (ruta) -> fd | -1                          */
+#define SYS_readdir      46   /* (fd, struct fs_info *) -> 1 | 0 | -1       */
+
+/* Desde donde cuenta lseek. Los tres de siempre. */
+#define DESDE_INICIO      0
+#define DESDE_ACTUAL      1
+#define DESDE_FINAL       2
+
+/* Lo que se sabe de un fichero. Poco, porque poco hay: FAT no guarda
+ * duenyo, ni permisos, ni enlaces. Inventar campos que siempre valen lo
+ * mismo seria fingir que este sistema tiene cosas que no tiene. */
+struct estado {
+    unsigned long tam;
+    unsigned long mtime;        /* segundos desde 1970, 0 si no hay */
+    unsigned long flags;        /* FS_ES_DIR */
+};
+
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */
 

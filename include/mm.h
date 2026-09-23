@@ -55,7 +55,21 @@
  * 0 y el 1) y de la ventana de pruebas de kernel.c (el 3).
  */
 #define KSTACK_AREA      (KERNEL_VA_BASE + 0x100000000UL)
-#define KSTACK_SLOT      (2 * PAGE_SIZE)   /* guarda + pila */
+/* La pila de kernel de cada hilo: una pagina de guarda debajo y DOS de
+ * pila encima.
+ *
+ * Era una sola pagina, y dejo de bastar en el paso 45. No porque el kernel
+ * hiciera mas cosas, sino porque las cosas que maneja crecieron: las rutas
+ * pasaron de 64 a 256 bytes y los mensajes de 128 a 512, asi que un marco
+ * con dos rutas y un mensaje se come 1 KB largo. Con tres o cuatro marcos
+ * anidados -despachador, operacion, transaccion- la suma se pasaba.
+ *
+ * Se encontro estrellandose contra la guarda, que es exactamente para lo
+ * que esta ahi desde el paso 22. Sin ella habria sido una escritura
+ * silenciosa encima de otra tarea, y el fallo habria aparecido mucho
+ * despues y en otro sitio. */
+#define KSTACK_PAGINAS   2
+#define KSTACK_SLOT      ((1 + KSTACK_PAGINAS) * PAGE_SIZE)   /* guarda + pila */
 
 /* --- Indices dentro de MAIR_EL1 ---------------------------------------
  * MAIR es una tabla de 8 "tipos de memoria". Cada descriptor de pagina no

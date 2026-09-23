@@ -78,6 +78,19 @@ static int copiar_ruta(char *dst, uint64_t uva)
     return copiar_cadena(dst, uva, FS_PATH_MAX);
 }
 
+/* Traerse una ruta del proceso Y resolverla contra su directorio actual.
+ *
+ * Las dos cosas van siempre juntas, y juntarlas ahorra un buffer de 256
+ * bytes en cada sitio que la use. Eso importa aqui mas de lo que parece:
+ * el despachador de llamadas es UNA funcion con un switch enorme, y el
+ * compilador puede reservar a la vez el sitio de todas las ramas. */
+static int traer_ruta(uint64_t uva, char *abs)
+{
+    char rel[FS_PATH_MAX];
+    if (copiar_ruta(rel, uva) < 0) return -1;
+    return path_resolve(current->cwd, rel, abs, FS_PATH_MAX);
+}
+
 static int copiar_args(struct args *a, uint64_t uargv)
 {
     a->n = 0;
@@ -100,6 +113,115 @@ static int copiar_args(struct args *a, uint64_t uargv)
         a->n++;
     }
     return 0;
+}
+
+/* Las seis operaciones que empiezan por una ruta, en una sola funcion.
+ *
+ * No es por ahorrar lineas: es por la PILA. Cada una necesita una o dos
+ * rutas de 256 bytes, y el compilador no siempre reaprovecha el hueco
+ * entre ramas de un switch. Con las seis dentro del despachador, la suma
+ * de todas puede reservarse a la vez, y la pila de kernel son 4 KB con una
+ * pagina de guarda debajo.
+ *
+ * Se encontro de la unica forma en que se encuentran estas cosas:
+ * estrellandose contra la guarda. Que el kernel dijera "desbordamiento de
+ * pila de kernel" en vez de corromper la tarea de al lado es exactamente
+ * por lo que se puso esa pagina en el paso 22. */
+static int64_t por_nombre(uint64_t nr, struct trap_frame *f)
+{
+    char abs[FS_PATH_MAX];
+    if (traer_ruta(f->x[0], abs) < 0) return -1;
+
+    switch (nr) {
+    case SYS_unlink: return fs_borrar(abs);
+    case SYS_mkdir:  return fs_mkdir(abs);
+    case SYS_rmdir:  return fs_rmdir(abs);
+
+    case SYS_stat: {
+        struct estado e = { 0, 0, 0 };
+        if (fs_estado(abs, &e.tam, &e.mtime, &e.flags) < 0) return -1;
+        return copy_to_user(f->x[1], &e, sizeof(e)) == 0 ? 0 : -1;
+    }
+
+    case SYS_opendir: {
+        struct fichero *fi = file_opendir(abs);
+        if (!fi) return -1;
+
+        int fd = task_fd_alloc(fi);
+        if (fd < 0) file_close(fi);
+        return fd;
+    }
+
+    case SYS_rename: {
+        /* El destino reaprovecha 'rel': ya no hace falta para nada, y son
+         * 256 bytes menos en una pila que va justa. */
+        char destino[FS_PATH_MAX];
+        if (traer_ruta(f->x[1], destino) < 0) return -1;
+        return fs_renombrar(abs, destino);
+    }
+    }
+    return -1;
+}
+
+/* exec y spawn, fuera del despachador y por el mismo motivo que
+ * por_nombre: cada uno necesita DOS struct args de 292 bytes -los
+ * argumentos y el entorno- y en la pila de kernel eso se nota. */
+static int64_t sys_spawn(struct trap_frame *f)
+{
+    uint64_t buf = f->x[0], len = f->x[1];
+
+    if (len == 0 || len > 256 * 1024) return -1;
+    if (!user_rango(buf, len))         return -1;
+
+    struct args args, entorno;
+    if (copiar_args(&args, f->x[2]) < 0)    return -1;
+    if (copiar_args(&entorno, f->x[3]) < 0) return -1;
+
+    return task_create_user(0, (const uint8_t *)buf, len, 0, &args, &entorno);
+}
+
+static int64_t sys_exec(struct trap_frame *f)
+{
+    uint64_t buf = f->x[0], len = f->x[1];
+
+    if (len == 0 || len > 1024 * 1024) return -1;
+    if (!user_rango(buf, len))         return -1;
+
+    /* Los dos lotes se copian ANTES de tocar nada del proceso, que es lo
+     * unico que hace segura esta llamada: exec destruye el espacio de
+     * direcciones de donde salen.
+     *
+     * Y el entorno se copia igual que los argumentos, no se hereda solo:
+     * exec lo REEMPLAZA. Que en la practica casi siempre sea el mismo es
+     * cosa del shell, que le pasa el suyo; el kernel no da nada por
+     * hecho. */
+    struct args args, entorno;
+    if (copiar_args(&args, f->x[2]) < 0)    return -1;
+    if (copiar_args(&entorno, f->x[3]) < 0) return -1;
+
+    return task_exec((const uint8_t *)buf, len, &args, &entorno, f);
+}
+
+/* Y bootstrap, por lo mismo: dos struct args mas. */
+static int64_t sys_bootstrap(struct trap_frame *f)
+{
+    /* La comprobacion es una linea, y es toda la frontera de privilegio
+     * que hay entre procesos en este sistema: hay el primero y hay los
+     * demas. Basta porque init es el unico que puede existir antes de que
+     * exista nadie mas. */
+    if (!current || current->pid != task_init_pid()) return -1;
+
+    char nombre[16];
+    if (copiar_cadena(nombre, f->x[0], sizeof(nombre)) < 0) return -1;
+
+    struct args args, entorno;
+    if (copiar_args(&args, f->x[1]) < 0)    return -1;
+    if (copiar_args(&entorno, f->x[2]) < 0) return -1;
+
+    /* argv vacio: que el programa se llame como pidio init. */
+    if (args.n == 0) args_de_cadena(&args, nombre);
+
+    return task_bootstrap(nombre, &args, &entorno, f->x[3]);
 }
 
 static int64_t sys_send(uint64_t port, uint64_t umsg)
@@ -196,19 +318,9 @@ void syscall_dispatch(struct trap_frame *f)
      * dentro de SU syscall. task_create_user() copia de ahi a las paginas
      * del hijo. Si nos desalojan a medias, al volver TTBR0 vuelve con
      * nosotros. */
-    case SYS_spawn: {
-        uint64_t buf = f->x[0], len = f->x[1], uargs = f->x[2];
-
-        if (len == 0 || len > 256 * 1024) { ret = -1; break; }
-        if (!user_rango(buf, len))        { ret = -1; break; }
-
-        struct args args, entorno;
-        if (copiar_args(&args, uargs) < 0)            { ret = -1; break; }
-        if (copiar_args(&entorno, f->x[3]) < 0)       { ret = -1; break; }
-
-        ret = task_create_user(0, (const uint8_t *)buf, len, 0, &args, &entorno);
+    case SYS_spawn:
+        ret = sys_spawn(f);
         break;
-    }
 
     /* Un driver de EL0 no puede hablar con el buzon de la GPU: el buzon es
      * uno solo para toda la maquina y darlo entero seria dar el control de
@@ -262,30 +374,9 @@ void syscall_dispatch(struct trap_frame *f)
 
     /* Convertirse en otro programa. Si sale bien no "vuelve": el frame que
      * se restaura al salir de aqui ya es el del programa nuevo. */
-    case SYS_exec: {
-        uint64_t buf = f->x[0], len = f->x[1], uargs = f->x[2];
-
-        if (len == 0 || len > 1024 * 1024) { ret = -1; break; }
-        if (!user_rango(buf, len))         { ret = -1; break; }
-
-        /* Los argumentos se copian ANTES de tocar nada del proceso, que
-         * es lo unico que hace segura esta llamada: exec destruye el
-         * espacio de direcciones de donde salen. */
-        /* Los dos lotes se copian ANTES de tocar nada del proceso, que es
-         * lo unico que hace segura esta llamada: exec destruye el espacio
-         * de direcciones de donde salen.
-         *
-         * Y el entorno se copia igual que los argumentos, no se hereda
-         * solo: exec lo REEMPLAZA. Que en la practica casi siempre sea el
-         * mismo es cosa del shell, que le pasa el suyo; el kernel no da
-         * nada por hecho. */
-        struct args args, entorno;
-        if (copiar_args(&args, uargs) < 0)      { ret = -1; break; }
-        if (copiar_args(&entorno, f->x[3]) < 0) { ret = -1; break; }
-
-        ret = task_exec((const uint8_t *)buf, len, &args, &entorno, f);
+    case SYS_exec:
+        ret = sys_exec(f);
         break;
-    }
 
     case SYS_sbrk:
         ret = (int64_t)task_sbrk((int64_t)f->x[0]);
@@ -342,9 +433,8 @@ void syscall_dispatch(struct trap_frame *f)
      * existe. */
 
     case SYS_chdir: {
-        char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
-        if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
-        if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
+        char abs[FS_PATH_MAX];
+        if (traer_ruta(f->x[0], abs) < 0) { ret = -1; break; }
 
         /* Y comprobar que existe Y es un directorio. Sin esto, un "cd
          * nada" dejaria al proceso apuntando a un sitio inventado y el
@@ -365,9 +455,8 @@ void syscall_dispatch(struct trap_frame *f)
     }
 
     case SYS_realpath: {
-        char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
-        if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
-        if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
+        char abs[FS_PATH_MAX];
+        if (traer_ruta(f->x[0], abs) < 0) { ret = -1; break; }
         if (copy_to_user(f->x[1], abs, FS_PATH_MAX) != 0) { ret = -1; break; }
         ret = 0;
         break;
@@ -376,9 +465,8 @@ void syscall_dispatch(struct trap_frame *f)
     /* Mapear un fichero. La ruta se resuelve aqui, como en open: el
      * servidor solo entiende absolutas. */
     case SYS_mmap: {
-        char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
-        if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
-        if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
+        char abs[FS_PATH_MAX];
+        if (traer_ruta(f->x[0], abs) < 0) { ret = -1; break; }
 
         uint64_t tam = 0;
         int64_t base = task_mmap(abs, &tam);
@@ -401,22 +489,9 @@ void syscall_dispatch(struct trap_frame *f)
      * unico que puede existir antes de que exista nadie mas. En cuanto
      * hiciera falta un segundo proceso de confianza, esto se quedaria
      * corto y habria que inventar algo de verdad. */
-    case SYS_bootstrap: {
-        if (!current || current->pid != task_init_pid()) { ret = -1; break; }
-
-        char nombre[16];
-        if (copiar_cadena(nombre, f->x[0], sizeof(nombre)) < 0) { ret = -1; break; }
-
-        struct args args, entorno;
-        if (copiar_args(&args, f->x[1]) < 0)    { ret = -1; break; }
-        if (copiar_args(&entorno, f->x[2]) < 0) { ret = -1; break; }
-
-        /* argv vacio: que el programa se llame como pidio init. */
-        if (args.n == 0) args_de_cadena(&args, nombre);
-
-        ret = task_bootstrap(nombre, &args, &entorno, f->x[3]);
+    case SYS_bootstrap:
+        ret = sys_bootstrap(f);
         break;
-    }
 
     case SYS_consola:
         if (!current || current->pid != task_init_pid()) { ret = -1; break; }
@@ -435,6 +510,37 @@ void syscall_dispatch(struct trap_frame *f)
         if (!current || current->pid != task_init_pid()) { ret = -1; break; }
         reloj_poner(f->x[0]);
         ret = 0;
+        break;
+
+    /* --- Ficheros por su nombre ------------------------------------
+     * Las cinco son la misma forma: traerse la ruta, resolverla contra el
+     * directorio actual, y pasarsela al servidor. La resolucion se hace
+     * aqui y no abajo porque el cwd es del proceso y el servidor no tiene
+     * estado. */
+    case SYS_stat:
+    case SYS_unlink:
+    case SYS_mkdir:
+    case SYS_rmdir:
+    case SYS_rename:
+    case SYS_opendir:
+        ret = por_nombre(nr, f);
+        break;
+
+    case SYS_readdir: {
+        struct fs_info info;
+        int r = file_readdir(task_fd((int)f->x[0]), &info);
+        if (r != 1) { ret = r; break; }
+        if (copy_to_user(f->x[1], &info, sizeof(info)) != 0) { ret = -1; break; }
+        ret = 1;
+        break;
+    }
+
+    case SYS_lseek:
+        ret = file_seek(task_fd((int)f->x[0]), (int64_t)f->x[1], (int)f->x[2]);
+        break;
+
+    case SYS_mmap_anon:
+        ret = task_mmap_anon(f->x[0]);
         break;
 
     case SYS_munmap:

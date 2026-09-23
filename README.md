@@ -99,6 +99,8 @@ Tres cosas que QEMU perdona y el silicio no:
 | 42   | init: el kernel deja de saber que es un shell| hecho |
 | 43   | Una sola puerta, y fuera las demostraciones | hecho  |
 | 44   | Rutas largas y un reloj inventado           | hecho  |
+| 45   | La superficie de fichero que espera una libc| hecho  |
+| 46   | Memoria anonima, y el ultimo programa sin IPC| hecho |
 
 ## Estructura
 
@@ -3137,7 +3139,155 @@ el nombre lleva una barra, no se busca en ningun sitio.** `./prog` y
 `/usr/bin/prog` dicen exactamente donde estan, y ponerse a buscar seria
 desobedecer.
 
+## La superficie que espera una libc
+
+Hasta aqui, un programa que quisiera borrar un fichero tenia que saber
+COMO se habla con el servidor: crear un puerto, componer un
+`struct fs_request`, mandar el mensaje, esperar la respuesta. Cincuenta
+lineas para un `unlink`.
+
+Eso esta bien mientras el que escribe el programa esta aprendiendo como
+funciona un servidor de ficheros. Deja de estarlo en cuanto quieres portar
+codigo que ya existe: **newlib no sabe nada de puertos**, sabe de
+`unlink()`, `stat()` y `lseek()`.
+
+El kernel ya hacia de intermediario para `open`, `read` y `write`. Ahora
+tambien para `stat`, `lseek`, `unlink`, `mkdir`, `rmdir`, `rename`,
+`opendir` y `readdir`. La IPC sigue ahi debajo, intacta; lo que cambia es
+que ya no hay que conocerla.
+
+Se nota al pesarlo:
+
+| programa | antes | ahora |
+|----------|-------|-------|
+| `rm`     | 55    | 35    |
+| `mkdir`  | 51    | 18    |
+| `rmdir`  | 51    | 25    |
+| `mv`     | 94    | 46    |
+| `ls`     | 101   | 82    |
+
+**Un directorio abierto es un descriptor con un indice dentro.** El
+protocolo del servidor pide las entradas de una en una por numero, asi que
+el descriptor solo tiene que acordarse de por cual iba. Que eso quepa en
+la misma `struct fichero` que un fichero normal no es casualidad: *"lo que
+un proceso tiene abierto"* es un concepto, y los tipos son variaciones
+suyas.
+
+**Y `lseek` solo vale en un fichero.** Una tuberia no se puede rebobinar
+-los bytes ya no estan- y la consola tampoco. Devolver un error ahi no es
+una carencia: es la verdad.
+
+`struct estado` tiene tres campos: tamanyo, fecha y si es un directorio.
+FAT no guarda duenyo, ni permisos, ni enlaces, e inventar campos que
+siempre valen lo mismo seria fingir que este sistema tiene cosas que no
+tiene.
+
+## La pila del kernel se quedo pequenya
+
+El paso anterior multiplico por cuatro el tamanyo de las rutas (64 a 256)
+y por dos el de los mensajes (256 a 512). Las llamadas nuevas empezaron a
+estrellarse:
+
+```
+    *** PANIC: desbordamiento de pila de kernel ***
+```
+
+Nadie habia escrito codigo mas profundo. Lo que paso es que **los datos
+que maneja el kernel crecieron y la pila no**. Un marco con dos rutas y un
+mensaje se come 1 KB largo, y hay tres anidados: el despachador, la
+operacion y la transaccion con el servidor.
+
+Se arreglo por dos sitios, y los dos hacian falta:
+
+- **Menos sitio por marco.** El mensaje de `fs_transaccion` pasa a ser
+  `static`, y es seguro porque ya lo era: `fs_mtx` garantiza una
+  transaccion a la vez, asi que no hay con quien compartirlo mal. Las
+  operaciones por nombre se unifican en una funcion -no por ahorrar
+  lineas, sino porque el compilador puede reservar a la vez el sitio de
+  todas las ramas de un `switch`-. El marco del despachador baja de 1168 a
+  928 bytes.
+
+- **Mas pila.** De una pagina a dos. Micro-optimizar marcos es pelear con
+  el sintoma: si los datos son cuatro veces mas grandes, la pila que los
+  maneja tiene que crecer. Cuesta 4 KB por hilo en una maquina de 960 MB.
+
+**Y lo encontro la pagina de guarda**, que lleva ahi desde el paso 22 sin
+hacer nada. Sin ella esto habria sido una escritura silenciosa encima de
+la tarea de al lado, y el fallo habria aparecido mucho despues, en otro
+sitio y sin relacion aparente. Una red que no se usa en veintitres pasos y
+sirve una vez ya ha pagado su coste.
+
+## Memoria anonima
+
+`sbrk` mueve **un** tope: la memoria de un proceso es un bloque contiguo
+que crece y encoge por arriba. Basta para un `malloc` pequenyo y se queda
+corto en cuanto alguien quiere un arena grande y poder soltarlo entero sin
+esperar a que se vacie lo que hay encima.
+
+`mmap` anonimo da tramos independientes: cada uno se pide, se usa y se
+suelta por su cuenta. Es como reserva memoria cualquier compilador, y por
+eso hace falta.
+
+Por dentro es el mismo mecanismo que mapear un fichero, con la pagina
+saliendo del gestor de paginas en vez del servidor. Y eso lo hace **mucho
+mas barato**: no hay mensaje, no hay espera, no hay nadie de quien
+depender.
+
+```
+    / $ map -m
+      100 MB reservados en 0x30000000
+      paginas libres: 245423 antes -> 245423 despues de reservar
+      (reservar no gasta memoria: no se ha tocado nada)
+
+      escribo en 256 paginas repartidas -> quedan 245117
+      gastadas: 306 paginas para 256 tocadas
+      lo escrito se relee y el resto esta a cero: ok
+```
+
+Reservar cien megas cuesta **cero paginas**. Tocar 256 repartidas cuesta
+306: las 50 de mas son tablas de nivel 3, una por cada 2 MB de direcciones
+tocadas. Ese es el precio de escribir salteado en vez de seguido, y se ve
+aqui porque las paginas se cuentan.
+
+**Y un cliff que habria aparecido tarde.** La primera version ponia cada
+tramo detras del ultimo y nunca miraba atras. Mas simple, y funciona
+hasta que alguien reserva y suelta muchas veces: cada vuelta consume
+direcciones que ya no vuelven, y a los 128 MB de la zona se acaba el sitio
+**aunque no haya nada mapeado**. Un compilador hace exactamente eso miles
+de veces.
+
+Ahora se busca el primer hueco que valga, y la prueba lo comprueba:
+
+```
+      veinte vueltas de reservar y soltar:
+        siempre en 0x30000000: ok
+```
+
+## El ultimo programa sin IPC
+
+Con `cat`, `cp` y `write` pasados a `open`/`read`/`write`, ya no queda
+ningun programa que sepa componer un `fs_request`. Los que hablan por
+puerto son los que tienen que hacerlo: el servidor de ficheros, el de
+consola y sus clientes.
+
+| programa | antes | ahora |
+|----------|-------|-------|
+| `cat`    | 60    | 43    |
+| `cp`     | 94    | 51    |
+| `write`  | 89    | 38    |
+
+Y `cat` gana algo que antes no podia tener: **funciona con lo que sea que
+haya detras del descriptor**. Si le dan una tuberia en vez de un fichero,
+no se entera. Eso no es que se haya anyadido: es lo que aparece cuando
+dejas de hablar con un servidor concreto y empiezas a hablar con un
+descriptor.
+
 ## Limitaciones conocidas
+
+- `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
+  se crearon para mapearlas. Son 50 por cada 100 MB tocados salteado, y se
+  recuperan al morir el proceso. Liberarlas exige contar cuantas entradas
+  quedan vivas en cada tabla.
 
 - El reloj arranca siempre en la misma base: dos sesiones seguidas empiezan
   a la misma hora, asi que un fichero de ayer puede parecer mas nuevo que
@@ -3147,6 +3297,8 @@ desobedecer.
   el sistema no sabe cual es.
 - La lista de programas esta escrita tres veces en el Makefile (UPROGS,
   sdtest y sdcard). Ya se han desincronizado una vez.
+- No hay `stat` sobre un descriptor abierto (`fstat`), ni permisos, ni
+  duenyo: FAT no los guarda.
 
 - La unica frontera de privilegio entre procesos es "eres init o no eres
   init". Sin usuarios, sin grupos y sin capacidades.

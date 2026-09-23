@@ -14,10 +14,78 @@
 #include <stdlib.h>
 #include "syscall.h"
 
+/* La otra mitad: memoria, no fichero.
+ *
+ * Lo que hay que mirar es CUANDO se paga. Reservar cien megas no cuesta
+ * nada -ni una pagina- porque no se ha leido ni escrito en ellos. El
+ * gasto aparece al tocarlos, pagina a pagina, y desaparece entero al
+ * soltar el tramo. */
+static int memoria(void)
+{
+    uint64_t antes = freepages();
+
+    const uint64_t MEGAS = 100;
+    char *p = mmap_anon(MEGAS * 1024 * 1024);
+    if (!p) { printf("\n  no he podido reservar %lu MB\n", MEGAS); return 1; }
+
+    printf("\n  %lu MB reservados en 0x%lx\n", MEGAS, (uint64_t)p);
+    printf("  paginas libres: %lu antes -> %lu despues de reservar\n",
+           antes, freepages());
+    printf("  (reservar no gasta memoria: no se ha tocado nada)\n");
+
+    /* Escribir una pagina de cada cien, repartidas por todo el tramo. */
+    uint64_t tocadas = 0;
+    for (uint64_t i = 0; i < MEGAS * 1024 * 1024; i += 100 * 4096) {
+        p[i] = (char)(i & 0xFF);
+        tocadas++;
+    }
+
+    uint64_t despues = freepages();
+    printf("\n  escribo en %lu paginas repartidas -> quedan %lu\n",
+           tocadas, despues);
+    printf("  gastadas: %lu paginas para %lu tocadas\n", antes - despues, tocadas);
+
+    /* Y comprobar que lo escrito sigue ahi, y que el resto esta a cero. */
+    int bien = 1;
+    for (uint64_t i = 0; i < MEGAS * 1024 * 1024; i += 100 * 4096)
+        if (p[i] != (char)(i & 0xFF)) bien = 0;
+    if (p[4096] != 0) bien = 0;               /* una que no se toco */
+
+    printf("  lo escrito se relee y el resto esta a cero: %s\n",
+           bien ? "ok" : "MAL");
+
+    munmap(p);
+    printf("  tras soltarlo        -> quedan %lu paginas\n", freepages());
+
+    /* Y lo que de verdad importa para un programa que reserva mucho: que
+     * las direcciones se REUTILICEN. Si cada vuelta consumiera sitio
+     * nuevo, a las pocas decenas se acabarian los 128 MB de la zona
+     * aunque no hubiera nada mapeado. */
+    printf("\n  veinte vueltas de reservar y soltar:\n    ");
+    void *primera = 0;
+    int iguales = 1;
+
+    for (int i = 0; i < 20; i++) {
+        void *q = mmap_anon(4 * 1024 * 1024);
+        if (!q) { printf("se acabo el sitio en la vuelta %d\n", i); return 1; }
+        if (!primera) primera = q;
+        else if (q != primera) iguales = 0;
+        munmap(q);
+    }
+
+    printf("siempre en 0x%lx: %s\n", (uint64_t)primera, iguales ? "ok" : "MAL");
+    printf("  paginas libres al final: %lu\n", freepages());
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && argv[1][0] == '-' && argv[1][1] == 'm')
+        return memoria();
+
     if (argc < 2) {
         printf("\n  uso: map FICHERO      (map -w FICHERO intenta escribir)\n");
+        printf("       map -m           (memoria anonima, sin fichero)\n");
         exit(1);
     }
 

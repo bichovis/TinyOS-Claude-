@@ -20,10 +20,8 @@
 
 #define MAX_LINEA   128
 
-static struct message m;
 static char           linea[MAX_LINEA];
 static char           nombre[FS_PATH_MAX];
-static int64_t        mi_puerto;
 
 
 
@@ -96,31 +94,19 @@ static void nombre_de(const char *orden)
  * sitio equivocado. */
 static const char *motivo;
 
+/* Cuanto mide un fichero, o 0 si no esta.
+ *
+ * Aqui habia veinticinco lineas de componer un fs_request y mandarlo por
+ * un puerto. Con stat() el shell deja de ser un cliente del servidor de
+ * ficheros y pasa a ser un programa normal: el unico que sabe como se
+ * habla con ese servidor es el kernel, y el unico que sabe lo que dicen
+ * los mensajes es el propio servidor. */
 static uint64_t tamano_de(const char *fichero)
 {
-    struct fs_request r;
-    r.port = (unsigned long)mi_puerto;
-    r.arg  = 0;
-    for (int i = 0; i < FS_PATH_MAX; i++) r.name[i] = 0;
-    memcpy(r.name, fichero, strlen(fichero) + 1);
-
-    m.type = FS_SIZE;
-    m.len  = sizeof(r);
-    memcpy(m.data, (const char *)&r, sizeof(r));
-
-    if (msg_send(PORT_FILES, &m) < 0) {
-        motivo = "no hay servidor de ficheros: arrancalo con 'f'";
-        return 0;
-    }
-    if (msg_recv((uint64_t)mi_puerto, &m) < 0) {
-        motivo = "el servidor de ficheros no ha contestado";
-        return 0;
-    }
-    if (m.type != FS_OK) {
-        motivo = "no esta en la tarjeta";
-        return 0;
-    }
-    return ((struct fs_info *)m.data)->size;
+    struct estado e;
+    if (stat(fichero, &e) < 0) { motivo = "no esta en la tarjeta"; return 0; }
+    if (e.flags & FS_ES_DIR)   { motivo = "es un directorio";      return 0; }
+    return e.tam;
 }
 
 /* --- El PATH ----------------------------------------------------------
@@ -301,13 +287,6 @@ static int aplicar(int hay, const char *ent, const char *sal)
  * hay. */
 #define MAX_ARGV  16
 
-/* Copiar una cadena con tope, que hace falta en varios sitios. */
-static void ucopiar(char *dst, const char *src, uint64_t max)
-{
-    uint64_t i = 0;
-    while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
-    dst[i] = 0;
-}
 
 /* Una orden ya preparada: sus argumentos, y a donde van su entrada y su
  * salida. Todo en la misma estructura porque todo sale del mismo troceo.
@@ -611,9 +590,6 @@ static void tuberia(char *izq, char *der)
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-
-    mi_puerto = port_create(-1);
-    if (mi_puerto < 0) { printf("  [sh] sin puertos\n"); exit(1); }
 
     printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
     printf("  se arrancan con fork + exec, se encadenan con | y se\n");

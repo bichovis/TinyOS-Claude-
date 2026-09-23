@@ -14,8 +14,6 @@
 #include "syscall.h"
 #include "fs_abi.h"
 
-static struct message m;
-
 /* "2026-09-23 07:14", o guiones si el fichero no trae fecha.
  *
  * Se calcula aqui y no en el servidor porque es presentacion: el servidor
@@ -51,51 +49,34 @@ static void fecha_corta(char *dst, uint64_t t)
 
 int main(int argc, char **argv)
 {
-    int64_t mio = port_create(-1);
-    if (mio < 0) { printf("  [ls] sin puertos\n"); exit(1); }
-
     char ruta[FS_PATH_MAX];
     if (realpath(argc > 1 ? argv[1] : ".", ruta) < 0) {
         printf("  [ls] ruta imposible\n");
         exit(1);
     }
 
-    printf("\n  %s\n", ruta);
-
-    for (uint64_t i = 0; ; i++) {
-        struct fs_request r;
-        r.port = (unsigned long)mio;
-        r.arg  = i;
-        for (int j = 0; j < FS_PATH_MAX; j++) r.name[j] = 0;
-        memcpy(r.name, ruta, strlen(ruta) + 1);
-
-        m.type = FS_LIST;
-        m.len  = sizeof(r);
-        memcpy(m.data, (const char *)&r, sizeof(r));
-        if (msg_send(PORT_FILES, &m) < 0) {
-            printf("  [ls] no hay servidor de ficheros: arrancalo con 'f'\n");
-            exit(1);
-        }
-
-        if (msg_recv((uint64_t)mio, &m) < 0) break;
-        if (m.type == FS_ERROR) {
-            printf("  [ls] no es un directorio\n");
-            exit(1);
-        }
-        if (m.type != FS_OK) break;
-
-        struct fs_info *info = (struct fs_info *)m.data;
-
-        /* El "%-14s" es la columna entera: alinear a la izquierda
-         * rellenando con espacios hasta 14. Antes eso era un bucle. */
-        char cuando[20];
-        fecha_corta(cuando, info->mtime);
-
-        if (info->flags & FS_ES_DIR)
-            printf("    %s  %8s  %s\n", cuando, "<dir>", info->name);
-        else
-            printf("    %s  %8lu  %s\n", cuando, info->size, info->name);
+    /* opendir y readdir, como en cualquier sitio. Aqui habia treinta
+     * lineas de componer un fs_request y mandarlo por un puerto: eso
+     * sigue pasando, pero lo hace el kernel y no este programa. */
+    int64_t d = opendir(ruta);
+    if (d < 0) {
+        printf("  [ls] %s no es un directorio, o no existe\n", ruta);
+        exit(1);
     }
 
-    exit(0);
+    printf("\n  %s\n", ruta);
+
+    struct fs_info info;
+    while (readdir((int)d, &info) == 1) {
+        char cuando[20];
+        fecha_corta(cuando, info.mtime);
+
+        if (info.flags & FS_ES_DIR)
+            printf("    %s  %8s  %s\n", cuando, "<dir>", info.name);
+        else
+            printf("    %s  %8lu  %s\n", cuando, info.size, info.name);
+    }
+
+    closefd((int)d);
+    return 0;
 }

@@ -190,7 +190,19 @@ static int fs_transaccion(uint64_t tipo, const char *nombre, uint64_t off,
         fs_listo = 1;
     }
 
-    struct message m;
+    /* El mensaje, ESTATICO y no en la pila.
+     *
+     * Son 536 bytes desde que el mensaje crecio a 512 de datos, y la pila
+     * de kernel son 4 KB con una pagina de guarda debajo. Con el mensaje
+     * aqui y otro en el que llama, mas dos o tres rutas de 256 en el
+     * despachador, la suma se acerca peligrosamente.
+     *
+     * Y es seguro porque ya lo era: fs_mtx garantiza UNA transaccion a la
+     * vez. El buffer no se puede compartir mal porque no hay con quien
+     * compartirlo. Lo que antes era una consecuencia del disenyo pasa a
+     * ser algo que el disenyo aprovecha. */
+    static struct message m;
+
     for (uint64_t i = 0; i < sizeof(m.data); i++) m.data[i] = 0;
 
     struct fs_request *r = (struct fs_request *)m.data;
@@ -268,6 +280,126 @@ int fs_es_directorio(const char *ruta)
 
     struct fs_info *i = (struct fs_info *)resp.data;
     return (i->flags & FS_ES_DIR) ? 1 : 0;
+}
+
+/* Las que solo necesitan el nombre. Todas son la misma frase dicha cuatro
+ * veces: manda esta peticion y mira si dijo que si. */
+int fs_borrar(const char *ruta)
+{
+    struct message r;
+    if (fs_transaccion(FS_DELETE, ruta, 0, 0, 0, &r) < 0) return -1;
+    return r.type == FS_OK ? 0 : -1;
+}
+
+int fs_mkdir(const char *ruta)
+{
+    struct message r;
+    if (fs_transaccion(FS_MKDIR, ruta, 0, 0, 0, &r) < 0) return -1;
+    return r.type == FS_OK ? 0 : -1;
+}
+
+int fs_rmdir(const char *ruta)
+{
+    struct message r;
+    if (fs_transaccion(FS_RMDIR, ruta, 0, 0, 0, &r) < 0) return -1;
+    return r.type == FS_OK ? 0 : -1;
+}
+
+int fs_renombrar(const char *origen, const char *destino)
+{
+    uint64_t n = 0;
+    while (destino[n] && n < FS_CHUNK - 1) n++;
+
+    struct message r;
+    if (fs_transaccion(FS_RENAME, origen, 0, destino, n + 1, &r) < 0) return -1;
+    return r.type == FS_OK ? 0 : -1;
+}
+
+int fs_estado(const char *ruta, uint64_t *tam, uint64_t *mtime, uint64_t *flags)
+{
+    struct message r;
+    if (fs_transaccion(FS_SIZE, ruta, 0, 0, 0, &r) < 0) return -1;
+    if (r.type != FS_OK) return -1;
+
+    struct fs_info *i = (struct fs_info *)r.data;
+    if (tam)   *tam   = i->size;
+    if (mtime) *mtime = i->mtime;
+    if (flags) *flags = i->flags;
+    return 0;
+}
+
+/* Un directorio abierto es un descriptor con un INDICE dentro, no un
+ * desplazamiento en bytes. El protocolo del servidor pide las entradas de
+ * una en una por numero, asi que el descriptor solo tiene que acordarse
+ * de por cual iba.
+ *
+ * Que eso quepa en la misma struct fichero que un fichero normal no es
+ * casualidad: "lo que un proceso tiene abierto" es un concepto, y los
+ * tipos son variaciones suyas. */
+struct fichero *file_opendir(const char *ruta)
+{
+    uint64_t flags = 0;
+    if (fs_estado(ruta, 0, 0, &flags) < 0) return 0;
+    if (!(flags & FS_ES_DIR)) return 0;
+
+    struct fichero *f = kmalloc(sizeof(struct fichero));
+    if (!f) return 0;
+
+    f->tipo = F_DIRECTORIO;
+    f->refs = 1;
+    f->p    = 0;
+    f->off  = 0;                          /* aqui es el indice */
+    for (int i = 0; i < FICH_NOMBRE; i++) f->nombre[i] = 0;
+    for (int i = 0; i < FICH_NOMBRE - 1 && ruta[i]; i++) f->nombre[i] = ruta[i];
+    return f;
+}
+
+/* Devuelve 1 si hay entrada, 0 si se acabo, -1 si algo fue mal. */
+int file_readdir(struct fichero *f, void *info)
+{
+    if (!f || f->tipo != F_DIRECTORIO) return -1;
+
+    struct message r;
+    if (fs_transaccion(FS_LIST, f->nombre, f->off, 0, 0, &r) < 0) return -1;
+    if (r.type == FS_EOF) return 0;
+    if (r.type != FS_OK)  return -1;
+
+    f->off++;
+    /* Un bucle y no kcopy: kcopy vive en sched.c y no esta declarada aqui.
+     * Son 88 bytes; el bucle dice lo mismo y no ata dos ficheros que no
+     * tienen por que conocerse. */
+    for (uint64_t i = 0; i < sizeof(struct fs_info); i++)
+        ((char *)info)[i] = r.data[i];
+    return 1;
+}
+
+/* Mover el punto por donde va un fichero.
+ *
+ * Solo tiene sentido en un fichero: una tuberia no se puede rebobinar
+ * -los bytes ya no estan- y la consola tampoco. Devolver un error ahi no
+ * es una carencia, es la verdad. */
+int64_t file_seek(struct fichero *f, int64_t desplazamiento, int desde)
+{
+    if (!f || f->tipo != F_FICHERO) return -1;
+
+    int64_t base;
+    switch (desde) {
+    case DESDE_INICIO: base = 0; break;
+    case DESDE_ACTUAL: base = (int64_t)f->off; break;
+    case DESDE_FINAL: {
+        uint64_t tam = 0;
+        if (fs_estado(f->nombre, &tam, 0, 0) < 0) return -1;
+        base = (int64_t)tam;
+        break;
+    }
+    default: return -1;
+    }
+
+    int64_t nuevo = base + desplazamiento;
+    if (nuevo < 0) return -1;              /* antes del principio no hay nada */
+
+    f->off = (uint64_t)nuevo;
+    return nuevo;
 }
 
 struct fichero *file_open(const char *nombre, int modo)

@@ -141,17 +141,22 @@ static uint64_t switches;        /* cambios de contexto totales */
  *
  * Devuelve la BASE de la pila (la direccion mas baja utilizable). El tope,
  * que es lo que va en SP, es base + PAGE_SIZE. */
+static void kstack_free(int ranura);
+
 static uint64_t kstack_alloc(int ranura)
 {
     uint64_t guarda = KSTACK_AREA + (uint64_t)ranura * KSTACK_SLOT;
     uint64_t base   = guarda + PAGE_SIZE;
 
-    uint64_t pa = pmm_alloc();
-    if (!pa) return 0;
+    for (int i = 0; i < KSTACK_PAGINAS; i++) {
+        uint64_t pa = pmm_alloc();
+        if (!pa) { kstack_free(ranura); return 0; }
 
-    if (vmm_map_page(base, pa, MM_RAM_RW) < 0) {
-        pmm_free(pa);
-        return 0;
+        if (vmm_map_page(base + (uint64_t)i * PAGE_SIZE, pa, MM_RAM_RW) < 0) {
+            pmm_free(pa);
+            kstack_free(ranura);
+            return 0;
+        }
     }
     return base;
 }
@@ -159,7 +164,12 @@ static uint64_t kstack_alloc(int ranura)
 static void kstack_free(int ranura)
 {
     uint64_t base = KSTACK_AREA + (uint64_t)ranura * KSTACK_SLOT + PAGE_SIZE;
-    vmm_unmap_page(base);            /* y devuelve la pagina fisica */
+
+    /* Todas las paginas de la pila, no solo la primera. vmm_unmap_page
+     * devuelve -1 en las que no estaban mapeadas, y eso pasa cuando se
+     * llama a medio reservar; da igual, es el caso que se quiere. */
+    for (int i = 0; i < KSTACK_PAGINAS; i++)
+        vmm_unmap_page(base + (uint64_t)i * PAGE_SIZE);
 }
 
 static const char *idle_names[CORES] = { "idle0", "idle1", "idle2", "idle3" };
@@ -551,6 +561,58 @@ static struct task *by_pid(uint64_t pid)
  * fichero: se estaria esperando a si mismo. No hay nada que lo impida por
  * ahora, y esta en las limitaciones.
  */
+/* Donde acaba un mapeo, con su pagina de hueco detras. Ese hueco es
+ * barato y evita que un desbordado de un tramo aterrice en el siguiente. */
+static uint64_t fin_de(const struct mapeo *m)
+{
+    return m->base + ((m->len + PAGE_SIZE - 1) / PAGE_SIZE + 1) * PAGE_SIZE;
+}
+
+/* Buscar ranura en la tabla y sitio en el mapa, REUTILIZANDO huecos.
+ *
+ * La primera version ponia cada tramo detras del ultimo y nunca miraba
+ * atras. Es mas simple y funciona... hasta que alguien reserva y suelta
+ * muchas veces: cada vuelta consume direcciones que ya no vuelven, y a los
+ * 128 MB de la zona se acaba el sitio aunque no haya nada mapeado.
+ *
+ * Un compilador hace exactamente eso miles de veces. Asi que se busca el
+ * primer hueco que valga, empezando por abajo. Con cuatro mapeos por
+ * proceso el bucle es de risa; con muchos habria que ordenarlos. */
+static struct mapeo *reservar_tramo(struct task *t, uint64_t paginas)
+{
+    int hueco = -1;
+    for (int i = 0; i < MAX_MAPEOS; i++)
+        if (!t->mapeos[i].base) { hueco = i; break; }
+
+    if (hueco < 0) return 0;                   /* ya tiene cuatro */
+
+    uint64_t bytes = paginas * PAGE_SIZE;
+    uint64_t donde = USER_MMAP_BASE;
+
+    /* Empujar hacia arriba mientras choque con alguno. Como cada empujon
+     * salta por encima de un tramo entero, esto termina: hay cuatro. */
+    for (int vueltas = 0; vueltas <= MAX_MAPEOS; vueltas++) {
+        int choca = 0;
+
+        for (int i = 0; i < MAX_MAPEOS; i++) {
+            struct mapeo *m = &t->mapeos[i];
+            if (!m->base) continue;
+
+            if (donde < fin_de(m) && m->base < donde + bytes) {
+                donde = fin_de(m);
+                choca = 1;
+            }
+        }
+
+        if (!choca) {
+            if (donde + bytes > USER_MMAP_MAX) return 0;
+            t->mapeos[hueco].base = donde;
+            return &t->mapeos[hueco];
+        }
+    }
+    return 0;
+}
+
 int64_t task_mmap(const char *ruta, uint64_t *tam)
 {
     struct task *t = current;
@@ -575,28 +637,41 @@ int64_t task_mmap(const char *ruta, uint64_t *tam)
     uint64_t paginas = ((uint64_t)largo + PAGE_SIZE - 1) / PAGE_SIZE;
     if (paginas == 0) paginas = 1;            /* un fichero vacio, una pagina */
 
-    /* Sitio en la tabla, y sitio en el mapa. Se colocan uno detras de otro
-     * dejando una pagina de hueco, que es barato y evita que un desbordado
-     * de un mapeo aterrice en el siguiente. */
-    int hueco = -1;
-    uint64_t siguiente = USER_MMAP_BASE;
+    struct mapeo *m = reservar_tramo(t, paginas);
+    if (!m) return -1;
 
-    for (int i = 0; i < MAX_MAPEOS; i++) {
-        if (!t->mapeos[i].base) { if (hueco < 0) hueco = i; continue; }
-        uint64_t fin = t->mapeos[i].base +
-                       ((t->mapeos[i].len + PAGE_SIZE - 1) / PAGE_SIZE + 1) * PAGE_SIZE;
-        if (fin > siguiente) siguiente = fin;
-    }
-
-    if (hueco < 0) return -1;                  /* ya tiene cuatro */
-    if (siguiente + paginas * PAGE_SIZE > USER_MMAP_MAX) return -1;
-
-    struct mapeo *m = &t->mapeos[hueco];
-    m->base = siguiente;
-    m->len  = (uint64_t)largo;
+    m->len     = (uint64_t)largo;
+    m->anonimo = 0;
     for (int i = 0; i < FS_PATH_MAX; i++) m->ruta[i] = ruta[i];
 
     if (tam) *tam = m->len;
+    return (int64_t)m->base;
+}
+
+/* Memoria nueva, a cero, escribible, y traida segun se toque.
+ *
+ * Es el mismo mecanismo que mapear un fichero, con la pagina saliendo del
+ * gestor de paginas en vez del servidor. Y eso lo hace MUCHO mas barato:
+ * no hay mensaje, no hay espera, no hay nadie de quien depender. Reservar
+ * cien megas cuesta lo mismo que reservar uno -nada- y solo se paga por
+ * las paginas que se tocan.
+ *
+ * Frente a sbrk, que mueve un solo tope: aqui cada tramo va por su cuenta
+ * y se suelta entero cuando sobra, sin esperar a que se vacie lo que
+ * tiene encima. */
+int64_t task_mmap_anon(uint64_t bytes)
+{
+    struct task *t = current;
+    if (!t || !t->pgd || !bytes) return -1;
+
+    uint64_t paginas = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    struct mapeo *m = reservar_tramo(t, paginas);
+    if (!m) return -1;
+
+    m->len     = bytes;
+    m->anonimo = 1;
+    m->ruta[0] = 0;
     return (int64_t)m->base;
 }
 
@@ -626,6 +701,17 @@ int task_mmap_fault(uint64_t direccion)
      * fichero lo trae un servidor que tarda. */
     char *dst = (char *)phys_to_virt(pa);
     for (uint64_t i = 0; i < PAGE_SIZE; i++) dst[i] = 0;
+
+    if (m->anonimo) {
+        /* Memoria y no fichero: la pagina ya esta a cero, que es todo lo
+         * que hacia falta. Ni mensaje, ni espera, ni nadie de quien
+         * depender. */
+        if (vmm_map_in(t->pgd, pag, pa, MM_USER_DATA) < 0) {
+            pmm_free(pa);
+            return 0;
+        }
+        return 1;
+    }
 
     uint64_t off = pag - m->base;
     uint64_t pedir = m->len > off ? m->len - off : 0;
@@ -1736,7 +1822,7 @@ int task_fork(struct trap_frame *f)
      * en su pila de kernel: los mismos registros y el mismo punto de
      * retorno. Solo cambia x0. */
     struct trap_frame *tf =
-        (struct trap_frame *)(kstack + PAGE_SIZE - sizeof(struct trap_frame));
+        (struct trap_frame *)(kstack + KSTACK_PAGINAS * PAGE_SIZE - sizeof(struct trap_frame));
     /* kcopy y no "*tf = *f": una asignacion de estructura de 288 bytes la
      * convierte gcc en una llamada a memcpy, y aqui no hay libc. */
     kcopy(tf, f, sizeof(*tf));
@@ -1940,7 +2026,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
 
     /* --- El trap_frame fabricado --- */
     struct trap_frame *tf =
-        (struct trap_frame *)(kstack + PAGE_SIZE - sizeof(struct trap_frame));
+        (struct trap_frame *)(kstack + KSTACK_PAGINAS * PAGE_SIZE - sizeof(struct trap_frame));
     kzero(tf, sizeof(*tf));
     tf->elr    = entry;              /* lo dice el ELF                      */
     tf->spsr   = 0;                  /* M=0b0000 -> EL0t; DAIF=0 -> IRQ ON  */

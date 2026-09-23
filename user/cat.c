@@ -1,60 +1,43 @@
-/* user/cat.c - Volcar un fichero de la tarjeta por la consola
+/* user/cat.c - Volcar un fichero
  *
- * El nombre del fichero llega como argumento: "cat HOLA.TXT". El kernel
- * deja argc en x0 y argv en x1, con las cadenas en la propia pila del
- * proceso, que es el unico sitio que ya es suyo antes de existir.
+ * Eran sesenta lineas de hablar con el servidor por su puerto. Ahora son
+ * open, read y close, como en cualquier sitio: el kernel manda los mismos
+ * mensajes, pero este programa ya no tiene por que saberlo.
+ *
+ * Y de paso funciona con LO QUE SEA que haya detras del descriptor. Si le
+ * dan una tuberia en vez de un fichero, "cat" no se entera.
  */
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
 #include "syscall.h"
-#include "fs_abi.h"
-
-static struct message m;
-static char linea[MSG_DATA_MAX + 1];
 
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("\n  uso: cat NOMBRE.EXT\n");
+        printf("\n  uso: cat FICHERO...\n");
         exit(1);
     }
-    char ruta[FS_PATH_MAX];
-    if (realpath(argv[1], ruta) < 0) { printf("  [cat] ruta imposible\n"); exit(1); }
-    const char *fichero = ruta;
 
-    int64_t mio = port_create(-1);
-    if (mio < 0) { printf("  [cat] sin puertos\n"); exit(1); }
-
-    printf("\n  --- ");
-    printf("%s", fichero);
-    printf(" ---\n");
-
-    for (uint64_t off = 0; ; ) {
-        struct fs_request r;
-        r.port = (unsigned long)mio;
-        r.arg  = off;
-        memcpy(r.name, fichero, strlen(fichero) + 1);
-
-        m.type = FS_READ;
-        m.len  = sizeof(r);
-        memcpy(m.data, (const char *)&r, sizeof(r));
-        if (msg_send(PORT_FILES, &m) < 0) {
-            printf("  [cat] no hay servidor de ficheros: arrancalo con 'f'\n");
-            exit(1);
+    for (int i = 1; i < argc; i++) {
+        int64_t fd = openf(argv[i], O_LEER);
+        if (fd < 0) {
+            printf("\n  %s: no esta en la tarjeta\n", argv[i]);
+            return 1;
         }
 
-        if (msg_recv((uint64_t)mio, &m) < 0) break;
-        if (m.type == FS_ERROR) { printf("  [cat] no existe\n"); exit(1); }
-        if (m.type != FS_OK || m.len == 0) break;
+        printf("\n  --- %s ---\n", argv[i]);
 
-        for (uint64_t i = 0; i < m.len; i++) linea[i] = m.data[i];
-        linea[m.len] = 0;
-        printf("%s", linea);
+        char buf[256];
+        int64_t n;
+        while ((n = read((int)fd, buf, sizeof(buf))) > 0)
+            for (int64_t o = 0; o < n; ) {
+                int64_t k = write(1, buf + o, (uint64_t)(n - o));
+                if (k <= 0) break;
+                o += k;
+            }
 
-        off += m.len;
+        closefd((int)fd);
+        printf("  --- fin ---\n");
     }
-
-    printf("  --- fin ---\n");
-    exit(0);
+    return 0;
 }

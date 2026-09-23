@@ -110,7 +110,8 @@ struct task {
      * pagina sabra a quien preguntar. */
     struct mapeo {
         uint64_t base;                  /* 0 = ranura libre               */
-        uint64_t len;                   /* bytes del fichero              */
+        uint64_t len;                   /* bytes del fichero, o del tramo */
+        int      anonimo;               /* 1 = memoria, no fichero        */
         char     ruta[FS_PATH_MAX];
     } mapeos[MAX_MAPEOS];
 
@@ -224,6 +225,7 @@ int  task_bootstrap(const char *nombre, const struct args *args,
 
 /* Mapear un fichero. Devuelve la direccion o -1; el tamanyo va en *tam. */
 int64_t task_mmap(const char *ruta, uint64_t *tam);
+int64_t task_mmap_anon(uint64_t bytes);
 int     task_mmap_fault(uint64_t direccion);  /* 1 si lo ha resuelto        */
 int     task_munmap(uint64_t base);
 struct fichero *task_fd(int fd);              /* el de este proceso, o 0    */
