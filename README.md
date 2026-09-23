@@ -79,6 +79,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 22   | Pagina de guarda en las pilas de kernel     | hecho  |
 | 23   | fork con copy-on-write                      | hecho  |
 | 24   | exec: convertirse en otro programa          | hecho  |
+| 25   | Senyales, y Ctrl-C                          | hecho  |
 
 ## Estructura
 
@@ -104,6 +105,8 @@ Tres cosas que QEMU perdona y el silicio no:
                  umalloc.c   malloc/free de usuario, encima de sbrk
                  deep.c      recursion honda: se come la pila a proposito
                  forkd.c     se bifurca y mide lo que NO cuesta hacerlo
+                 signal.c    el trampolin por donde vuelve un manejador
+                 trap.c      atrapa Ctrl-C     kill.c  manda senyales
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -952,6 +955,70 @@ ya lo usa:
 El hijo lee la imagen de la memoria del shell, y puede hacerlo porque el
 copy-on-write ya se la ha dado: en ese momento esos bytes son suyos.
 
+## Senyales
+
+Una senyal es **un bit**. Todo lo demas -cuando se mira, que se hace con
+el, como se le cuenta al proceso- es politica que decide el kernel.
+
+Y el momento en que se mira no es casual: **justo antes de volver a EL0**,
+y en ningun otro sitio. Antes no se puede, porque el proceso esta a medias
+de una llamada al sistema y su estado no es coherente; despues no hay
+ocasion, porque ya se ha ido. Como todo lo que hace el kernel pasa por
+`exception_dispatch` -llamadas, interrupciones, fallos de pagina- basta
+mirar en un sitio.
+
+### El kernel fabrica una llamada a funcion
+
+Si hay manejador, el kernel guarda el contexto interrumpido **en la pila
+del proceso** y reescribe el marco de excepcion:
+
+    f->elr    = el manejador      el proceso "aparece" ahi
+    f->x[0]   = el numero         con la senyal como argumento
+    f->lr     = el trampolin      y vuelve por aqui
+    f->sp_el0 = debajo del contexto guardado
+
+Al hacer el `eret`, el proceso se encuentra dentro de una funcion que
+nunca llamo. Cuando esa funcion retorna, cae en el trampolin, que llama a
+`sigreturn`, que restaura el contexto y lo devuelve **exactamente** donde
+estaba. Se ve en `trap`:
+
+    [trap] sigo aqui, vuelta 6
+    [trap] atrapada la senyal 2, van 1
+    [trap] sigo aqui, vuelta 7
+
+La vuelta 7 viene despues de la 6 aunque en medio se haya ejecutado codigo
+que el programa no pidio. El proceso no puede notar la diferencia, y esa
+es toda la idea.
+
+### Por que hay un trampolin
+
+La direccion de retorno tiene que apuntar a codigo que exista en el
+programa. El kernel no puede inventarse tres instrucciones en la pila
+porque la pila **no es ejecutable** — y mejor que siga sin serlo. Asi que
+`user/signal.c` lleva una funcion minuscula que no hace mas que llamar a
+`sigreturn`, y el programa se la pasa al kernel sin llegar a verla nunca.
+
+### Ctrl-C es del driver, no del programa
+
+El caracter 3 no se pone en la cola de entrada: se lo queda `uart_irq` y
+lo convierte en una senyal. Por eso Ctrl-C funciona aunque el programa no
+este leyendo del teclado, que es justo cuando hace falta.
+
+Va al proceso de **primer plano**, definido de la forma mas simple que
+funciona: el duenyo de la consola, o el hijo al que este esperando. Un Unix
+de verdad lleva grupos de procesos; esto es la misma idea sin la
+contabilidad.
+
+### Lo que se hereda y lo que no
+
+`fork` hereda los manejadores -el hijo es el mismo programa y sabe atrapar
+lo mismo- pero **no** las senyales pendientes, que eran del padre. `exec`
+los borra todos: apuntaban a codigo de un programa que ya no existe.
+
+Y `SIGKILL` no se puede atrapar. Eso no es una limitacion, es su unico
+motivo de existir: si un proceso pudiera ignorarla, no habria forma de
+acabar con uno que se ha vuelto loco.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -996,6 +1063,13 @@ copy-on-write ya se la ha dado: en ese momento esos bytes son suyos.
   ahorraria memoria a cambio de bastante mas codigo.
 - Una pagina no puede compartirse mas de 255 veces. Con `MAX_TASKS` en 24
   no es un limite alcanzable, pero esta ahi.
+- Las senyales solo se entregan al volver a EL0, asi que un proceso
+  bloqueado para siempre en un `recv` no se entera de ninguna. Lo que falta
+  es el sueño interrumpible: que una senyal despierte al durmiente y su
+  llamada al sistema vuelva diciendo que la interrumpieron.
+- No se anidan: mientras se atiende una, las demas esperan. Y no hay
+  mascaras ni `sigaction`, solo un manejador por senyal.
+- `waitpid` no devuelve el codigo de salida del hijo: se pierde.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
   en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
   carga no hay nada que priorizar.

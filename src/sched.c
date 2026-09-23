@@ -593,6 +593,151 @@ uint64_t task_sbrk(int64_t delta)
     return viejo;
 }
 
+/* ====================== SENYALES ===================================
+ *
+ * Una senyal es un bit. Todo lo demas -cuando se mira, que se hace con el,
+ * como se le cuenta al proceso- es politica que decide el kernel.
+ *
+ * El momento en que se miran no es casual: JUSTO ANTES de volver a EL0, y
+ * en ningun otro sitio. Antes no se puede, porque el proceso esta a medias
+ * de una llamada al sistema y su estado no es coherente; despues no hay
+ * ocasion, porque ya se ha ido.
+ */
+static volatile uint64_t consola_pid;      /* quien manda en la consola */
+
+static void kcopy(void *dst, const void *src, uint64_t n);   /* mas abajo */
+
+int task_signal(uint64_t pid, int sig)
+{
+    if (sig <= 0 || sig >= SIG_MAX) return -1;
+
+    uint64_t flags = sched_lock_irqsave();
+    struct task *t = by_pid(pid);
+    int ok = 0;
+
+    if (t && t->state != TASK_ZOMBIE && t->pgd) {
+        t->sig_pending |= 1u << sig;
+
+        /* Si dormia, despertarlo: una senyal apuntada en la libreta de
+         * alguien que duerme no sirve de nada hasta que se despierte. */
+        if (t->state == TASK_SLEEPING) t->state = TASK_READY;
+        sched_kick_idle();
+        ok = 1;
+    }
+
+    sched_unlock_irqrestore(flags);
+    return ok ? 0 : -1;
+}
+
+int task_set_handler(int sig, uint64_t manejador, uint64_t trampolin)
+{
+    if (!current || !current->pgd)       return -1;
+    if (sig <= 0 || sig >= SIG_MAX)      return -1;
+    if (sig == SIGKILL)                  return -1;   /* esa no se atrapa */
+
+    current->sig_handler[sig] = manejador;
+    if (trampolin) current->sig_tramp = trampolin;
+    return 0;
+}
+
+void task_set_console(uint64_t pid) { consola_pid = pid; }
+
+/* Ctrl-C. Va al proceso de primer plano, que aqui se define de la forma
+ * mas simple que funciona: el duenyo de la consola, o el hijo al que este
+ * esperando. Un Unix de verdad lleva grupos de procesos y un grupo de
+ * primer plano; esto es la misma idea sin la contabilidad. */
+void task_console_interrupt(void)
+{
+    uint64_t flags = sched_lock_irqsave();
+    uint64_t destino = consola_pid;
+    struct task *t = destino ? by_pid(destino) : 0;
+    if (t && t->waiting_for) destino = t->waiting_for;
+    sched_unlock_irqrestore(flags);
+
+    if (destino) task_signal(destino, SIGINT);
+}
+
+/* ¿Se puede escribir ahi? Y si no, ¿es porque la pila necesita crecer? */
+static int pila_escribible(uint64_t sp, uint64_t n)
+{
+    for (uint64_t p = sp & ~(uint64_t)(PAGE_SIZE - 1); p < sp + n; p += PAGE_SIZE) {
+        if (vmm_translate_user_w(p)) continue;
+        if (!task_grow_stack(p, p))  return 0;
+    }
+    return 1;
+}
+
+/* Entregar una senyal. Aqui esta el truco entero.
+ *
+ * Si no hay manejador, la accion por defecto: morirse. Y si lo hay, el
+ * kernel FABRICA UNA LLAMADA A FUNCION en espacio de usuario: guarda el
+ * contexto interrumpido en la pila del proceso y reescribe el marco de
+ * excepcion para que, al hacer el 'eret', el proceso aparezca dentro de su
+ * manejador como si lo hubiera llamado el mismo.
+ *
+ * Cuando el manejador retorna, cae en el trampolin -que el kernel dejo en
+ * x30- y ese llama a sigreturn, que deshace todo esto y devuelve al
+ * proceso exactamente donde estaba. El proceso no puede notar la
+ * diferencia, y esa es la idea.
+ */
+void signal_deliver(struct trap_frame *f)
+{
+    struct task *t = current;
+
+    if (!t || !t->pgd || !t->sig_pending) return;
+    if (t->sig_frame) return;            /* ya hay una en curso: sin anidar */
+
+    for (int s = 1; s < SIG_MAX; s++) {
+        if (!(t->sig_pending & (1u << s))) continue;
+        t->sig_pending &= ~(1u << s);
+
+        uint64_t h = (s == SIGKILL) ? 0 : t->sig_handler[s];
+
+        if (!h) {
+            uint64_t lf = uart_begin();
+            uart_puts("\n  [kernel] ");
+            uart_puts(t->name);
+            uart_puts(" termina por la senyal ");
+            uart_dec((uint64_t)s);
+            uart_puts("\n");
+            uart_end(lf);
+            task_exit();                 /* no vuelve */
+        }
+
+        uint64_t sp = (f->sp_el0 - sizeof(struct trap_frame)) & ~15UL;
+
+        if (!t->sig_tramp || !pila_escribible(sp, sizeof(struct trap_frame))) {
+            uart_puts("\n  [kernel] no puedo entregarle la senyal: lo mato\n");
+            task_exit();
+        }
+
+        kcopy((void *)sp, f, sizeof(struct trap_frame));
+
+        t->sig_frame = sp;
+        f->sp_el0    = sp;
+        f->elr       = h;               /* el proceso "aparece" aqui */
+        f->x[0]      = (uint64_t)s;     /* con la senyal como argumento */
+        f->lr        = t->sig_tramp;    /* y vuelve por aqui */
+        return;
+    }
+}
+
+/* Deshacer lo anterior. Devuelve el x0 que tenia el proceso antes de que
+ * lo interrumpieramos: el despachador de llamadas lo pondra en su sitio,
+ * igual que hace con exec. */
+int64_t signal_return(struct trap_frame *f)
+{
+    struct task *t = current;
+    if (!t || !t->sig_frame) return -1;
+
+    uint64_t sp = t->sig_frame;
+    if (!vmm_translate_user(sp)) return -1;
+
+    kcopy(f, (const void *)sp, sizeof(struct trap_frame));
+    t->sig_frame = 0;
+    return (int64_t)f->x[0];
+}
+
 int task_alive(uint64_t pid)
 {
     uint64_t flags = sched_lock_irqsave();
@@ -614,11 +759,15 @@ int task_wait(uint64_t pid)
 {
     uint64_t flags = sched_lock_irqsave();
 
+    if (current) current->waiting_for = pid;
+
     for (;;) {
         struct task *t = by_pid(pid);
         if (!t || t->state == TASK_ZOMBIE) break;
         wq_wait(&exit_wq);
     }
+
+    if (current) current->waiting_for = 0;
 
     sched_unlock_irqrestore(flags);
     return 0;
@@ -914,6 +1063,13 @@ int task_exec(const uint8_t *image, uint64_t size, const char *args,
     t->brk       = tope;
     t->stack_low = USER_STACK_TOP - PAGE_SIZE;
 
+    /* Un programa nuevo empieza sin senyales pendientes y sin manejadores:
+     * los que habia eran del programa anterior y ya no existen. */
+    t->sig_pending = 0;
+    t->sig_frame   = 0;
+    t->sig_tramp   = 0;
+    for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
+
     /* El MMIO concedido NO se hereda: se le dio al programa que habia, y
      * ese programa ya no existe. Un driver que hace exec deja de ser un
      * driver. */
@@ -1003,6 +1159,15 @@ int task_fork(struct trap_frame *f)
     t->brk_base  = padre->brk_base;
     t->brk       = padre->brk;
     t->stack_low = padre->stack_low;
+
+    /* Los manejadores SE HEREDAN -el hijo es el mismo programa y sabe
+     * atrapar lo mismo- pero las senyales pendientes no: son del padre, y
+     * el hijo no tiene por que pagarlas. */
+    for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = padre->sig_handler[s];
+    t->sig_tramp   = padre->sig_tramp;
+    t->sig_pending = 0;
+    t->sig_frame   = 0;
+    t->waiting_for = 0;
 
     /* El nombre se copia, no se apunta: el del padre puede vivir en el
      * padre, y el padre puede morirse antes. */
@@ -1094,6 +1259,15 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
             goto fail;
         t->mmio_va = USER_MMIO_BASE | (mmio_pa & (PAGE_SIZE - 1));
     }
+
+    /* Las ranuras se reciclan, asi que lo de las senyales hay que
+     * limpiarlo a mano: un manejador que quedara puesto apuntaria al
+     * codigo de un programa que ya no existe. */
+    t->sig_pending = 0;
+    t->sig_frame   = 0;
+    t->sig_tramp   = 0;
+    t->waiting_for = 0;
+    for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
     /* --- Pila de kernel: donde se guardara su contexto en cada syscall --- */
     kstack = kstack_alloc((int)(t - tasks));

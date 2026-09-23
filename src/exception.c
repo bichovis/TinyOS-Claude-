@@ -151,7 +151,25 @@ void panic(const char *msg)
 }
 
 /* Punto de entrada desde vectors.S. */
+static void exception_body(struct trap_frame *f, uint64_t index);
+
 void exception_dispatch(struct trap_frame *f, uint64_t index)
+{
+    exception_body(f, index);
+
+    /* El unico momento en que un proceso puede recibir una senyal: justo
+     * antes de volver a EL0. Todo lo que hace el kernel pasa por aqui -las
+     * llamadas al sistema, las interrupciones, los fallos de pagina- asi
+     * que basta mirar en un sitio.
+     *
+     * SPSR con M[3:0] a cero significa EL0t: volvemos a espacio de
+     * usuario. Si no, es el kernel volviendo a si mismo y no hay nada que
+     * entregar. */
+    if ((f->spsr & 0xF) == 0)
+        signal_deliver(f);
+}
+
+static void exception_body(struct trap_frame *f, uint64_t index)
 {
     uint32_t ec = (uint32_t)(f->esr >> 26) & 0x3F;
 

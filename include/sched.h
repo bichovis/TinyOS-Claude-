@@ -1,6 +1,7 @@
 /* sched.h - Hilos del kernel y planificador */
 #pragma once
 #include <stdint.h>
+#include "ipc_abi.h"
 
 struct trap_frame;
 
@@ -43,6 +44,13 @@ struct task {
     uint64_t    stack_low;    /* la pagina de pila mas baja que ya existe    */
     uint64_t    brk_base;     /* donde acaba el ELF: el suelo del monton     */
     uint64_t    brk;          /* y hasta donde ha crecido                    */
+
+    /* --- Senyales --- */
+    uint32_t    sig_pending;  /* las que tiene pendientes, una por bit       */
+    uint64_t    sig_handler[SIG_MAX];  /* 0 = la accion por defecto          */
+    uint64_t    sig_tramp;    /* por donde vuelve un manejador               */
+    uint64_t    sig_frame;    /* donde guardo su contexto, 0 si no hay       */
+    uint64_t    waiting_for;  /* a que pid espera, 0 si a ninguno            */
     const char *name;
     char        namebuf[16]; /* para los que traen su nombre de argv[0]    */
 };
@@ -119,6 +127,17 @@ int  task_exec(const uint8_t *image, uint64_t size, const char *args,
 int  task_grow_stack(uint64_t direccion, uint64_t sp);
 uint64_t task_stack_pages(struct task *t);
 int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
+
+/* --- Senyales --------------------------------------------------------- */
+int  task_signal(uint64_t pid, int sig);       /* apuntarsela a un proceso  */
+int  task_set_handler(int sig, uint64_t manejador, uint64_t trampolin);
+void task_set_console(uint64_t pid);           /* quien manda en la consola */
+void task_console_interrupt(void);             /* lo llama uart.c con Ctrl-C*/
+
+/* Se llama justo antes de volver a EL0: es el unico momento en que un
+ * proceso puede recibir una senyal. */
+void signal_deliver(struct trap_frame *f);
+int64_t signal_return(struct trap_frame *f);
 void sched_preempt(void);        /* lo llama irq_handle()                   */
 uint64_t sched_switches(void);   /* cambios de contexto totales             */
 uint64_t sched_reaped(void);     /* tareas cuyos recursos se han devuelto   */

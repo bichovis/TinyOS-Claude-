@@ -45,6 +45,21 @@ struct message {
 #define SYS_fork         16    /* () -> pid del hijo en el padre, 0 en el hijo */
 #define SYS_freepages    17    /* () -> paginas de 4 KB libres en el sistema */
 #define SYS_exec         18    /* (buffer, bytes, args) -> no vuelve         */
+#define SYS_kill         19    /* (pid, senyal) -> 0 | -1                    */
+#define SYS_signal       20    /* (senyal, manejador, trampolin) -> 0 | -1   */
+#define SYS_sigreturn    21    /* lo llama el trampolin, no el programa      */
+
+/* --- Senyales ----------------------------------------------------------
+ * Los numeros son los de siempre, para que no haya que aprenderselos otra
+ * vez. Solo estan los tres que hacen falta.
+ *
+ * SIGKILL no se puede atrapar, y eso no es una limitacion: es su unico
+ * motivo de existir. Si un proceso pudiera ignorarla, no habria forma de
+ * acabar con un programa que se ha vuelto loco. */
+#define SIG_MAX      16
+#define SIGINT        2    /* Ctrl-C, la interrupcion del teclado           */
+#define SIGKILL       9    /* fulminante, no se atrapa ni se ignora         */
+#define SIGTERM      15    /* "haz el favor de irte", si se atrapa          */
 
 /* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del
  * buzon de la GPU y solo contesta a esta lista corta. */

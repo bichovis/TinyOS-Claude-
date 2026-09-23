@@ -213,6 +213,25 @@ void syscall_dispatch(struct trap_frame *f)
         ret = (int64_t)pmm_free_pages();
         break;
 
+    /* Mandarle una senyal a otro proceso. Cualquiera puede a cualquiera:
+     * no hay usuarios ni permisos que comprobar. */
+    case SYS_kill:
+        ret = task_signal(f->x[0], (int)f->x[1]);
+        break;
+
+    /* Decir que hacer cuando llegue una. El trampolin lo pone la libreria
+     * de usuario, no el programa: es por donde vuelve el manejador. */
+    case SYS_signal:
+        ret = task_set_handler((int)f->x[0], f->x[1], f->x[2]);
+        break;
+
+    /* Lo llama el trampolin cuando el manejador termina. Devuelve el x0
+     * que tenia el proceso antes de la interrupcion, y el "f->x[0] = ret"
+     * del final lo deja en su sitio. */
+    case SYS_sigreturn:
+        ret = signal_return(f);
+        break;
+
     case SYS_fork:
         ret = task_fork(f);
         break;

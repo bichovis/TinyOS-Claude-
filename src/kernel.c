@@ -461,6 +461,7 @@ static void thread_shell(void *arg)
             uart_puts("\n  [kernel] el interprete ha terminado."
                       " Vuelvo a leer yo.\n");
             sh_pid = 0;
+            task_set_console(0);
         }
         command(uart_getc_blocking());
     }
@@ -690,7 +691,9 @@ static void command(char c)
             uart_puts("\n  [kernel] no he podido crearlo\n");
         } else {
             uart_puts("\n  [kernel] te cedo la consola. 'salir' me la devuelve.\n");
+            uart_puts("  [kernel] Ctrl-C va al programa que este en marcha.\n");
             sh_pid = (uint64_t)pid;
+            task_set_console(sh_pid);
         }
         break;
     }

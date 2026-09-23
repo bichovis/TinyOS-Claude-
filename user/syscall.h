@@ -53,6 +53,14 @@ void  free(void *p);
 /* Paginas de 4 KB libres en todo el sistema. */
 static inline uint64_t freepages(void) { return (uint64_t)syscall2(SYS_freepages, 0, 0); }
 
+/* --- Senyales (user/signal.c) -----------------------------------------
+ * signal() registra que hacer cuando llegue una; 0 vuelve a la accion por
+ * defecto. SIGKILL no se puede atrapar. */
+int signal(int sig, void (*manejador)(int));
+
+static inline int64_t kill(uint64_t pid, int sig)
+{ return syscall2(SYS_kill, pid, (uint64_t)sig); }
+
 /* Convertirse en otro programa. Si sale bien no vuelve; si vuelve, fallo. */
 static inline int64_t exec(const void *imagen, uint64_t bytes, const char *args)
 { return syscall3(SYS_exec, (uint64_t)imagen, bytes, (uint64_t)args); }
