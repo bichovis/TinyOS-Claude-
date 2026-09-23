@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "sched.h"
 #include "mm.h"
+#include "fpu.h"
 #include "irq.h"
 #include "timer.h"
 #include "uart.h"
@@ -40,6 +41,10 @@ _Static_assert(__builtin_offsetof(struct task, ctx) == 0, "ctx debe ir primero")
  * reparten a quien las pida. */
 static struct task tasks[MAX_TASKS];
 static uint64_t    next_pid = CORES;
+
+/* Cuantos hilos han existido. Sirve para poner en contexto cuantos han
+ * llegado a pedir la FPU: sin el denominador, el numero no dice nada. */
+uint64_t task_creados(void) { return next_pid - CORES; }
 /* Uno por nucleo: que al nucleo 2 se le acabe el turno a su hilo no dice
  * nada de lo que esta haciendo el 3. */
 static volatile int need_resched[CORES];
@@ -296,6 +301,12 @@ void schedule_locked(void)
          * ASID 0. */
         vmm_switch_to(next->pgd ? next->pgd : vmm_empty_pgd(), next->asid);
 
+        /* Si el que se va tenia la FPU encendida, guardarla y apagarla. La
+         * mayoria de los hilos no la ha encendido nunca y esto es una
+         * comparacion y ya. El que entra NO la recibe: si la quiere,
+         * atrapara y se le dara entonces. */
+        fp_switch_out(prev);
+
         cpu_switch_to(prev, next);
         /* --- Cuando la ejecucion vuelve a esta linea han podido pasar
          * horas y haber corrido veinte hilos en cuatro nucleos. Somos otra
@@ -427,6 +438,8 @@ static void reap(struct task *t)
 
     if (t->stack)
         kstack_free((int)(t - tasks));
+
+    fp_release(t);              /* sus 528 bytes, si llego a necesitarlos */
 
     t->pgd     = 0;
     t->asid    = 0;
@@ -1198,6 +1211,14 @@ int task_exec(const uint8_t *image, uint64_t size, const char *args,
     t->sig_tramp   = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
+    /* Y sin coma flotante, por lo mismo. Lo que hubiera en esos registros
+     * era del programa anterior; el nuevo tiene que empezar con la FPU
+     * apagada y encontrarsela a cero cuando la pida. Se apaga a mano
+     * porque exec NO pasa por el cambio de contexto: vuelve a EL0 siendo
+     * el mismo hilo, y nadie mas iba a hacerlo. */
+    fp_hw_disable();
+    fp_release(t);
+
     /* El MMIO concedido NO se hereda: se le dio al programa que habia, y
      * ese programa ya no existe. Un driver que hace exec deja de ser un
      * driver. */
@@ -1255,6 +1276,12 @@ int task_fork(struct trap_frame *f)
     t->name  = "(bifurcando)";
     t->stack = 0;
     t->pgd   = 0;
+
+    /* La ranura viene de otro hilo que ya murio: su marca de FPU no es
+     * nuestra. Aqui, y no mas abajo, porque fp_area_alloc la mira. */
+    t->fp_state  = 0;
+    t->fp_activo = 0;
+    t->fp_pedida = 0;
     sched_unlock_irqrestore(flags);
 
     uint64_t asid = 0;
@@ -1283,6 +1310,22 @@ int task_fork(struct trap_frame *f)
      * convierte gcc en una llamada a memcpy, y aqui no hay libc. */
     kcopy(tf, f, sizeof(*tf));
     tf->x[0] = 0;
+
+    /* La coma flotante tambien se hereda: el hijo es el mismo programa en
+     * el mismo punto, y si el padre tenia un numero a medias en q0 el hijo
+     * tiene que verlo igual.
+     *
+     * Primero se BAJA la del padre a memoria. Si la tiene encendida, sus
+     * registros son la copia buena y la que hay en su area esta vieja;
+     * copiar sin bajarla le daria al hijo un estado de hace un rato. El
+     * padre volvera a atraparla la proxima vez que la use, que cuesta una
+     * excepcion y nada mas. */
+    if (padre->fp_state) {
+        fp_switch_out(padre);
+        if (fp_area_alloc(t))
+            kcopy(t->fp_state, padre->fp_state, FP_STATE_SIZE);
+    }
+    t->fp_activo = 0;                   /* la suya esta en memoria, no viva */
 
     flags = sched_lock_irqsave();
 
@@ -1406,6 +1449,11 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->sig_tramp   = 0;
     t->waiting_for = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
+
+    /* Nace sin FPU. Si la quiere, que la pida atrapando. */
+    t->fp_state  = 0;
+    t->fp_activo = 0;
+    t->fp_pedida = 0;
 
     /* Entrada, salida y errores a la consola. Si quien lo arranca quiere
      * otra cosa, que los cambie despues. */

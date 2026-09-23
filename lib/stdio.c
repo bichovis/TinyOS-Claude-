@@ -56,6 +56,15 @@ static void relleno(struct destino *d, int cuantos, char c)
     while (cuantos-- > 0) emitir(d, c);
 }
 
+/* Una cadena fija con su anchura, para los casos raros de %f. */
+static void formato_fijo(struct destino *d, const char *s, int ancho, int izq)
+{
+    int n = (int)strlen(s);
+    if (!izq) relleno(d, ancho - n, ' ');
+    while (*s) emitir(d, *s++);
+    if (izq)  relleno(d, ancho - n, ' ');
+}
+
 /* Un numero, ya sin signo, en la base que sea. El signo se trata fuera
  * porque el relleno con ceros va DETRAS del '-': "-007", no "00-7". */
 static void numero(struct destino *d, unsigned long v, unsigned base,
@@ -98,6 +107,15 @@ static void formatear(struct destino *d, const char *fmt, va_list ap)
         /* Anchura */
         int ancho = 0;
         while (*fmt >= '0' && *fmt <= '9') ancho = ancho * 10 + (*fmt++ - '0');
+
+        /* Precision: decimales en %f, o cuantos caracteres como mucho en
+         * %s. Menos 1 quiere decir "no la han dicho". */
+        int prec = -1;
+        if (*fmt == '.') {
+            fmt++;
+            prec = 0;
+            while (*fmt >= '0' && *fmt <= '9') prec = prec * 10 + (*fmt++ - '0');
+        }
 
         /* Longitud. Hace falta de verdad: en esta maquina un int son 32
          * bits y un puntero o un uint64_t son 64, y sacar el argumento
@@ -145,9 +163,69 @@ static void formatear(struct destino *d, const char *fmt, va_list ap)
             const char *s = va_arg(ap, const char *);
             if (!s) s = "(nulo)";
             int n = (int)strlen(s);
+            if (prec >= 0 && prec < n) n = prec;      /* como mucho prec */
             if (!izq) relleno(d, ancho - n, ' ');
-            while (*s) emitir(d, *s++);
+            for (int i = 0; i < n; i++) emitir(d, s[i]);
             if (izq)  relleno(d, ancho - n, ' ');
+            break;
+        }
+
+        /* %f es la unica conversion que obliga a este fichero a usar la
+         * FPU de verdad, y por eso lib/ se compila sin
+         * -mgeneral-regs-only. El kernel, que si lo lleva, no podria tener
+         * un printf con decimales aunque quisiera. */
+        case 'f': {
+            double v = va_arg(ap, double);
+            if (prec < 0) prec = 6;
+
+            int neg = 0;
+            if (v < 0) { neg = 1; v = -v; }
+
+            /* NaN no es igual a si mismo: es la unica forma de detectarlo
+             * sin funciones de <math.h>, que no tenemos. */
+            if (v != v)        { formato_fijo(d, "nan", ancho, izq); break; }
+            if (v > 1.7e308)   { formato_fijo(d, neg ? "-inf" : "inf", ancho, izq); break; }
+
+            /* Redondear ANTES de partir. Sin esto, 0.9999 con dos
+             * decimales sale "0.99" en vez de "1.00": truncar no es
+             * redondear. */
+            double mitad = 0.5;
+            for (int i = 0; i < prec; i++) mitad /= 10.0;
+            v += mitad;
+
+            /* Por encima de 2^64 la parte entera ya no cabe en un entero y
+             * esto daria un numero inventado. Mejor decirlo. */
+            if (v >= 18446744073709551616.0) {
+                formato_fijo(d, neg ? "-enorme" : "enorme", ancho, izq);
+                break;
+            }
+
+            unsigned long entero = (unsigned long)v;
+            double        resto  = v - (double)entero;
+
+            /* Se formatea primero en memoria y luego se rellena, porque la
+             * anchura hay que contarla sobre el numero YA escrito y aqui no
+             * se sabe de antemano cuantos digitos tiene la parte entera.
+             * El truco es que el destino intermedio es un destino normal:
+             * la misma maquinaria que usa snprintf. */
+            char tmp[80];
+            struct destino t = { -1, tmp, sizeof(tmp) - 1, 0, 0 };
+
+            if (neg) emitir(&t, '-');
+            numero(&t, entero, 10, 0, 0, 0, 0, 0);
+            if (prec > 0) {
+                emitir(&t, '.');
+                for (int i = 0; i < prec; i++) {
+                    resto *= 10.0;
+                    int dig = (int)resto;
+                    if (dig > 9) dig = 9;
+                    emitir(&t, (char)('0' + dig));
+                    resto -= dig;
+                }
+            }
+            tmp[t.n] = 0;
+
+            formato_fijo(d, tmp, ancho, izq);
             break;
         }
         case '%':

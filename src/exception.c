@@ -13,6 +13,7 @@
 #include "irq.h"
 #include "syscall.h"
 #include "sched.h"
+#include "fpu.h"
 #include "mm.h"
 
 extern char vector_table[];   /* definido en vectors.S */
@@ -188,6 +189,24 @@ static void exception_body(struct trap_frame *f, uint64_t index)
     if (index == 8 && ec == 0x15) {
         syscall_dispatch(f);
         return;
+    }
+
+    /* EC 0x07: alguien ha tocado la FPU teniendola apagada.
+     *
+     * No es un error. Es exactamente lo que estabamos esperando: el aviso
+     * de que este hilo, por fin, quiere coma flotante. Se le reserva su
+     * area de 528 bytes -la primera vez-, se le restaura lo que tuviera y
+     * se le enciende. Luego se vuelve SIN tocar elr, para que la CPU
+     * reintente la misma instruccion, que esta vez si se ejecutara.
+     *
+     * Es el mismo patron que la pila que crece y que copy-on-write: el
+     * fallo como mecanismo. Lo distinto es que aqui lo que se difiere no es
+     * memoria, es estado de registros. Ver include/fpu.h.
+     *
+     * Si falla, es que no hay memoria ni para 528 bytes, y entonces si es
+     * un problema: se cae por el camino normal y el proceso muere. */
+    if (ec == 0x07) {
+        if (fp_trap()) return;
     }
 
     /* BRK es una excepcion "de mentira": la pedimos nosotros. La informamos

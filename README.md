@@ -84,6 +84,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 27   | El teclado, tambien en EL0                  | hecho  |
 | 28   | Redireccion: < y >                          | hecho  |
 | 29   | Una libc: crt0, printf y libc.a             | hecho  |
+| 30   | Coma flotante, y el fallo como aviso        | hecho  |
 
 ## Estructura
 
@@ -113,6 +114,8 @@ Tres cosas que QEMU perdona y el silicio no:
                  wc.c        cuenta lo que le pasa por delante
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
+    fpu.c        cuando encender la FPU y a quien salvarsela
+    fpu.S        los 32 registros de 128 bits, y CPACR_EL1
     lib/         la libc de los programas, archivada en build/libc.a:
                  crt0.S      _start: lo que corre ANTES de main()
                  stdio.c     printf, snprintf, putchar, puts, getchar
@@ -1441,6 +1444,172 @@ correccion de `memcpy` no dependa de un efecto secundario de otro flag.
 con el kernel, y nada mas. Esa es la otra mitad de tener una libc; no solo
 gana el que escribe programas, gana tambien lo que queda debajo.
 
+## Coma flotante, y el fallo como aviso
+
+Desde el paso 1 todo el proyecto compila con `-mgeneral-regs-only`, que
+prohibe usar los registros de coma flotante. No era un capricho: el kernel
+no los salva, asi que si un hilo los usara, el siguiente encontraria los
+suyos pisados. Prohibirlos era mas barato que salvarlos.
+
+Salvarlos cuesta. Son 32 registros de 128 bits mas FPSR y FPCR: **528
+bytes**. El contexto entero de un hilo -lo que salva `switch.S`- son 104.
+Hacerlo en cada cambio de contexto multiplicaria por cinco el coste de
+cambiar de hilo, y para nada en la mayoria de los casos: el planificador,
+el recolector, el servidor de ficheros y el shell no hacen una sola
+operacion en coma flotante en toda su vida.
+
+**Asi que no se salvan. Se apaga la FPU y se espera a que alguien la
+quiera.**
+
+```
+    CPACR_EL1.FPEN = 0b00        atrapar cualquier uso, en EL0 y en EL1
+      -> un hilo toca un registro de FP
+      -> excepcion sincrona con EC = 0x07
+      -> se le reserva su area de 528 bytes (kmalloc, la primera vez)
+      -> se le restaura lo que tuviera y se enciende la FPU
+      -> se vuelve SIN tocar elr: la CPU reintenta la misma instruccion
+```
+
+Es el mismo patron que ya aparecio tres veces -la pila que crece, las
+paginas bajo demanda, copy-on-write-: **el fallo no es un error, es el
+aviso de que ha llegado el momento de hacer el trabajo.** Lo distinto es
+que aqui lo que se difiere no es memoria, es estado de registros. Un hilo
+que nunca hace una multiplicacion en coma flotante no paga ni un ciclo ni
+un byte: ni area reservada, ni save, ni restore, nunca.
+
+**Por que NO es perezosa del todo, que es la parte interesante.** La
+version de libro es perezosa por los dos lados: al cambiar de hilo tampoco
+se salva, se deja el estado en los registros, y si el hilo vuelve sin que
+nadie los haya tocado se ahorra hasta la restauracion. Funciona perfecto en
+una maquina de un solo nucleo.
+
+Aqui hay cuatro. Si el hilo A deja su estado en los registros del nucleo 0
+y luego lo planifican en el 1, el nucleo 1 **no tiene forma de traerselo**:
+esta en unos registros que no son suyos. Sacarlo de ahi exige interrumpir
+al nucleo 0 y pedirle por IPI que lo escriba en memoria, y para cuando has
+montado eso la optimizacion ha dejado de ser barata. Los kernels de verdad
+lo hacen; aqui se eligio lo otro.
+
+**Se salva al salir y se restaura perezosamente al entrar.** Se conserva lo
+que de verdad importa -quien no la usa no paga nada- y no queda estado vivo
+fuera de su duenyo cuando un hilo cambia de nucleo. Lo que se pierde es una
+excepcion por hilo y por turno entre los que si la usan.
+
+**Y ahora la medida, que es lo que decide si la historia era cierta.** La
+tecla `q` del menu lo cuenta. Tras arrancar los dos servidores y correr
+`ls`, `wc` y `cat` desde el shell:
+
+```
+      veces que se ha encendido : 307
+      hilos que la han pedido   : 5
+      la tienen reservada ahora : 2
+      hilos creados en total    : 16
+```
+
+Cinco de dieciseis. No es "casi nadie", que es lo que uno esperaria: **ni
+`ls` ni `wc` ni `cat` hacen una sola cuenta con decimales**. Y sin embargo
+piden la FPU. El motivo sale desensamblando `printf`:
+
+```
+    400e38:  stp  q0, q1, [sp, #256]
+    400e3c:  stp  q2, q3, [sp, #288]
+    400e40:  stp  q4, q5, [sp, #320]
+    400e44:  stp  q6, q7, [sp, #352]
+```
+
+Es el prologo de una funcion variadica. El ABI de AArch64 obliga a salvar
+v0-v7 al entrar en una funcion con `...`, **por si el formato lleva un
+`%f`**. No se sabe hasta leer la cadena, y para entonces ya es tarde. Asi
+que cualquier programa que llame a `printf`, aunque solo imprima enteros,
+toca la FPU en su primera llamada.
+
+La prueba en negativo la da `upper`, que filtra con `read`/`write` y no
+llama a `printf` en ningun sitio: **cero instrucciones de FP en todo el
+binario**, cero trampas, cero bytes reservados. Y los hilos del kernel
+tampoco, porque el kernel sigue compilando con `-mgeneral-regs-only`.
+
+**Y una prediccion, que es lo que convierte la historia en comprobacion.**
+Arrancando solo los servidores y `fp`, la cuenta da cuatro: el servidor de
+ficheros, el shell, `fp` y el hijo de `fp`. Falta el `conserver`, y hay que
+explicar por que falta o el argumento no vale.
+
+Falta porque su camino normal **no pasa por la libc**: imprime con
+`hw_puts`, que escribe en el registro de la PL011 y no es variadica. Sus
+dos `printf` son rutas de error que no se ejecutan, y su `snprintf` solo
+salta cuando un cliente le manda un `CMSG_PRINT`. Si eso es cierto, basta
+arrancar un cliente con `n` para que aparezca. Y aparece:
+
+| escenario                | hilos que la han pedido |
+|--------------------------|-------------------------|
+| `f` `s` `z` + `fp`       | 4                       |
+| lo mismo, mas `n`        | 6                       |
+
+Los dos nuevos son el `conserver`, que ya ejecuta su `snprintf`, y el
+cliente, que tambien es variadico.
+
+Lo que separa ese experimento es una distincion que se confunde con
+facilidad: **tener instrucciones de coma flotante en el binario no es lo
+mismo que llegar a ejecutarlas.** El `conserver` tiene 28 y no paga ni un
+byte mientras nadie le hable. Es exactamente de lo que vive este mecanismo:
+no adivina quien va a usar la FPU, espera a que la use.
+
+O sea: el ahorro es real, pero no por donde dice el libro. No lo decide
+"quien hace cuentas con decimales", lo decide **quien llama a una funcion
+variadica**. Es exactamente el tipo de cosa que no se sabe hasta medirla.
+
+**Un contador que dice "hilos" tiene que contar hilos.** La primera version
+de esa tabla mentia por dos sitios a la vez. Los hijos que heredan el area
+en el `fork` no pasan por la trampa, asi que no se contaban; y `exec`
+soltaba el area sin descontarla. En el escenario de arriba los dos errores
+**se cancelaban** y el numero salia bien, que es la peor forma de estar
+mal: no hay sintoma que te avise.
+
+Se vio al correr otra secuencia -solo `fp`, sin `ls` ni `cat`- y encontrar
+tres donde el razonamiento decia cinco. La cura fue poner toda la
+contabilidad en un solo sitio, `fp_area_alloc()`, por donde pasan los dos
+caminos, y marcar el hilo con `fp_pedida` para no contarlo dos veces cuando
+hereda el area y luego la pierde en un `exec`.
+
+**Dos detalles del hierro.**
+
+El `isb` despues de escribir `CPACR_EL1` no es opcional. Cambiar ese
+registro afecta a como se **decodifican** las instrucciones siguientes, y
+la CPU ya tiene varias en vuelo: sin la barrera, la primera instruccion de
+FP de despues puede haber pasado por el decodificador cuando FPEN todavia
+valia cero, y atrapar otra vez. Un bucle infinito de trampas.
+
+Y uno pequenyo que costo un error de ensamblado: `stp x1, x2, [x0, #512]`
+no existe. El desplazamiento de `stp` se codifica en 7 bits con signo por
+8, o sea hasta 504; el de `str` en 12 bits sin signo por 8, y llega de
+sobra. Dos instrucciones que parecen la misma con limites distintos.
+
+**Lo que hay que probar de verdad.** Que `2.5 * 4` da `10` no prueba nada:
+un `fp_restore` roto da numeros correctos mientras no se cuele nadie entre
+dos instrucciones. Por eso `user/fp.c` no comprueba cuentas, comprueba
+supervivencia: deja un valor en la FPU, llama a `yield()` cincuenta veces
+-cada una pasa por el planificador, que salva y apaga- y mira si sigue
+ahi. Y luego hace un `fork` con un numero a medias, para probar que el
+hijo lo hereda y que los dos siguen por su cuenta.
+
+```
+    50 sumas de 0.1     : 5.0000  ok
+    [hijo]  heredado 3.75, x2 = 7.50  ok
+    [padre] el mio sigue en 3.75  ok
+```
+
+El `fork` tiene su miga: antes de copiar el area del padre hay que
+**bajarla** a memoria. Si el padre tiene la FPU encendida, sus registros
+son la copia buena y lo que hay en su area es de hace un rato; copiar sin
+bajarla le daria al hijo un estado viejo. Cuesta que el padre vuelva a
+atrapar la proxima vez que la use, y no cuesta nada mas.
+
+**Y de paso, `%f`.** La libc ya tiene decimales, con precision (`%.10f`) y
+anchura (`%10.3f`). El redondeo se hace **antes** de partir el numero en
+entero y fraccion, que es lo que hace que `0.9999` con dos decimales salga
+`1.00` y no `0.99`: truncar no es redondear. `lib/` se compila sin
+`-mgeneral-regs-only` precisamente por esto; el kernel, que si lo lleva, no
+podria tener un `printf` con decimales aunque quisiera.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -1450,10 +1619,16 @@ gana el que escribe programas, gana tambien lo que queda debajo.
   sin el y publica con el otra vez.)
 - El shell no tiene historial, ni segundo plano, ni tuberias de mas de dos,
   ni `>>`: lee, carga, arranca y espera.
-- La libc no tiene coma flotante (`%f` no existe, y el FPU esta apagado),
-  ni `errno`, ni ficheros con buffer (`FILE`, `fopen`): se trabaja con
-  descriptores. `printf` entiende banderas, anchura y `l`, pero no
-  precision (`%.3s`).
+- La libc no tiene `errno` ni ficheros con buffer (`FILE`, `fopen`): se
+  trabaja con descriptores. `printf` entiende banderas, anchura, precision
+  y `l`, pero no notacion exponencial (`%e`, `%g`) ni `long double`.
+- Las senyales no salvan la coma flotante. Un manejador que use decimales
+  pisa los registros del programa interrumpido, porque el marco de senyal
+  guarda los enteros y nada mas. Real, y de los que no se notan hasta que
+  se notan.
+- El cambio de contexto de FP es perezoso solo al restaurar. Al salir se
+  salva siempre, porque con cuatro nucleos dejar el estado vivo en los
+  registros de otro nucleo exigiria IPIs (ver "Coma flotante").
 - Una transaccion con el servidor de ficheros cada vez. Hay un solo puerto
   de respuesta y las respuestas no dicen a quien pertenecen, asi que un
   mutex las serializa. La tarjeta es un solo dispositivo de todas formas,

@@ -12,6 +12,7 @@
 #include "sync.h"
 #include "ipc.h"
 #include "file.h"
+#include "fpu.h"
 
 #define TICK_HZ      100
 
@@ -586,6 +587,7 @@ static void menu(void)
     uart_puts("  j - estado de los cuatro nucleos\n");
     uart_puts("  d - que los hilos de demostracion hablen (o se callen)\n");
     uart_puts("  g - castigar el monton del kernel (kmalloc/kfree)\n");
+    uart_puts("  q - coma flotante: cuantos la han pedido de verdad\n");
     uart_puts("  f - arrancar el SERVIDOR DE FICHEROS (driver SD en EL0)\n"
               "  z - ceder la consola a un interprete de ordenes en EL0\n");
     uart_puts("  o - listar la tarjeta\n");
@@ -727,6 +729,10 @@ static void command(char c)
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }
+
+    case 'q':
+        fp_stats();
+        break;
 
     case 'g':
         prueba_monton();

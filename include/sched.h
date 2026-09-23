@@ -62,6 +62,14 @@ struct task {
     /* Sus descriptores. El 0 es la entrada, el 1 la salida, y quien los
      * pone no es el programa sino quien lo arranco. */
     struct fichero *fd[MAX_FD];
+    /* --- Coma flotante (ver fpu.h) ---
+     * fp_state es 0 mientras el hilo no haya tocado la FPU, que es el caso
+     * de casi todos. fp_activo dice si ADEMAS la tiene encendida ahora
+     * mismo, que es lo que decide si hay que salvarla al salir. */
+    void       *fp_state;
+    int         fp_activo;
+    int         fp_pedida;   /* la llego a pedir alguna vez; para las cuentas */
+
     const char *name;
     char        namebuf[16]; /* para los que traen su nombre de argv[0]    */
 };
@@ -144,6 +152,7 @@ uint64_t task_stack_pages(struct task *t);
 int  user_touch_w(uint64_t va);
 
 /* --- Descriptores ----------------------------------------------------- */
+uint64_t task_creados(void);                  /* hilos que han existido     */
 struct fichero *task_fd(int fd);              /* el de este proceso, o 0    */
 int  task_fd_alloc(struct fichero *f);        /* el primer hueco libre      */
 int  task_fd_close(int fd);

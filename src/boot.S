@@ -204,11 +204,15 @@ at_el1:
     sub     x1, x1, x2
     mov     sp, x1
 
-    // Permitir a EL1/EL0 usar FP/SIMD sin que la CPU lo atrape.
-    // Nuestro kernel compila con -mgeneral-regs-only y no los usa, pero si
-    // quedan atrapados una excepcion inesperada seria dificil de diagnosticar.
-    mov     x1, #(3 << 20)           // CPACR_EL1.FPEN = 0b11
-    msr     cpacr_el1, x1
+    // APAGAR la FPU. CPACR_EL1.FPEN = 0b00 atrapa cualquier uso de coma
+    // flotante o SIMD, tanto en EL0 como en EL1.
+    //
+    // No es una restriccion, es el mecanismo: esa trampa es la que avisa de
+    // que un hilo quiere la FPU, y solo entonces se le reserva su area de
+    // 528 bytes y se le enciende. El kernel nunca la enciende para si
+    // mismo, porque compila con -mgeneral-regs-only y no la usa. Ver
+    // include/fpu.h.
+    msr     cpacr_el1, xzr           // FPEN = 0b00: atrapar en EL0 y EL1
     isb                              // que surta efecto antes de continuar
 
     // AQUI NO se toca CPUECTLR_EL1.SMPEN, el bit que mete a este nucleo en
