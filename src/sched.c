@@ -379,6 +379,12 @@ void task_sleep(uint64_t ticks)
  * zombi podria seguir corriendo en otro. Ese dia habra que revisarlo.)
  */
 static struct waitqueue reaper_wq;
+
+/* Una cola donde espera todo el que quiera enterarse de que alguien ha
+ * terminado. Es una sola para todos los procesos: despertar a cuatro
+ * esperando para que tres se vuelvan a dormir es mas barato que llevar una
+ * lista por pid, con la cantidad de tareas que caben aqui. */
+static struct waitqueue exit_wq;
 static uint64_t         reaped;
 
 static void reap(struct task *t)
@@ -437,6 +443,46 @@ static void thread_reaper(void *arg)
 
 uint64_t sched_reaped(void) { return reaped; }
 
+/* Buscar una tarea por pid. Con el cerrojo cogido. */
+static struct task *by_pid(uint64_t pid)
+{
+    for (int i = CORES; i < MAX_TASKS; i++)
+        if (tasks[i].state != TASK_UNUSED && tasks[i].pid == pid)
+            return &tasks[i];
+    return 0;
+}
+
+int task_alive(uint64_t pid)
+{
+    uint64_t flags = sched_lock_irqsave();
+    struct task *t = by_pid(pid);
+    int vivo = t && t->state != TASK_ZOMBIE;
+    sched_unlock_irqrestore(flags);
+    return vivo;
+}
+
+/* Esperar a que un proceso termine.
+ *
+ * El bucle vuelve a mirar en cada vuelta, y eso no es desconfianza: puede
+ * haber varios esperando y el aviso es para todos, asi que al despertar hay
+ * que comprobar si el que nos interesa a nosotros es el que ha muerto.
+ *
+ * Que la tarea haya desaparecido del todo tambien vale como "termino": el
+ * recolector puede haber pasado por ahi antes de que nos despertaramos. */
+int task_wait(uint64_t pid)
+{
+    uint64_t flags = sched_lock_irqsave();
+
+    for (;;) {
+        struct task *t = by_pid(pid);
+        if (!t || t->state == TASK_ZOMBIE) break;
+        wq_wait(&exit_wq);
+    }
+
+    sched_unlock_irqrestore(flags);
+    return 0;
+}
+
 void task_exit(void)
 {
     uint64_t flags = sched_lock_irqsave();
@@ -450,6 +496,7 @@ void task_exit(void)
     /* Avisar a quien nos tiene que enterrar. Lo unico que hace es ponerlo
      * listo; no corre hasta que soltemos la CPU en el schedule() de abajo. */
     wq_wake_one(&reaper_wq);
+    wq_wake_all(&exit_wq);       /* y a quien estuviera esperandonos */
 
     /* Y sin soltar el cerrojo: se lo lleva el hilo que entre. Que siga
      * cogido durante todo el cambio es lo que hace seguro al recolector,
@@ -645,6 +692,24 @@ static void build_args(uint64_t ustack_pa, const char *args,
     *sp_out   = base + o_argv;
 }
 
+/* Como se llama un proceso que arranca otro proceso.
+ *
+ * El nombre no puede ser un puntero a la memoria del que llama: ese espacio
+ * de direcciones puede desaparecer antes que la tarea. Se copia la primera
+ * palabra de sus argumentos, que es justo como se llama a si mismo. */
+static void nombre_de_args(struct task *t, const char *args)
+{
+    uint64_t o = 0;
+    if (args) {
+        while (*args == ' ') args++;
+        while (*args && *args != ' ' && o < sizeof(t->namebuf) - 1)
+            t->namebuf[o++] = *args++;
+    }
+    if (!o) { t->namebuf[o++] = '?'; }
+    t->namebuf[o] = 0;
+    t->name = t->namebuf;
+}
+
 int task_create_user(const char *name, const uint8_t *image, uint64_t size,
                      uint64_t mmio_pa, const char *args)
 {
@@ -722,7 +787,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->stack     = kstack;
     t->pgd       = pgd;
     t->asid      = asid;
-    t->name      = name;
+    if (name) t->name = name;
+    else      nombre_de_args(t, args);
     t->pid       = next_pid++;
     t->counter   = TASK_QUANTUM;
     t->ticks_run = 0;

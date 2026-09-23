@@ -100,22 +100,32 @@ static int montar(void)
 
 /* --- El nombre, en formato 8.3 ---------------------------------------- */
 /* "HOLA.TXT" se guarda en el disco como "HOLA    TXT": once bytes, sin
- * punto, rellenados con espacios. Convertir es la mitad del trabajo de
- * buscar un fichero. */
+ * punto, rellenados con espacios y EN MAYUSCULAS. Convertir es la mitad
+ * del trabajo de buscar un fichero.
+ *
+ * Las mayusculas se ponen aqui, y ese "aqui" importa: que FAT no distinga
+ * mayusculas de minusculas es una regla del SISTEMA DE FICHEROS, no de
+ * quien lo usa. Si la aplicara cada cliente, "cat hola.txt" funcionaria y
+ * el siguiente programa que alguien escriba volveria a fallar. */
+static char mayus(char c)
+{
+    return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+}
+
 static void a_8_3(const char *nombre, char out[11])
 {
     for (int i = 0; i < 11; i++) out[i] = ' ';
 
     int i = 0, o = 0;
     while (nombre[i] && nombre[i] != '.' && o < 8)
-        out[o++] = nombre[i++];
+        out[o++] = mayus(nombre[i++]);
     while (nombre[i] && nombre[i] != '.') i++;
 
     if (nombre[i] == '.') {
         i++;
         o = 8;
         while (nombre[i] && o < 11)
-            out[o++] = nombre[i++];
+            out[o++] = mayus(nombre[i++]);
     }
 }
 

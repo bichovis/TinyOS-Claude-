@@ -41,6 +41,12 @@ static inline uint64_t ustrlen(const char *s)
 /* --- Llamadas basicas -------------------------------------------------- */
 static inline void kprint(const char *s)  { syscall2(SYS_write, (uint64_t)s, ustrlen(s)); }
 static inline void exit(int code)         { syscall2(SYS_exit, (uint64_t)code, 0); }
+
+/* Un caracter de la consola. Bloquea hasta que llegue. */
+static inline char kgetc(void)            { return (char)syscall2(SYS_read, 0, 0); }
+
+/* Esperar a que termine un proceso. Vuelve enseguida si ya no existe. */
+static inline void waitpid(uint64_t pid)  { syscall2(SYS_waitpid, pid, 0); }
 static inline void yield(void)            { syscall2(SYS_yield, 0, 0); }
 static inline uint64_t getpid(void)       { return (uint64_t)syscall2(SYS_getpid, 0, 0); }
 static inline void sleep(uint64_t ticks)  { syscall2(SYS_sleep, ticks, 0); }

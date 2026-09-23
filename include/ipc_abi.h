@@ -36,6 +36,8 @@ struct message {
 #define SYS_mmio_base    10    /* () -> VA del MMIO concedido, 0 si ninguno*/
 #define SYS_spawn        11    /* (buffer, bytes, args) -> pid | -1        */
 #define SYS_clock_rate   12    /* (id) -> Hz de un reloj de la placa        */
+#define SYS_read         13    /* () -> un caracter de la consola           */
+#define SYS_waitpid      14    /* (pid) -> 0 cuando ese proceso termina     */
 
 /* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del
  * buzon de la GPU y solo contesta a esta lista corta. */

@@ -71,6 +71,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 14   | Pulido: IPIs, cerrojos mas finos            | hecho  |
 | 15   | Servidor de ficheros: SD, FAT16 y `spawn`   | hecho  |
 | 16   | Procesos en ELF y argumentos                | hecho  |
+| 17   | Un interprete de ordenes en EL0             | hecho  |
 
 ## Estructura
 
@@ -90,6 +91,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  fs.c        servidor de ficheros FAT16, sirve el puerto 1
                  ls.c        lista la tarjeta      cat.c  vuelca un fichero
                  run.c       carga un programa de la tarjeta y lo arranca
+                 sh.c        interprete de ordenes: lee, carga, arranca, espera
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -517,6 +519,64 @@ Si fuera al reves —el kernel leyendo de un servidor de usuario— el kernel
 dependeria de un proceso que puede morirse, y eso es justo lo que un
 microkernel no hace. `exec` es cosa del usuario.
 
+## El interprete de ordenes
+
+`user/sh.c` es el primer programa que ata todo lo demas, y no tiene ningun
+privilegio especial. No sabe hacer nada por si mismo:
+
+    lee una linea           con SYS_read
+    busca el programa       preguntandole al servidor de ficheros
+    lo arranca              con spawn(), pasandole la linea de argumentos
+    espera a que termine    con waitpid()
+
+```
+$ ls
+
+  Contenido de la tarjeta:
+    HOLA.TXT      82 bytes
+    HELLO.ELF     8616 bytes
+    LS.ELF        5264 bytes
+    CAT.ELF       5296 bytes
+    RUN.ELF       5920 bytes
+
+$ cat HOLA.TXT
+
+  --- HOLA.TXT ---
+Hola desde la tarjeta SD.
+Este fichero lo ha puesto un Mac y lo va a leer TinyOS.
+  --- fin ---
+
+$ pepe
+  no encuentro PEPE.ELF
+```
+
+**Todas las ordenes son programas de la tarjeta**, sin ninguna dentro del
+shell. Eso no es purismo: significa que anyadir una orden es copiar un
+fichero a la SD, sin tocar ni recompilar nada.
+
+Hicieron falta dos cosas que no existian. `SYS_read`, porque la entrada de
+consola seguia siendo del kernel. Y `SYS_waitpid`, porque sin el el prompt
+volvia antes de que el programa hubiera abierto la boca.
+
+### Un teclado, dos lectores
+
+La consola tiene UN teclado, y en cuanto arranca el shell hay dos lectores:
+el hilo del menu del kernel y el proceso. Cada caracter se lo llevaria el
+que despertara antes, que es tanto como repartir lo que escribes a cara o
+cruz.
+
+Se resuelve cediendo la entrada entera: mientras el shell viva, el hilo del
+kernel no lee. Lo comprueba con `task_alive()` y se duerme. `salir` le
+devuelve la consola, y el menu de una tecla sigue ahi para lo que es: un
+depurador del kernel.
+
+Dos detalles de comodidad. Un proceso arrancado con `spawn()` toma su
+nombre de su propio `argv[0]`, copiado a la tarea porque el puntero del que
+llama vive en un espacio de direcciones que puede desaparecer antes: por eso
+`l` dice `hello` y no `spawn`. Y `SYS_exit` solo anuncia las salidas con
+error — que un programa termine bien es lo normal, y decirlo en voz alta
+llena de ruido una sesion de shell. Ahi el silencio es la respuesta.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -524,6 +584,10 @@ microkernel no hace. `exec` es cosa del usuario.
   correcto. (Lo que si se saco de el es la carga de un proceso, que son
   milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
   sin el y publica con el otra vez.)
+- La entrada de consola sigue siendo del kernel: `SYS_read` la sirve, pero
+  no hay un servidor de teclado como lo hay de pantalla.
+- El shell no tiene tuberias, ni redireccion, ni historial, ni segundo
+  plano: lee, carga, arranca y espera.
 - El servidor de ficheros solo LEE, solo entiende FAT16 y solo mira el
   directorio raiz. Nada de escribir, nada de FAT32, nada de subdirectorios.
 - El reloj base del EMMC esta puesto a mano (41.666 MHz, el de la placa).

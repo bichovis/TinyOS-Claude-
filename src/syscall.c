@@ -109,11 +109,18 @@ void syscall_dispatch(struct trap_frame *f)
         break;
 
     case SYS_exit:
-        uart_puts("\n  [kernel] el proceso ");
-        uart_puts(current->name);
-        uart_puts(" ha terminado con codigo ");
-        uart_dec(a0);
-        uart_puts("\n");
+        /* Solo se anuncia si algo fue mal. Que un programa termine bien es
+         * lo normal, y decirlo en voz alta llena de ruido una sesion de
+         * shell: ahi el silencio ES la respuesta correcta. */
+        if (a0 != 0) {
+            uint64_t lf = uart_begin();
+            uart_puts("\n  [kernel] el proceso ");
+            uart_puts(current->name);
+            uart_puts(" ha terminado con codigo ");
+            uart_dec(a0);
+            uart_puts("\n");
+            uart_end(lf);
+        }
         task_exit();                     /* no vuelve */
         break;
 
@@ -175,7 +182,7 @@ void syscall_dispatch(struct trap_frame *f)
         }
         args[i] = 0;
 
-        ret = task_create_user("spawn", (const uint8_t *)buf, len, 0, args);
+        ret = task_create_user(0, (const uint8_t *)buf, len, 0, args);
         break;
     }
 
@@ -190,6 +197,19 @@ void syscall_dispatch(struct trap_frame *f)
         ret = (int64_t)mbox_clock_rate((uint32_t)id);
         break;
     }
+
+    /* Leer de la consola. Por ahora la entrada sigue siendo del kernel: es
+     * el unico periferico que no se ha cedido, porque de el depende poder
+     * decir que algo ha fallado. */
+    case SYS_read:
+        ret = (int64_t)(uint8_t)uart_getc_blocking();
+        break;
+
+    /* Esperar a un hijo. Sin esto no hay shell posible: el prompt volveria
+     * antes de que el programa hubiera dicho nada. */
+    case SYS_waitpid:
+        ret = task_wait(f->x[0]);
+        break;
 
     case SYS_mmio_base:
         /* El kernel concede el MMIO al crear el proceso; aqui solo le

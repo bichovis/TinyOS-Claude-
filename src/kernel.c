@@ -23,6 +23,7 @@ extern const uint8_t  user_fs[];         extern const uint64_t user_fs_size;
 extern const uint8_t  user_ls[];         extern const uint64_t user_ls_size;
 extern const uint8_t  user_cat[];        extern const uint64_t user_cat_size;
 extern const uint8_t  user_run[];        extern const uint64_t user_run_size;
+extern const uint8_t  user_sh[];         extern const uint64_t user_sh_size;
 
 /* Registros de la PL011. Se los concedemos al driver de consola para que
  * pueda hacer su trabajo desde EL0 sin pasar por el kernel. Aqui hace falta
@@ -307,14 +308,30 @@ static void command(char c);
 /* La consola vive en su propio hilo. Antes estaba en la tarea idle, pero la
  * idle solo corre cuando nadie mas quiere CPU: con un hilo como 'crunch' en
  * marcha, la consola no habria respondido jamas. */
+/* El pid del interprete de ordenes de EL0, o 0 si no hay ninguno.
+ *
+ * La consola tiene UN teclado, y en cuanto arranca el shell hay dos
+ * lectores: este hilo y el proceso. Cada caracter se lo llevaria el que
+ * despertara antes, que es tanto como repartir lo que escribes a cara o
+ * cruz. Asi que mientras el shell viva, este hilo no lee: le cede la
+ * entrada entera y se queda mirando. */
+static volatile uint64_t sh_pid;
+
 static void thread_shell(void *arg)
 {
     (void)arg;
     /* Ya no hay polling: el hilo se bloquea en la cola de espera de la UART
      * y la interrupcion de recepcion lo despierta. Latencia minima y cero
      * CPU consumida mientras no escribes. */
-    for (;;)
+    for (;;) {
+        if (sh_pid) {
+            if (task_alive(sh_pid)) { task_sleep(10); continue; }
+            uart_puts("\n  [kernel] el interprete ha terminado."
+                      " Vuelvo a leer yo.\n");
+            sh_pid = 0;
+        }
         command(uart_getc_blocking());
+    }
 }
 
 /* ---------------- Demostracion 1: la carrera de datos ----------------
@@ -433,7 +450,8 @@ static void menu(void)
     uart_puts("  x - traducciones VA -> PA del kernel\n");
     uart_puts("  j - estado de los cuatro nucleos\n");
     uart_puts("  d - que los hilos de demostracion hablen (o se callen)\n");
-    uart_puts("  f - arrancar el SERVIDOR DE FICHEROS (driver SD en EL0)\n");
+    uart_puts("  f - arrancar el SERVIDOR DE FICHEROS (driver SD en EL0)\n"
+              "  z - ceder la consola a un interprete de ordenes en EL0\n");
     uart_puts("  o - listar la tarjeta\n");
     uart_puts("  a - volcar un fichero: cat HOLA.TXT\n");
     uart_puts("  e - cargar y ejecutar: run HELLO.ELF\n");
@@ -527,6 +545,21 @@ static void command(char c)
     case 'r':
         demo_readonly();
         break;
+
+    case 'z': {
+        if (sh_pid && task_alive(sh_pid)) {
+            uart_puts("\n  [kernel] ya hay un interprete\n");
+            break;
+        }
+        int pid = task_create_user("sh", user_sh, user_sh_size, 0, "sh");
+        if (pid < 0) {
+            uart_puts("\n  [kernel] no he podido crearlo\n");
+        } else {
+            uart_puts("\n  [kernel] te cedo la consola. 'salir' me la devuelve.\n");
+            sh_pid = (uint64_t)pid;
+        }
+        break;
+    }
 
     case 'f': {
         uart_puts("\n  [kernel] enrutando los pines de la tarjeta al EMMC\n");

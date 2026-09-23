@@ -39,6 +39,7 @@ struct task {
     uint64_t    asid;         /* etiqueta de su TLB; 0 = hilo de kernel      */
     uint64_t    mmio_va;      /* MMIO concedido a un driver de EL0; 0 si no  */
     const char *name;
+    char        namebuf[16]; /* para los que traen su nombre de argv[0]    */
 };
 
 /* 'current' ya no puede ser una variable: hay cuatro nucleos y cada uno
@@ -102,6 +103,8 @@ void scheduler_tick(void);       /* lo llama el timer                       */
 void task_yield(void);           /* ceder la CPU voluntariamente            */
 void task_sleep(uint64_t ticks);
 void task_exit(void);
+int  task_wait(uint64_t pid);    /* espera a que ese pid termine            */
+int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
 void sched_preempt(void);        /* lo llama irq_handle()                   */
 uint64_t sched_switches(void);   /* cambios de contexto totales             */
 uint64_t sched_reaped(void);     /* tareas cuyos recursos se han devuelto   */
