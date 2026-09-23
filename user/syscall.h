@@ -125,7 +125,13 @@ static inline void *sbrk(int64_t delta)
 
 /* Esperar a que termine un proceso y recoger su codigo de salida. Vuelve
  * -1 si ya no existe o si nos interrumpio una senyal. */
-static inline int64_t waitpid(uint64_t pid) { return syscall2(SYS_waitpid, pid, 0); }
+static inline int64_t waitpid(uint64_t pid) { return syscall3(SYS_waitpid, pid, 0, 0); }
+
+/* Esperar sabiendo QUE paso. 'que' recibe W_SALIDA o W_PARADO, porque un
+ * proceso detenido no ha terminado y confundir las dos cosas hace que
+ * quien espera siga adelante dejando atras algo que sigue existiendo. */
+static inline int64_t waitpid_que(uint64_t pid, int *que, int banderas)
+{ return syscall3(SYS_waitpid, pid, (uint64_t)banderas, (uint64_t)que); }
 
 /* Preguntar sin quedarse esperando. Devuelve el codigo de salida, o
  * -EAGAIN si ese proceso sigue vivo. Es lo que necesita un shell para
@@ -133,7 +139,7 @@ static inline int64_t waitpid(uint64_t pid) { return syscall2(SYS_waitpid, pid, 
  * en el, y de paso para recogerlo: un hijo que nadie espera se queda de
  * zombi. */
 static inline int64_t waitpid_ya(uint64_t pid)
-{ return syscall2(SYS_waitpid, pid, WNOHANG); }
+{ return syscall3(SYS_waitpid, pid, WNOHANG, 0); }
 
 /* El grupo, o sea el trabajo. Con pid 0 se refiere a uno mismo, y con
  * pgid 0 el grupo pasa a llamarse como el propio pid: "formo el mio". */
@@ -264,6 +270,8 @@ static inline int64_t irq_ack(uint64_t irq)
 static inline int64_t console_push(const char *b, uint64_t n)
                                           { return syscall2(SYS_console_push, (uint64_t)b, n); }
 static inline int64_t console_int(void)   { return syscall2(SYS_console_int, 0, 0); }
+static inline
+int64_t console_stop(void)  { return syscall2(SYS_console_stop, 0, 0); }
 
 /* Crear un proceso a partir de una imagen que tenemos en memoria.
  *

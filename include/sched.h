@@ -50,6 +50,16 @@ enum task_state {
     TASK_SLEEPING,            /* dormida hasta cierto tick                  */
     TASK_BLOCKED,             /* esperando en una cola (mutex, canal, UART)  */
     TASK_ZOMBIE,              /* termino; su pila aun no se ha liberado     */
+
+    /* Detenida. Ni corre ni quiere correr, y NO esta en ninguna cola de
+     * espera: no aguarda un suceso, aguarda un permiso. Solo SIGCONT la
+     * saca de aqui, y por eso es un estado y no una cola mas.
+     *
+     * El planificador no necesito enterarse: pick_next solo mira
+     * TASK_READY, asi que un estado nuevo se queda fuera sin tocar una
+     * linea. Eso no es suerte, es lo que se gana cuando la condicion se
+     * escribe en positivo. */
+    TASK_STOPPED,
 };
 
 /* Lo unico que hay que salvar para cambiar de hilo: los registros que el
@@ -201,10 +211,11 @@ void task_yield(void);           /* ceder la CPU voluntariamente            */
 void task_sleep(uint64_t ticks);
 void task_exit(void);
 void task_exit_con(int64_t codigo);   /* y apunta lo que devolvio */
-/* Espera y recoge su salida. Devuelve 0 y deja el codigo en 'codigo', o
- * un errno negativo: -EINTR si una senyal corto la espera, -EAGAIN si se
- * pidio WNOHANG y ese proceso sigue vivo. */
-int  task_wait(uint64_t pid, int64_t *codigo, int banderas);
+/* Espera y recoge su salida. Devuelve 0 y deja el codigo en 'codigo' y en
+ * 'que' el W_SALIDA o W_PARADO correspondiente, o un errno negativo:
+ * -EINTR si una senyal corto la espera, -EAGAIN si se pidio WNOHANG y ese
+ * proceso sigue vivo. */
+int  task_wait(uint64_t pid, int64_t *codigo, int *que, int banderas);
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
 int  task_exec(const uint8_t *image, uint64_t size, const struct args *args,
@@ -249,6 +260,10 @@ int  task_set_handler(int sig, uint64_t manejador, uint64_t trampolin);
 void task_set_console(uint64_t pgid);          /* que GRUPO esta en primer plano */
 int  task_set_pgid(uint64_t pid, uint64_t pgid);
 int  task_dar_consola(uint64_t pgid);          /* y quien puede darla */
+int  task_signal_grupo(uint64_t pgid, int sig); /* a todo un trabajo */
+int  task_en_primer_plano(void);               /* ¿el mio tiene la consola? */
+void task_console_stop(void);                  /* lo llama el driver con Ctrl-Z */
+int  task_parar(void);                         /* detenerse aqui mismo */
 int64_t task_get_pgid(uint64_t pid);
 uint64_t task_console_pid(void);               /* ...y quien la tiene ahora */
 void task_console_interrupt(void);             /* lo llama uart.c con Ctrl-C*/

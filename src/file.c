@@ -148,6 +148,42 @@ static int64_t consola_read(uint64_t uva, uint64_t n)
 {
     if (n == 0) return 0;
 
+    /* Leer el teclado desde el SEGUNDO PLANO no es un error, es una
+     * pregunta mal hecha: el teclado lo tiene uno solo, y quien esta
+     * sentado ahi le escribe al trabajo que ve delante.
+     *
+     * Sin esto, los dos leian por turnos y el que perdia el turno se
+     * quedaba sin su tecla. No fallaba nada -no hay error que devolver,
+     * porque leer un caracter que existe es legal- y por eso era tan
+     * desagradable: el shell perdia una letra de cada dos y no habia nada
+     * a lo que culpar.
+     *
+     * La respuesta de Unix es que el que pregunta a destiempo se detenga
+     * hasta que le toque. SIGTTIN no es un castigo: es lo que convierte
+     * "compites por las teclas y pierdes la mitad" en "esperas tu turno",
+     * y de paso es lo que hace que "fg" tenga sentido, porque ya hay algo
+     * parado a lo que volver. */
+    /* Y se REINTENTA al continuar, que es la mitad que importa.
+     *
+     * Pararse y devolver un error seria inutil: el programa volveria del
+     * read con -1, decidiria que se acabo la entrada y se iria. Es justo
+     * lo que pasaba al escribir esto: "wc &" se paraba bien, y al traerlo
+     * con "fg" contestaba "0 lineas" sin leer nada, porque la lectura que
+     * lo habia parado ya habia fracasado.
+     *
+     * Detenerse no es fallar. Es no hacerlo todavia, y hacerlo despues.
+     *
+     * Si el programa tiene manejador para SIGTTIN es otra cosa: dijo que
+     * queria enterarse, asi que se le entrega y la lectura vuelve con
+     * EINTR, como cualquier otra interrumpida. */
+    while (!task_en_primer_plano()) {
+        if (current->sig_handler[SIGTTIN]) {
+            task_signal(current->pid, SIGTTIN);
+            return -EINTR;
+        }
+        if (task_parar() < 0) return -EINTR;   /* lo estan matando */
+    }
+
     /* -EINTR y no -1 a secas.
      *
      * El paso 48 puso a todo el kernel a decir POR QUE fallaba y este

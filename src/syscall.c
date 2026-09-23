@@ -358,9 +358,17 @@ void syscall_dispatch(struct trap_frame *f)
 
     /* Mandarle una senyal a otro proceso. Cualquiera puede a cualquiera:
      * no hay usuarios ni permisos que comprobar. */
-    case SYS_kill:
-        ret = task_signal(f->x[0], (int)f->x[1]);
+    /* Un numero negativo nombra un GRUPO, que es el convenio de Unix. Y no
+     * es un truco sucio: un pid y un pgid viven en el mismo espacio de
+     * numeros -un grupo se llama como su primer proceso- asi que para
+     * decir cual de los dos es hace falta algo que no sea el numero. El
+     * signo estaba libre porque no hay pids negativos. */
+    case SYS_kill: {
+        int64_t quien = (int64_t)f->x[0];
+        ret = (quien < 0) ? task_signal_grupo((uint64_t)-quien, (int)f->x[1])
+                          : task_signal((uint64_t)quien, (int)f->x[1]);
         break;
+    }
 
     /* Decir que hacer cuando llegue una. El trampolin lo pone la libreria
      * de usuario, no el programa: es por donde vuelve el manejador. */
@@ -588,7 +596,16 @@ void syscall_dispatch(struct trap_frame *f)
      * interrumpieron esperando. */
     case SYS_waitpid: {
         int64_t codigo = -1;
-        int     r      = task_wait(f->x[0], &codigo, (int)f->x[1]);
+        int     que    = W_SALIDA;
+        int     r      = task_wait(f->x[0], &codigo, &que, (int)f->x[1]);
+
+        /* El "que paso" va aparte, en memoria del que pregunta, porque en
+         * el valor de retorno ya no cabe: ahi esta el numero. Si no da un
+         * sitio donde escribirlo, es que no le interesa. */
+        if (r == 0 && f->x[2]) {
+            if (!user_rango(f->x[2], sizeof(int))) { ret = -EFAULT; break; }
+            if (copy_to_user(f->x[2], &que, sizeof(int)) != 0) { ret = -EFAULT; break; }
+        }
 
         /* El errno pasa por delante del codigo de salida: -EAGAIN quiere
          * decir "no ha terminado", que no es lo mismo que "termino
@@ -639,6 +656,15 @@ void syscall_dispatch(struct trap_frame *f)
      * decide a quien le cae. */
     case SYS_console_int:
         task_console_interrupt();
+        ret = 0;
+        break;
+
+    /* Ctrl-Z es lo mismo con otra senyal: el driver ve la tecla, el kernel
+     * sabe a quien le cae. Que sean dos llamadas y no una con parametro es
+     * a proposito: la lista de lo que un driver puede provocar esta escrita
+     * en el kernel, y no la elige quien llama. */
+    case SYS_console_stop:
+        task_console_stop();
         ret = 0;
         break;
 

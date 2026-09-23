@@ -68,6 +68,17 @@ struct message {
  * proceso sigue vivo, que con el convenio del paso 48 no se confunde con
  * ningun codigo de salida. */
 #define WNOHANG           1
+#define WUNTRACED         2   /* avisame tambien si se PARA, no solo si muere */
+
+/* Que le paso al proceso por el que preguntabas.
+ *
+ * waitpid tiene que contestar DOS cosas -que ocurrio y con que numero- y
+ * un solo entero no da para las dos. Unix lo resolvio metiendolas en el
+ * mismo valor y repartiendo bits, que es por lo que hay que desmontarlo
+ * con WIFEXITED y companyia y por lo que nadie se acuerda de como va.
+ * Aqui van por separado, que cuesta un puntero y se entiende leyendolo. */
+#define W_SALIDA          0   /* termino solo; el valor es su codigo        */
+#define W_PARADO          1   /* NO ha terminado: esta detenido             */
 #define SYS_sbrk         15    /* (delta) -> tope viejo del monton          */
 #define SYS_fork         16    /* () -> pid del hijo en el padre, 0 en el hijo */
 #define SYS_freepages    17    /* () -> paginas de 4 KB libres en el sistema */
@@ -93,7 +104,8 @@ struct message {
 
 /* El driver de consola le pasa al kernel lo que ha leido del teclado. */
 #define SYS_console_push 27   /* (buffer, bytes) -> 0 | -1                  */
-#define SYS_console_int  28   /* () -> Ctrl-C al proceso de primer plano    */
+#define SYS_console_int  28   /* () -> Ctrl-C al grupo de primer plano      */
+#define SYS_console_stop 50   /* () -> Ctrl-Z al grupo de primer plano      */
 
 /* Abrir un fichero de la tarjeta y quedarselo en un descriptor. Es lo que
  * hace falta para que el shell pueda redirigir con > y <. */
@@ -294,15 +306,29 @@ struct estado {
 
 /* --- Senyales ----------------------------------------------------------
  * Los numeros son los de siempre, para que no haya que aprenderselos otra
- * vez. Solo estan los tres que hacen falta.
+ * vez.
  *
  * SIGKILL no se puede atrapar, y eso no es una limitacion: es su unico
  * motivo de existir. Si un proceso pudiera ignorarla, no habria forma de
- * acabar con un programa que se ha vuelto loco. */
-#define SIG_MAX      16
+ * acabar con un programa que se ha vuelto loco. SIGSTOP tampoco, y por lo
+ * mismo: es la unica garantia de que algo se puede parar.
+ *
+ * Las cinco de abajo son de este paso, y todas hablan del mismo estado
+ * nuevo: un proceso que no esta vivo ni muerto, sino DETENIDO. */
+#define SIG_MAX      32
 #define SIGINT        2    /* Ctrl-C, la interrupcion del teclado           */
 #define SIGKILL       9    /* fulminante, no se atrapa ni se ignora         */
 #define SIGTERM      15    /* "haz el favor de irte", si se atrapa          */
+#define SIGCONT      18    /* sigue donde estabas                           */
+#define SIGSTOP      19    /* parate; tampoco se atrapa                     */
+#define SIGTSTP      20    /* Ctrl-Z: parate, pero esta si se atrapa        */
+#define SIGTTIN      21    /* has leido del teclado desde el segundo plano  */
+#define SIGTTOU      22    /* ...y esta seria por escribir (ver el README)  */
+
+/* Mandar una senyal a un GRUPO entero: kill(-pgid, sig). El signo es el
+ * convenio de Unix, y no es un truco sucio: un pid y un pgid viven en el
+ * mismo espacio de numeros -un grupo se llama como su primer proceso- asi
+ * que hace falta algo fuera del numero para decir cual de los dos es. */
 
 /* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del
  * buzon de la GPU y solo contesta a esta lista corta. */

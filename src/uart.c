@@ -209,7 +209,7 @@ void uart_irq(void)
 {
     /* Vaciar la FIFO de recepcion: una sola interrupcion puede traer varios
      * bytes, y si dejamos alguno dentro la IRQ se volveria a disparar. */
-    int interrumpir = 0;
+    int interrumpir = 0, parar = 0;
 
     while (!(mmio_read(UART0_FR) & FR_RXFE)) {
         char c = (char)(mmio_read(UART0_DR) & 0xFF);
@@ -217,8 +217,12 @@ void uart_irq(void)
         /* Ctrl-C no es un caracter que leer: es una orden. Se lo queda el
          * driver y se convierte en una senyal para quien esta en primer
          * plano. Esto es lo que hace un terminal de verdad, y es la razon
-         * por la que Ctrl-C funciona aunque el programa no lo lea. */
-        if (c == 3) { interrumpir = 1; continue; }
+         * por la que Ctrl-C funciona aunque el programa no lo lea.
+         *
+         * Ctrl-Z es la misma idea con otra respuesta: en vez de "acaba con
+         * esto", "deja esto donde esta". */
+        if (c == 3)  { interrumpir = 1; continue; }
+        if (c == 26) { parar = 1; continue; }
 
         uint32_t next = (rx_head + 1) % RXBUF_SIZE;
         if (next != rx_tail) {            /* si esta lleno, tiramos el byte */
@@ -236,8 +240,9 @@ void uart_irq(void)
     wq_wake_all(&rx_waiters);
     sched_unlock_irqrestore(f);
 
-    /* Fuera del cerrojo: task_console_interrupt lo vuelve a coger. */
+    /* Fuera del cerrojo: los dos lo vuelven a coger. */
     if (interrumpir) task_console_interrupt();
+    if (parar)       task_console_stop();
 }
 
 /* Meter bytes en el buffer de recepcion desde fuera del driver.

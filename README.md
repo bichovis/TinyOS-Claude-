@@ -106,6 +106,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 49   | Ficheros con buffer: FILE, fopen, fprintf   | hecho  |
 | 50   | Anyadir al final: O_APPEND y `>>`           | hecho  |
 | 51   | Grupos de procesos, segundo plano y Ctrl-C  | hecho  |
+| 52   | Detenido: Ctrl-Z, fg, bg y SIGTTIN          | hecho  |
 
 ## Estructura
 
@@ -3998,6 +3999,224 @@ entran en `DEPS`. Los `.elf` necesitan un `-MF` explicito porque su regla
 compila y enlaza de una vez, y `-MMD` deduce el nombre del fichero de
 dependencias del `-o`, que aqui es un ejecutable.
 
+## Ni vivo ni muerto
+
+Hasta aqui un proceso estaba vivo o estaba muerto. Este paso trae el
+tercer estado, que es el unico que no se le ocurre a nadie hasta que hace
+falta: **detenido**.
+
+    TASK_STOPPED,
+
+Ni corre ni quiere correr, y -esto es lo que lo distingue de todo lo
+demas- **no esta en ninguna cola de espera**. Una tarea bloqueada aguarda
+un suceso: una tecla, un hueco en una tuberia, que muera un hijo. Una
+tarea detenida no aguarda un suceso, aguarda un **permiso**. Por eso es un
+estado y no una cola mas.
+
+Y el planificador no se entero:
+
+    if (t->state == TASK_READY)
+        return t;
+
+`pick_next` solo mira `TASK_READY`, asi que un estado nuevo se queda fuera
+sin tocar una linea. Eso no es suerte: es lo que se gana cuando la
+condicion se escribe en positivo. Una escrita al reves -"todo menos
+zombi"- habria puesto a ejecutar procesos detenidos desde el primer
+minuto, y el fallo habria aparecido en el sitio equivocado.
+
+### Detenerse no tiene nada que guardar
+
+    int task_parar(void)
+    {
+        uint64_t flags = sched_lock_irqsave();
+        current->state = TASK_STOPPED;
+        wq_wake_all(&exit_wq);          /* que el padre se entere ANTES */
+        schedule_locked();
+        int abortar = (current->sig_pending & (1u << SIGKILL)) != 0;
+        sched_unlock_irqrestore(flags);
+        return abortar ? -1 : 0;
+    }
+
+No hay contexto que salvar. El proceso esta a mitad de una llamada al
+sistema, con su pila de kernel y su marco de excepcion tal cual: **si no
+se ejecuta, tampoco se mueve**. Al reanudarlo sigue por la linea de abajo
+y vuelve por donde entro. Comparado con lo que costo `fork` o una senyal,
+detener un proceso es casi no hacer nada, y esa es la gracia.
+
+El `wq_wake_all` de en medio si es necesario, y va **antes** de
+`schedule_locked()`. Sin el, un shell que esta en `waitpid` esperando a
+este proceso se queda ahi para siempre: el hijo no ha muerto -asi que no
+despierta a nadie- y tampoco va a volver a correr. Los dos esperando al
+otro, y nadie con motivo para moverse.
+
+### Un proceso parado tiene que poder matarse
+
+    if (t->state == TASK_STOPPED && (sig == SIGCONT || sig == SIGKILL)) {
+        t->state = TASK_READY;
+        ...
+    }
+
+Un proceso detenido no vuelve a EL0, asi que **no pasa por
+`signal_deliver`**: apuntarle un bit de senyal ahi no sirve de nada.
+Devolverlo a la vida es trabajo de `task_signal`, y `SIGCONT` existe
+justo para eso.
+
+Lo que es facil de olvidar es que `SIGKILL` tambien tiene que hacerlo.
+Sin esa mitad de la condicion, un proceso parado seria **inmatable**: la
+senyal fulminante se quedaria apuntada en la libreta de alguien que no va
+a leerla nunca, y para matarlo habria que continuarlo primero. Asi que se
+le devuelve la CPU lo justo para que se muera:
+
+    / $ lento 40 zz
+      ^Z
+      [1] parado   lento 40 zz
+    / $ kill 9 9
+      [kernel] lento termina por la senyal 9
+
+### Parar y seguir se anulan
+
+    if (sig == SIGCONT) {
+        t->sig_pending &= ~((1u << SIGSTOP) | (1u << SIGTSTP) | ...);
+    } else if (ES_PARADA(sig)) {
+        t->sig_pending &= ~(1u << SIGCONT);
+    }
+
+Y se hace al APUNTARLAS, no al entregarlas. Si un Ctrl-Z y un `SIGCONT`
+llegan casi a la vez y las dos se quedan pendientes, el proceso arranca y
+se vuelve a parar, o al reves, segun el orden en que se recorran los bits.
+Ninguno de los dos resultados es el que pidio nadie: **vale lo que dijo el
+ultimo en hablar**, y para eso la que llega borra a su contraria.
+
+### Ni SIGKILL ni SIGSTOP se atrapan
+
+    uint64_t h = (s == SIGKILL || s == SIGSTOP) ? 0 : t->sig_handler[s];
+
+Son las dos unicas garantias que le quedan a quien esta fuera. Una es
+"esto se puede matar" y la otra "esto se puede parar", y las dos dejan de
+valer en cuanto el programa puede opinar. Ctrl-Z manda `SIGTSTP`, que si
+se atrapa, porque ahi lo que se quiere no es una garantia sino una
+costumbre: un editor que quiere dejar el terminal como lo encontro antes
+de irse.
+
+## El robo de teclas, y por que SIGTTIN no es un castigo
+
+El paso anterior dejo esto anotado como limitacion: un proceso de segundo
+plano que lea del teclado **roba las teclas** que ibas a escribirle al
+shell, por turnos y sin avisar.
+
+Y no fallaba nada. No hay error que devolver, porque leer un caracter que
+existe es perfectamente legal. Por eso era tan desagradable: el shell
+perdia una letra de cada dos y no habia nada a lo que culpar.
+
+    while (!task_en_primer_plano()) {
+        if (current->sig_handler[SIGTTIN]) {
+            task_signal(current->pid, SIGTTIN);
+            return -EINTR;
+        }
+        if (task_parar() < 0) return -EINTR;
+    }
+
+Leer el teclado desde el fondo no es un error: es una **pregunta a
+destiempo**. El teclado lo tiene uno solo, y quien esta sentado ahi le
+escribe al trabajo que ve delante. La respuesta de Unix es que el que
+pregunta antes de tiempo espere su turno, y eso es lo que convierte
+"compites por las teclas y pierdes la mitad" en "esperas". De paso es lo
+que le da sentido a `fg`, porque ya hay algo parado a lo que volver:
+
+    / $ wc &
+      [1] en el fondo  wc
+    / $ jobs
+      [1] parado   wc
+
+### Detenerse no es fallar
+
+La primera version se paraba bien y no servia para nada:
+
+    / $ fg
+      wc
+      0 lineas, 0 bytes
+
+`wc` volvia del `read` con -1, decidia que se habia acabado la entrada y
+se iba sin leer nada. La lectura que lo habia parado ya habia fracasado.
+
+Por eso el `while` de arriba es un bucle y no un `if`: al continuar, **la
+lectura se reintenta**. Detenerse no es fallar; es no hacerlo todavia, y
+hacerlo despues. Es la misma idea que `SA_RESTART`, y es lo que hace que
+un programa que no sabe nada de todo esto funcione igual estando en
+primer plano que habiendo pasado por el fondo.
+
+Con `SIGTTOU` -escribir desde el fondo- no se hace nada, y tampoco lo hace
+Unix salvo que se lo pidas (`stty tostop`). Un proceso de fondo que
+imprime es molesto, no peligroso: ensucia la pantalla y ya. Uno que lee te
+quita algo.
+
+## waitpid tiene que contestar dos cosas
+
+    #define W_SALIDA   0   /* termino solo; el valor es su codigo */
+    #define W_PARADO   1   /* NO ha terminado: esta detenido      */
+
+Un `waitpid` que no distinguiera las dos seria peor que uno que no
+contesta: el que espera creeria que su hijo ha acabado y seguiria adelante
+dejando atras un proceso que sigue existiendo, con sus ficheros abiertos y
+su memoria.
+
+Unix mete las dos en el mismo entero y reparte bits, que es por lo que hay
+que desmontarlo con `WIFEXITED` y companyia y por lo que nadie se acuerda
+de como va. Aqui van por separado: cuesta un puntero y se entiende
+leyendolo.
+
+Que `WUNTRACED` haya que **pedirlo** -y no venga de serie- es de las pocas
+decisiones de Unix que se explican solas: quien no sabe que existen los
+procesos detenidos no sabria que hacer con uno.
+
+## fg, bg, y el orden que sale caro
+
+    consola(t->pgid);                    /* primero el testigo */
+    kill(-(int64_t)t->pgid, SIGCONT);    /* luego el pistoletazo */
+
+Equivocarse de orden sale caro y el sintoma no lleva a la causa: si el
+`SIGCONT` va primero, el proceso arranca, intenta leer del teclado, ve que
+no es el de primer plano, se gana un `SIGTTIN` y se vuelve a parar en el
+acto. `fg` parpadearia y no haria nada, y estarias buscando el fallo en
+`fg`.
+
+`bg` es lo mismo **sin la primera linea**. Toda la diferencia entre traer
+algo al frente y soltarlo en el fondo es esa: quien se queda el teclado.
+
+El `kill(-pgid, ...)` es el convenio de Unix y no es un truco sucio: un
+pid y un pgid viven en el mismo espacio de numeros -un grupo se llama como
+su primer proceso- asi que para decir cual de los dos es hace falta algo
+que no sea el numero. El signo estaba libre porque no hay pids negativos.
+
+Ctrl-Z va al grupo, asi que para una tuberia entera, y `fg` la reanuda
+entera:
+
+    / $ lento 30 a | lento 30 b
+      [a] 7 de 30      [b] 7 de 30
+      ^Z
+      [1] parado   lento 30 a | lento 30 b
+    / $ fg
+      [a] 8 de 30      [b] 8 de 30
+
+### Una lista de trabajos que no sabe distinguir parado de corriendo
+
+Dos fallos de contabilidad, los dos en el mismo sitio y los dos por
+preguntar de menos.
+
+El primero: `recoger()` preguntaba con `WNOHANG` a secas, asi que un
+trabajo del fondo que se detenia -porque intento leer, que es lo normal-
+contestaba "sigue vivo" y la lista decia **corriendo**. Peor que un error
+de contabilidad: el usuario se queda esperando a que avance algo que no va
+a avanzar.
+
+El segundo aparecio al arreglar el primero. Los trabajos ya marcados como
+parados se saltaban, porque volver a preguntar solo servia para
+anunciarlos en cada prompt. Pero a un proceso parado se le puede mandar un
+`SIGKILL` -es lo unico aparte de `SIGCONT` que lo saca de ahi- y entonces
+la lista seguia diciendo "parado" de algo que ya no existia. Lo que no hay
+que repetir no es la pregunta, es el **anuncio**: se dice al cambiar de
+estado, no cada vez que se mira.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -4026,16 +4245,24 @@ dependencias del `-o`, que aqui es un ejecutable.
 - El shell no tiene historial, ni tuberias de mas de dos, ni `2>`.
   Redirigir stderr pide poder nombrar el descriptor de destino (`2>&1`), y
   eso es una sintaxis nueva, no una llamada nueva.
-- Hay `&` y `jobs`, pero no `fg` ni `bg`: un trabajo que se manda al fondo
-  no se puede traer al frente. `fg` es dos lineas -ceder la consola a ese
-  grupo y esperarlo- y sin `bg` sirve de poco, porque para tener algo
-  parado que reanudar hacen falta `SIGTSTP` y `SIGCONT`, o sea Ctrl-Z, que
-  es una senyal que este sistema no tiene: aqui un proceso esta vivo o
-  muerto, nunca detenido.
-- No hay `SIGTTIN` ni `SIGTTOU`, asi que un proceso de segundo plano que
-  lea del teclado **roba las teclas** que ibas a escribirle al shell, por
-  turnos y sin avisar. En Unix eso es precisamente lo que cazan esas dos
-  senyales: leer desde el fondo te detiene en vez de dejarte competir.
+- `SIGTTOU` existe como numero pero no se genera nunca: un proceso de
+  segundo plano que escribe ensucia la pantalla y nadie lo para. Unix hace
+  lo mismo salvo que se lo pidas con `stty tostop`, y el motivo es que
+  escribir desde el fondo es molesto pero no te quita nada; leer, si.
+- No hay `stty` ni modo canonico, asi que tampoco hay Ctrl-D: el terminal
+  no sabe convertir una tecla en fin de fichero. Un `wc` en primer plano
+  lee hasta que lo matas.
+- Las teclas de control estan escritas a mano en los dos drivers (3 para
+  Ctrl-C, 26 para Ctrl-Z) y no se pueden cambiar. En Unix eso es una tabla
+  del terminal, no una constante del driver.
+- Un trabajo parado por `SIGTTIN` no dice por que esta parado: la lista
+  ensenya "parado" igual que si lo hubieras parado tu con Ctrl-Z. `waitpid`
+  contesta W_PARADO pero no cual fue la senyal.
+- `WUNTRACED` avisa de que un proceso esta parado cada vez que se
+  pregunta, no solo la primera. El shell lo tapa anunciandolo solo al
+  cambiar de estado; un Unix lo lleva en el propio proceso.
+- No hay `SIGCHLD`, asi que los cambios de estado se descubren preguntando
+  antes de cada prompt y no en el momento en que ocurren.
 - No hay sesiones, ni proceso lider, ni `SIGHUP`. Con un solo terminal y
   un solo shell, una sesion seria una etiqueta que no distingue nada.
 - Dos procesos que escriban a la vez en la consola se entrelazan letra a

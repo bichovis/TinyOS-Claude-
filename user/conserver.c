@@ -84,7 +84,7 @@ static void drenar(uint64_t base)
 
     char buf[32];
     uint64_t n = 0;
-    int interrumpir = 0;
+    int interrumpir = 0, parar = 0;
     int perdidos = 0;
 
     /* RECONOCER PRIMERO Y VACIAR DESPUES, y repetir mientras quede algo.
@@ -125,7 +125,8 @@ static void drenar(uint64_t base)
              * trabajo del terminal. Lo que este proceso NO puede saber es a
              * quien hay que interrumpir -eso esta en la tabla de procesos- asi
              * que de eso se encarga el kernel. */
-            if (c == 3) { interrumpir = 1; continue; }
+            if (c == 3)  { interrumpir = 1; continue; }
+            if (c == 26) { parar = 1; continue; }        /* Ctrl-Z */
 
             if (n < sizeof(buf)) buf[n++] = c;
 
@@ -140,6 +141,7 @@ static void drenar(uint64_t base)
 
     if (n) console_push(buf, n);
     if (interrumpir) console_int();
+    if (parar)       console_stop();
 
     if (perdidos) {
         /* Por el hardware y no por printf: printf escribe en el descriptor

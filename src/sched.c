@@ -941,6 +941,11 @@ static volatile uint64_t consola_pgid;     /* que GRUPO esta en primer plano */
 
 static void kcopy(void *dst, const void *src, uint64_t n);   /* mas abajo */
 
+/* Las que detienen. Se repiten en varios sitios y una lista suelta se
+ * desincroniza, asi que va una vez. */
+#define ES_PARADA(s) ((s) == SIGSTOP || (s) == SIGTSTP || \
+                      (s) == SIGTTIN || (s) == SIGTTOU)
+
 int task_signal(uint64_t pid, int sig)
 {
     if (sig <= 0 || sig >= SIG_MAX) return -1;
@@ -950,7 +955,39 @@ int task_signal(uint64_t pid, int sig)
     int ok = 0;
 
     if (t && t->state != TASK_ZOMBIE && t->pgd) {
+        /* Parar y seguir se ANULAN entre si, y hay que hacerlo al
+         * apuntarlas y no al entregarlas.
+         *
+         * Si llegan un Ctrl-Z y un SIGCONT casi a la vez y las dos se
+         * quedan apuntadas, el proceso arranca y se vuelve a parar, o al
+         * reves, segun el orden en que se miren los bits. Ninguno de los
+         * dos resultados es el que pidio nadie: lo que pidio el ultimo en
+         * hablar es lo que vale, y para eso la que llega borra a su
+         * contraria. */
+        if (sig == SIGCONT) {
+            t->sig_pending &= ~((1u << SIGSTOP) | (1u << SIGTSTP) |
+                                (1u << SIGTTIN) | (1u << SIGTTOU));
+        } else if (ES_PARADA(sig)) {
+            t->sig_pending &= ~(1u << SIGCONT);
+        }
+
         t->sig_pending |= 1u << sig;
+
+        /* Un proceso detenido no vuelve a EL0, asi que NO pasa por
+         * signal_deliver: apuntarle un bit ahi no sirve de nada. Lo que lo
+         * saca de ahi tiene que actuar aqui.
+         *
+         * SIGCONT es la que existe para eso. Pero SIGKILL tambien tiene
+         * que hacerlo, y esto es facil de olvidar: sin ello, un proceso
+         * parado seria inmatable -la senyal fulminante se quedaria
+         * apuntada en la libreta de alguien que no va a leerla nunca- y
+         * habria que despertarlo para poder matarlo. Asi que se le
+         * devuelve la CPU lo justo para que se muera. */
+        if (t->state == TASK_STOPPED && (sig == SIGCONT || sig == SIGKILL)) {
+            t->state = TASK_READY;
+            sched_kick_idle();
+            wq_wake_all(&exit_wq);       /* el padre puede estar en waitpid */
+        }
 
         /* Y despertarlo, porque una senyal apuntada en la libreta de
          * alguien que duerme no sirve de nada hasta que se despierte.
@@ -959,7 +996,10 @@ int task_signal(uint64_t pid, int sig)
          * mano y marcarle que lo ha despertado una senyal, no el aviso que
          * esperaba: su llamada al sistema tiene que volver diciendo que la
          * interrumpieron, no fingir que la condicion se cumplio. */
-        if (t->state == TASK_SLEEPING) {
+        if (t->state == TASK_STOPPED) {
+            /* Detenido: la senyal espera a que lo reanuden. No se le
+             * despierta, que es justo lo que significa estar parado. */
+        } else if (t->state == TASK_SLEEPING) {
             t->state = TASK_READY;
         } else if (t->state == TASK_BLOCKED) {
             t->interrumpido = 1;
@@ -1159,23 +1199,67 @@ int task_bootstrap(const char *nombre, const struct args *args,
  * cerrojo cogido, y luego se senyalan sin el, porque task_signal lo
  * vuelve a pedir. Recorrer la tabla llamando a task_signal desde dentro
  * seria un interbloqueo contra uno mismo. */
-void task_console_interrupt(void)
+int task_signal_grupo(uint64_t pgid, int sig)
 {
+    if (!pgid) return -ESRCH;
+
     uint64_t destinos[MAX_TASKS];
     int n = 0;
 
     uint64_t flags = sched_lock_irqsave();
-    uint64_t grupo = consola_pgid;
 
-    if (grupo)
-        for (int i = CORES; i < MAX_TASKS && n < MAX_TASKS; i++)
-            if (tasks[i].state != TASK_UNUSED && tasks[i].pgd &&
-                tasks[i].state != TASK_ZOMBIE && tasks[i].pgid == grupo)
-                destinos[n++] = tasks[i].pid;
+    for (int i = CORES; i < MAX_TASKS && n < MAX_TASKS; i++)
+        if (tasks[i].state != TASK_UNUSED && tasks[i].pgd &&
+            tasks[i].state != TASK_ZOMBIE && tasks[i].pgid == pgid)
+            destinos[n++] = tasks[i].pid;
 
     sched_unlock_irqrestore(flags);
 
-    for (int i = 0; i < n; i++) task_signal(destinos[i], SIGINT);
+    for (int i = 0; i < n; i++) task_signal(destinos[i], sig);
+    return n ? 0 : -ESRCH;
+}
+
+/* Detenerse aqui mismo, y volver donde estabas.
+ *
+ * No hay nada que guardar. El proceso esta a mitad de una llamada al
+ * sistema, con su pila de kernel y su marco de excepcion tal cual: si no
+ * se ejecuta, tampoco se mueve. Al reanudarlo, sigue por la linea de
+ * abajo, y desde ahi vuelve por el mismo camino por el que entro.
+ *
+ * Devuelve -1 si al despertar hay algo que no admite continuar: solo
+ * SIGKILL puede sacar de aqui aparte de SIGCONT, asi que si no fue el uno
+ * fue el otro.
+ *
+ * Que esto sea una funcion y no dos copias importa: lo llaman el
+ * repartidor de senyales -para un Ctrl-Z- y la lectura del teclado -para
+ * un SIGTTIN-, y son dos caminos muy distintos hasta la misma decision. */
+int task_parar(void)
+{
+    uint64_t flags = sched_lock_irqsave();
+
+    current->state = TASK_STOPPED;
+    wq_wake_all(&exit_wq);          /* que el padre se entere ANTES */
+    schedule_locked();
+
+    int abortar = (current->sig_pending & (1u << SIGKILL)) != 0;
+
+    sched_unlock_irqrestore(flags);
+    return abortar ? -1 : 0;
+}
+
+void task_console_interrupt(void) { task_signal_grupo(consola_pgid, SIGINT); }
+void task_console_stop(void)      { task_signal_grupo(consola_pgid, SIGTSTP); }
+
+/* ¿El grupo de quien pregunta es el que tiene la consola?
+ *
+ * Lo pregunta la lectura del teclado. Con la consola sin repartir -antes
+ * de que init arranque a nadie- la respuesta es que si: negarsela a todo
+ * el mundo dejaria la maquina muda. */
+int task_en_primer_plano(void)
+{
+    if (!current || !current->pgd) return 1;
+    if (!consola_pgid)             return 1;
+    return current->pgid == consola_pgid;
 }
 
 /* ¿Puede el KERNEL escribir en esa direccion del proceso?
@@ -1271,7 +1355,34 @@ void signal_deliver(struct trap_frame *f)
         if (!(t->sig_pending & (1u << s))) continue;
         t->sig_pending &= ~(1u << s);
 
-        uint64_t h = (s == SIGKILL) ? 0 : t->sig_handler[s];
+        /* SIGCONT sin manejador no hace NADA aqui, y eso es correcto: su
+         * trabajo entero ocurrio en task_signal, que es quien devolvio el
+         * proceso a la cola de listos. Cuando llega hasta este punto es
+         * que el proceso ya estaba corriendo, y entonces no hay nada que
+         * continuar. */
+        if (s == SIGCONT && !t->sig_handler[s]) continue;
+
+        /* Ni SIGKILL ni SIGSTOP se atrapan, y por el mismo motivo: son las
+         * dos unicas garantias que le quedan a quien esta fuera. Una es
+         * "esto se puede matar" y la otra "esto se puede parar", y las dos
+         * dejan de valer en cuanto el programa puede opinar. */
+        uint64_t h = (s == SIGKILL || s == SIGSTOP) ? 0 : t->sig_handler[s];
+
+        /* Detenerse es una accion POR DEFECTO, igual que morirse; lo que
+         * pasa es que no es definitiva. El proceso se queda aqui dentro,
+         * a mitad de volver a EL0, con su marco de excepcion intacto: no
+         * se guarda nada ni se deshace nada, porque no se va a ningun
+         * sitio. Cuando alguien le mande un SIGCONT seguira por la linea
+         * de abajo y hara su eret como si no hubiera pasado nada.
+         *
+         * Y hay que avisar al padre ANTES de pararse. Si no, un shell que
+         * esta en waitpid esperando a este proceso se queda ahi para
+         * siempre: el hijo no ha muerto -asi que no despierta a nadie- y
+         * tampoco va a volver a correr. Los dos esperando al otro. */
+        if (!h && ES_PARADA(s)) {
+            task_parar();
+            continue;                    /* al volver, mirar si queda algo */
+        }
 
         if (!h) {
             uint64_t lf = uart_begin();
@@ -1378,7 +1489,7 @@ int task_alive(uint64_t pid)
  *
  * Que la tarea haya desaparecido del todo tambien vale como "termino": el
  * recolector puede haber pasado por ahi antes de que nos despertaramos. */
-int task_wait(uint64_t pid, int64_t *codigo, int banderas)
+int task_wait(uint64_t pid, int64_t *codigo, int *que, int banderas)
 {
     uint64_t flags = sched_lock_irqsave();
     int      ret   = 0;
@@ -1389,16 +1500,13 @@ int task_wait(uint64_t pid, int64_t *codigo, int banderas)
      * quien pregunta sin bloquearse no lo esta. */
     if (current && !(banderas & WNOHANG)) current->waiting_for = pid;
 
+    if (que) *que = W_SALIDA;
+
     for (;;) {
         struct task *t = by_pid(pid);
 
         if (!t) {                          /* ya no existe: nada que contar */
             if (codigo) *codigo = -1;
-            break;
-        }
-
-        if (t->state != TASK_ZOMBIE && (banderas & WNOHANG)) {
-            ret = -EAGAIN;                   /* sigue vivo; vuelve luego */
             break;
         }
 
@@ -1409,6 +1517,29 @@ int task_wait(uint64_t pid, int64_t *codigo, int banderas)
              * zombi existia precisamente para que su padre leyera esto. */
             t->parent = 0;
             wq_wake_one(&reaper_wq);
+            break;
+        }
+
+        /* Detenido no es terminado, y por eso hay que pedirlo aparte.
+         *
+         * Un waitpid que contestara a las dos cosas sin distinguirlas seria
+         * peor que uno que no contesta: el que espera creeria que su hijo
+         * ha acabado y seguiria adelante dejando atras un proceso que
+         * sigue existiendo, con sus ficheros abiertos y su memoria. Que
+         * WUNTRACED haya que pedirlo -y no venga de serie- es de las pocas
+         * decisiones de Unix que se explican solas: quien no sabe que
+         * existen los procesos detenidos no sabria que hacer con uno.
+         *
+         * Y NO se recoge: un proceso parado no es un zombi, va a volver.
+         * Lo unico que se hace es contarlo. */
+        if (t->state == TASK_STOPPED && (banderas & WUNTRACED)) {
+            if (codigo) *codigo = 0;
+            if (que)    *que    = W_PARADO;
+            break;
+        }
+
+        if (banderas & WNOHANG) {
+            ret = -EAGAIN;                   /* sigue vivo; vuelve luego */
             break;
         }
 

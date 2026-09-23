@@ -458,6 +458,7 @@ static int preparar(struct orden *o, const char *linea)
 static struct trabajo {
     int      usado;
     int      numero;                 /* el [1] que se ensenya */
+    int      parado;                 /* detenido, que no es terminado */
     uint64_t pgid;
     uint64_t pids[2];
     int      npids;
@@ -467,13 +468,15 @@ static struct trabajo {
 static int siguiente_numero = 1;
 static uint64_t mi_grupo;            /* el del propio shell */
 
-static void anotar(uint64_t pgid, uint64_t p1, uint64_t p2, const char *orden)
+static struct trabajo *anotar(uint64_t pgid, uint64_t p1, uint64_t p2,
+                              const char *orden, int parado)
 {
     for (int i = 0; i < MAX_TRABAJOS; i++) {
         if (trabajos[i].usado) continue;
 
         struct trabajo *t = &trabajos[i];
         t->usado  = 1;
+        t->parado = parado;
         t->numero = siguiente_numero++;
         t->pgid   = pgid;
         t->npids  = 0;
@@ -481,10 +484,31 @@ static void anotar(uint64_t pgid, uint64_t p1, uint64_t p2, const char *orden)
         if (p2) t->pids[t->npids++] = p2;
         ucopiar(t->orden, orden, sizeof(t->orden));
 
-        printf("  [%d] %lu\n", t->numero, (unsigned long)pgid);
-        return;
+        printf("  [%d] %s  %s\n", t->numero,
+               parado ? "parado " : "en el fondo", t->orden);
+        return t;
     }
-    printf("  no caben mas trabajos en segundo plano\n");
+    printf("  no caben mas trabajos\n");
+    return 0;
+}
+
+static struct trabajo *buscar_trabajo(const char *arg)
+{
+    /* Sin numero, el ULTIMO que se anoto. Es lo que hace cualquier shell y
+     * es lo que uno quiere decir cuando escribe "fg" a secas: el de antes. */
+    struct trabajo *mejor = 0;
+
+    if (arg && *arg) {
+        int n = atoi(arg);
+        for (int i = 0; i < MAX_TRABAJOS; i++)
+            if (trabajos[i].usado && trabajos[i].numero == n) return &trabajos[i];
+        return 0;
+    }
+
+    for (int i = 0; i < MAX_TRABAJOS; i++)
+        if (trabajos[i].usado && (!mejor || trabajos[i].numero > mejor->numero))
+            mejor = &trabajos[i];
+    return mejor;
 }
 
 /* Recoger los que hayan terminado, SIN esperar a ninguno.
@@ -503,16 +527,47 @@ static void recoger(void)
         struct trabajo *t = &trabajos[i];
         if (!t->usado) continue;
 
-        int quedan = 0;
+        /* Los parados TAMBIEN se miran.
+         *
+         * Saltarselos parecia razonable -no han terminado, estan
+         * esperando permiso- y dejaba un agujero: a un proceso parado se
+         * le puede mandar un SIGKILL, y de hecho es lo unico aparte de
+         * SIGCONT que lo saca de ahi. Si el shell no vuelve a preguntar,
+         * la lista sigue diciendo "parado" de algo que ya no existe.
+         *
+         * Lo que no se repite es el ANUNCIO, que es lo unico que molestaba
+         * de preguntar: se dice al cambiar de estado, no en cada prompt. */
+        int quedan = 0, se_paro = 0;
+
         for (int k = 0; k < t->npids; k++) {
             if (!t->pids[k]) continue;
-            if (waitpid_ya(t->pids[k]) == -EAGAIN) quedan++;
+
+            /* WUNTRACED tambien aqui, y no solo al esperar en primer
+             * plano. Sin el, un trabajo del fondo que se detiene -porque
+             * intento leer del teclado, que es lo normal- se cuenta como
+             * "sigue vivo" y la lista dice que corre. Y es peor que un
+             * error de contabilidad: el usuario ve "corriendo", se queda
+             * esperando a que avance, y no va a avanzar nunca.
+             *
+             * Una lista de trabajos que no sabe distinguir parado de
+             * corriendo no es una lista de trabajos. */
+            int que = W_SALIDA;
+            if (waitpid_que(t->pids[k], &que, WNOHANG | WUNTRACED) == -EAGAIN)
+                quedan++;
+            else if (que == W_PARADO) { quedan++; se_paro = 1; }
             else t->pids[k] = 0;            /* recogido */
         }
 
-        if (!quedan) {
+        if (se_paro) {
+            if (!t->parado) {
+                t->parado = 1;
+                printf("  [%d] parado   %s\n", t->numero, t->orden);
+            }
+        } else if (!quedan) {
             printf("  [%d] hecho    %s\n", t->numero, t->orden);
             t->usado = 0;
+        } else {
+            t->parado = 0;               /* alguien le dio un SIGCONT */
         }
     }
 }
@@ -522,11 +577,12 @@ static void listar_trabajos(void)
     int hay = 0;
     for (int i = 0; i < MAX_TRABAJOS; i++)
         if (trabajos[i].usado) {
-            printf("  [%d] %lu  %s\n", trabajos[i].numero,
+            printf("  [%d] %-9s %lu  %s\n", trabajos[i].numero,
+                   trabajos[i].parado ? "parado" : "corriendo",
                    (unsigned long)trabajos[i].pgid, trabajos[i].orden);
             hay = 1;
         }
-    if (!hay) printf("  no hay trabajos en segundo plano\n");
+    if (!hay) printf("  no hay trabajos\n");
 }
 
 /* Ceder la consola a un grupo y esperarlo, y recuperarla pase lo que
@@ -536,15 +592,73 @@ static void listar_trabajos(void)
  * Es un prestamo, y como todo prestamo lo importante es la linea de
  * despues: si el shell se olvidara de recuperarla, el teclado se quedaria
  * apuntando a un grupo que ya no existe y Ctrl-C no volveria a servir. */
-static int64_t en_primer_plano(uint64_t pgid, uint64_t p1, uint64_t p2)
+static int64_t en_primer_plano(uint64_t pgid, uint64_t p1, uint64_t p2,
+                               int *parado)
 {
     consola(pgid);
 
-    int64_t codigo = waitpid(p1);
-    if (p2) codigo = waitpid(p2);
+    int64_t codigo = 0;
+    int     que    = W_SALIDA;
+    *parado = 0;
 
+    uint64_t quienes[2] = { p1, p2 };
+    for (int i = 0; i < 2 && quienes[i]; i++) {
+        codigo = waitpid_que(quienes[i], &que, WUNTRACED);
+
+        /* Si uno se paro, se pararon todos: Ctrl-Z va al grupo entero.
+         * Seguir esperando al otro seria esperar a algo que no va a
+         * moverse, que es la forma mas facil de colgar un shell. */
+        if (que == W_PARADO) { *parado = 1; break; }
+    }
+
+    /* La consola vuelve pase lo que pase. Terminado o parado, el que
+     * manda a partir de ahora es el shell otra vez, y si se le olvidara
+     * recuperarla el teclado apuntaria a un grupo que no la va a usar. */
     consola(mi_grupo);
     return codigo;
+}
+
+/* Traer un trabajo al frente: cederle la consola, decirle que siga, y
+ * esperarlo.
+ *
+ * El ORDEN de esas dos primeras cosas importa, y equivocarse sale caro:
+ * si se manda el SIGCONT antes de cederle la consola, el proceso arranca,
+ * intenta leer del teclado, ve que no es el de primer plano, se gana un
+ * SIGTTIN y se vuelve a parar en el acto. "fg" parpadearia y no haria
+ * nada. Primero el testigo, luego el pistoletazo. */
+static void al_frente(struct trabajo *t)
+{
+    printf("  %s\n", t->orden);
+
+    consola(t->pgid);
+    kill(-(int64_t)t->pgid, SIGCONT);
+
+    int     parado = 0;
+    int     que    = W_SALIDA;
+    int64_t codigo = 0;
+
+    for (int i = 0; i < t->npids; i++) {
+        if (!t->pids[i]) continue;
+        codigo = waitpid_que(t->pids[i], &que, WUNTRACED);
+        if (que == W_PARADO) { parado = 1; break; }
+    }
+
+    consola(mi_grupo);
+
+    if (parado) { t->parado = 1; printf("\n  [%d] parado   %s\n", t->numero, t->orden); }
+    else {
+        t->usado = 0;
+        if (codigo != 0) printf("  [salida %ld]\n", (long)codigo);
+    }
+}
+
+/* Y soltarlo en el fondo: el mismo SIGCONT, pero sin darle la consola.
+ * Toda la diferencia entre fg y bg es esa linea que aqui no esta. */
+static void al_fondo(struct trabajo *t)
+{
+    t->parado = 0;
+    kill(-(int64_t)t->pgid, SIGCONT);
+    printf("  [%d] %s &\n", t->numero, t->orden);
 }
 
 /* No hace nada, y eso es lo que tiene que hacer: lo unico que se busca es
@@ -612,6 +726,19 @@ static int interna(char *orden, const char *der)
         return 1;
     }
 
+    /* fg y bg TIENEN que ser internas, y por el mismo motivo que cd: la
+     * tabla de trabajos es del shell, y un programa aparte no la ve. */
+    if ((orden[0] == 'f' || orden[0] == 'b') && orden[1] == 'g' &&
+        (orden[2] == 0 || orden[2] == ' ')) {
+        struct trabajo *t = buscar_trabajo(limpiar(orden + 2));
+        if (!t) { printf("  no hay ese trabajo\n"); return 1; }
+
+        if (orden[0] == 'f') al_frente(t);
+        else if (!t->parado) printf("  [%d] ya estaba corriendo\n", t->numero);
+        else al_fondo(t);
+        return 1;
+    }
+
     if (orden[0] == 'p' && orden[1] == 'w' && orden[2] == 'd' && !orden[3]) {
         char aqui[FS_PATH_MAX];
         getcwd(aqui, sizeof(aqui));
@@ -669,11 +796,19 @@ static void una(char *orden, int fondo, const char *entera)
 
     setpgid((uint64_t)pid, (uint64_t)pid);      /* la otra mitad de la carrera */
 
-    if (fondo) { anotar((uint64_t)pid, (uint64_t)pid, 0, entera); return; }
+    if (fondo) { anotar((uint64_t)pid, (uint64_t)pid, 0, entera, 0); return; }
 
     /* El codigo de salida del hijo. Solo se dice si no es cero, que es
      * como se comporta cualquier shell: lo normal no se anuncia. */
-    int64_t codigo = en_primer_plano((uint64_t)pid, (uint64_t)pid, 0);
+    int parado = 0;
+    int64_t codigo = en_primer_plano((uint64_t)pid, (uint64_t)pid, 0, &parado);
+
+    /* Un Ctrl-Z convierte un trabajo de primer plano en uno de la lista.
+     * No ha terminado, asi que no se puede olvidar: alguien tiene que
+     * acordarse de el o se queda parado para siempre sin nadie que lo
+     * sepa. */
+    if (parado) { printf("\n"); anotar((uint64_t)pid, (uint64_t)pid, 0, entera, 1); return; }
+
     if (codigo != 0)
         printf("  [salida %ld]\n", (long)codigo);
 }
@@ -768,9 +903,11 @@ static void tuberia(char *izq, char *der, int fondo, const char *entera)
 
     setpgid((uint64_t)p2, (uint64_t)p1);
 
-    if (fondo) { anotar((uint64_t)p1, (uint64_t)p1, (uint64_t)p2, entera); return; }
+    if (fondo) { anotar((uint64_t)p1, (uint64_t)p1, (uint64_t)p2, entera, 0); return; }
 
-    en_primer_plano((uint64_t)p1, (uint64_t)p1, (uint64_t)p2);
+    int parado = 0;
+    en_primer_plano((uint64_t)p1, (uint64_t)p1, (uint64_t)p2, &parado);
+    if (parado) { printf("\n"); anotar((uint64_t)p1, (uint64_t)p1, (uint64_t)p2, entera, 1); }
 }
 
 int main(int argc, char **argv)
@@ -780,7 +917,7 @@ int main(int argc, char **argv)
     printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
     printf("  se arrancan con fork + exec, se encadenan con | y se\n");
     printf("  redirigen con <, > y >>\n");
-    printf("  Con & van al fondo, y 'jobs' dice cuales siguen ahi\n");
+    printf("  Con & van al fondo; Ctrl-Z los para, y jobs/fg/bg los manejan\n");
     printf("  Hay directorios (cd, pwd, mkdir) y entorno (export, env, $VAR)\n");
     printf("  Prueba: ls / mkdir docs / cd docs / cat /hola.txt > copia.txt\n");
     printf("          cd .. / ls docs / wc < hola.txt / salir\n");
