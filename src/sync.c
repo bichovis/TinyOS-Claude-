@@ -13,7 +13,26 @@
 
 /* ====================== COLAS DE ESPERA ============================== */
 
-void wq_wait(struct waitqueue *wq)
+/* Sacar a una tarea de su cola. Con sched_lock cogido. */
+void wq_remove(struct task *t)
+{
+    struct waitqueue *wq = t->wq;
+    if (!wq) return;
+
+    struct task **pp = &wq->head;
+    struct task  *prev = 0;
+
+    while (*pp && *pp != t) { prev = *pp; pp = &(*pp)->wait_next; }
+    if (*pp == t) {
+        *pp = t->wait_next;
+        if (wq->tail == t) wq->tail = prev;
+    }
+
+    t->wait_next = 0;
+    t->wq        = 0;
+}
+
+static int wq_wait_comun(struct waitqueue *wq, int interrumpible)
 {
     /* Se entra con sched_lock COGIDO (responsabilidad del llamante). Eso es
      * lo que cierra la carrera clasica: si entre comprobar la condicion y
@@ -22,8 +41,10 @@ void wq_wait(struct waitqueue *wq)
      *
      * Con un solo nucleo bastaba tapar las interrupciones. Con cuatro no:
      * tapar las IRQ no calla a los otros tres. */
-    current->state     = TASK_BLOCKED;
-    current->wait_next = 0;
+    current->state        = TASK_BLOCKED;
+    current->wait_next    = 0;
+    current->wq           = wq;
+    current->interrumpido = 0;
 
     if (wq->tail) wq->tail->wait_next = current;
     else          wq->head = current;
@@ -33,6 +54,26 @@ void wq_wait(struct waitqueue *wq)
      * que seguir cogido a traves del cambio de contexto. Al volver aqui
      * -puede que mucho despues, y en otro nucleo- lo tendremos otra vez. */
     schedule_locked();
+
+    /* Al despertar hay dos motivos posibles, y hay que distinguirlos: o el
+     * aviso que se esperaba, o una senyal. */
+    current->wq = 0;
+
+    if (interrumpible && current->interrumpido) {
+        current->interrumpido = 0;
+        return -1;
+    }
+    return 0;
+}
+
+int wq_wait(struct waitqueue *wq)
+{
+    return wq_wait_comun(wq, 1);
+}
+
+void wq_wait_uninterruptible(struct waitqueue *wq)
+{
+    (void)wq_wait_comun(wq, 0);
 }
 
 /* Los dos 'wake' se llaman SIEMPRE con sched_lock cogido, asi que no lo
@@ -45,6 +86,7 @@ void wq_wake_one(struct waitqueue *wq)
         wq->head = t->wait_next;
         if (!wq->head) wq->tail = 0;
         t->wait_next = 0;
+        t->wq = 0;
         if (t->state == TASK_BLOCKED) {
             t->state = TASK_READY;
             sched_kick_idle();
@@ -58,6 +100,7 @@ void wq_wake_all(struct waitqueue *wq)
     while (t) {
         struct task *next = t->wait_next;
         t->wait_next = 0;
+        t->wq        = 0;
         if (t->state == TASK_BLOCKED) {
             t->state = TASK_READY;
             sched_kick_idle();
@@ -83,7 +126,7 @@ void mutex_lock(struct mutex *m)
     /* 'while' y no 'if': al despertarnos, otro hilo puede habernos ganado
      * el mutex por delante. Hay que volver a comprobarlo siempre. */
     while (m->locked)
-        wq_wait(&m->waiters);
+        wq_wait_uninterruptible(&m->waiters);
 
     m->locked = 1;
     m->owner  = current;
@@ -130,7 +173,7 @@ void sem_wait(struct semaphore *s)
     uint64_t f = sched_lock_irqsave();
 
     while (s->count == 0)
-        wq_wait(&s->waiters);
+        wq_wait_uninterruptible(&s->waiters);
     s->count--;
 
     sched_unlock_irqrestore(f);
@@ -166,7 +209,7 @@ void chan_send(struct channel *c, uint64_t msg)
     uint64_t f = sched_lock_irqsave();
 
     while (c->count == CHAN_CAPACITY)
-        wq_wait(&c->senders);           /* lleno: esperar a que alguien lea */
+        wq_wait_uninterruptible(&c->senders);           /* lleno: esperar a que alguien lea */
 
     c->slot[c->tail] = msg;
     c->tail = (c->tail + 1) % CHAN_CAPACITY;
@@ -201,7 +244,7 @@ uint64_t chan_recv(struct channel *c)
     uint64_t f = sched_lock_irqsave();
 
     while (c->count == 0)
-        wq_wait(&c->receivers);         /* vacio: esperar a que alguien envie */
+        wq_wait_uninterruptible(&c->receivers);         /* vacio: esperar a que alguien envie */
 
     uint64_t msg = c->slot[c->head];
     c->head = (c->head + 1) % CHAN_CAPACITY;

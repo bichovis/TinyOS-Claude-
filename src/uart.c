@@ -243,13 +243,17 @@ void uart_irq(void)
 /* Version bloqueante: en vez de preguntar cada 10 ms si ha llegado algo,
  * el hilo se duerme y la interrupcion de la UART lo despierta. Mientras
  * tanto no consume ni un ciclo. */
-char uart_getc_blocking(void)
+int uart_getc_blocking(void)
 {
     uint64_t f = sched_lock_irqsave();
     char c;
 
-    while (!uart_read(&c))
-        wq_wait(&rx_waiters);
+    while (!uart_read(&c)) {
+        if (wq_wait(&rx_waiters) < 0) {   /* una senyal, no una tecla */
+            sched_unlock_irqrestore(f);
+            return -1;
+        }
+    }
 
     sched_unlock_irqrestore(f);
     return c;

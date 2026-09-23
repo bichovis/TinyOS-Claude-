@@ -39,11 +39,44 @@ static inline uint64_t ustrlen(const char *s)
 }
 
 /* --- Llamadas basicas -------------------------------------------------- */
-static inline void kprint(const char *s)  { syscall2(SYS_write, (uint64_t)s, ustrlen(s)); }
+/* --- Descriptores ------------------------------------------------------
+ * El 0 es la entrada y el 1 la salida, por costumbre. Quien arranca el
+ * programa puede ponerles lo que quiera, y el programa no se entera. */
+static inline int64_t write(int fd, const void *buf, uint64_t n)
+{ return syscall3(SYS_write, (uint64_t)fd, (uint64_t)buf, n); }
+
+static inline int64_t read(int fd, void *buf, uint64_t n)
+{ return syscall3(SYS_read, (uint64_t)fd, (uint64_t)buf, n); }
+
+static inline int64_t pipe(int fds[2])
+{ return syscall2(SYS_pipe, (uint64_t)fds, 0); }
+
+static inline int64_t closefd(int fd)
+{ return syscall2(SYS_close, (uint64_t)fd, 0); }
+
+static inline int64_t dup2(int viejo, int nuevo)
+{ return syscall2(SYS_dup2, (uint64_t)viejo, (uint64_t)nuevo); }
+
+/* Escribir una cadena entera en la salida. El kernel acepta trozos
+ * pequenyos por llamada, asi que aqui se da la vuelta hasta acabar. */
+static inline void kprint(const char *s)
+{
+    uint64_t n = ustrlen(s), o = 0;
+    while (o < n) {
+        int64_t k = write(1, s + o, n - o);
+        if (k <= 0) break;
+        o += (uint64_t)k;
+    }
+}
 static inline void exit(int code)         { syscall2(SYS_exit, (uint64_t)code, 0); }
 
-/* Un caracter de la consola. Bloquea hasta que llegue. */
-static inline char kgetc(void)            { return (char)syscall2(SYS_read, 0, 0); }
+/* Un caracter de la entrada. Bloquea hasta que llegue; -1 si se acaba o
+ * si nos interrumpe una senyal. */
+static inline int kgetc(void)
+{
+    char c;
+    return (read(0, &c, 1) == 1) ? (int)(unsigned char)c : -1;
+}
 
 /* --- El monton del proceso (user/umalloc.c) ---------------------------
  * Encima de sbrk(), el mismo asignador que usa el kernel para el suyo. */
@@ -74,8 +107,9 @@ static inline int64_t fork(void)          { return syscall2(SYS_fork, 0, 0); }
 static inline void *sbrk(int64_t delta)
 { return (void *)(uint64_t)syscall2(SYS_sbrk, (uint64_t)delta, 0); }
 
-/* Esperar a que termine un proceso. Vuelve enseguida si ya no existe. */
-static inline void waitpid(uint64_t pid)  { syscall2(SYS_waitpid, pid, 0); }
+/* Esperar a que termine un proceso y recoger su codigo de salida. Vuelve
+ * -1 si ya no existe o si nos interrumpio una senyal. */
+static inline int64_t waitpid(uint64_t pid) { return syscall2(SYS_waitpid, pid, 0); }
 static inline void yield(void)            { syscall2(SYS_yield, 0, 0); }
 static inline uint64_t getpid(void)       { return (uint64_t)syscall2(SYS_getpid, 0, 0); }
 static inline void sleep(uint64_t ticks)  { syscall2(SYS_sleep, ticks, 0); }

@@ -29,6 +29,8 @@ void ret_to_user(void);
 
 /* El recolector esta mas abajo; sched_init() lo necesita aqui arriba. */
 static void thread_reaper(void *arg);
+static struct task *by_pid(uint64_t pid);
+static void fd_cerrar_todos(struct task *t);
 
 /* switch.S accede al contexto con offsets desde el principio del struct */
 _Static_assert(__builtin_offsetof(struct task, ctx) == 0, "ctx debe ir primero");
@@ -421,6 +423,8 @@ static void reap(struct task *t)
 
     /* Y su pila, que vive en la zona de pilas y no en el mapa lineal: se
      * quita del mapa del kernel y la pagina fisica vuelve sola. */
+    fd_cerrar_todos(t);
+
     if (t->stack)
         kstack_free((int)(t - tasks));
 
@@ -443,16 +447,24 @@ static void thread_reaper(void *arg)
     for (;;) {
         uint64_t flags = sched_lock_irqsave();
 
+        /* Un zombi con padre vivo NO se toca: existe para que ese padre
+         * pueda leer su codigo de salida. Cuando el padre lo recoge -o se
+         * muere sin hacerlo- deja de tener padre y entonces es nuestro. */
         struct task *dead = 0;
-        for (int i = CORES; i < MAX_TASKS; i++)
-            if (tasks[i].state == TASK_ZOMBIE) { dead = &tasks[i]; break; }
+        for (int i = CORES; i < MAX_TASKS; i++) {
+            if (tasks[i].state != TASK_ZOMBIE) continue;
+            uint64_t p = tasks[i].parent;
+            if (p && by_pid(p)) continue;         /* su padre sigue ahi */
+            dead = &tasks[i];
+            break;
+        }
 
         if (!dead) {
             /* Buscar y dormirse, sin soltar las IRQ entre una cosa y otra:
              * si las soltaramos, un hilo podria morir justo en medio y su
              * aviso llegaria antes de que estuvieramos en la cola. Nos
              * dormiriamos despues del despertador. */
-            wq_wait(&reaper_wq);
+            wq_wait_uninterruptible(&reaper_wq);
             sched_unlock_irqrestore(flags);
             continue;
         }
@@ -593,6 +605,66 @@ uint64_t task_sbrk(int64_t delta)
     return viejo;
 }
 
+/* --- Descriptores de fichero ------------------------------------------
+ *
+ * Una tabla pequenya por proceso. Lo unico que hace es dar un numero a
+ * cada cosa abierta, y ese numero es lo que permite que quien arranca un
+ * programa decida a donde va su salida sin que el programa se entere.
+ */
+struct fichero *task_fd(int fd)
+{
+    if (!current || fd < 0 || fd >= MAX_FD) return 0;
+    return current->fd[fd];
+}
+
+int task_fd_alloc(struct fichero *f)
+{
+    if (!current) return -1;
+    for (int i = 0; i < MAX_FD; i++)
+        if (!current->fd[i]) { current->fd[i] = f; return i; }
+    return -1;
+}
+
+int task_fd_close(int fd)
+{
+    struct fichero *f = task_fd(fd);
+    if (!f) return -1;
+    current->fd[fd] = 0;
+    file_close(f);
+    return 0;
+}
+
+/* Poner algo en un descriptor concreto, cerrando lo que hubiera. Es la
+ * pieza que hace posible una tuberia: el hijo pone el extremo de escritura
+ * en el 1, y a partir de ahi todo lo que "imprima" va a la tuberia. */
+int task_fd_dup2(int viejo, int nuevo)
+{
+    struct fichero *f = task_fd(viejo);
+    if (!f || nuevo < 0 || nuevo >= MAX_FD) return -1;
+    if (viejo == nuevo) return nuevo;
+
+    if (current->fd[nuevo]) file_close(current->fd[nuevo]);
+    file_dup(f);
+    current->fd[nuevo] = f;
+    return nuevo;
+}
+
+static void fd_heredar(struct task *hijo, struct task *padre)
+{
+    for (int i = 0; i < MAX_FD; i++) {
+        hijo->fd[i] = padre->fd[i];
+        if (hijo->fd[i]) file_dup(hijo->fd[i]);
+    }
+}
+
+static void fd_cerrar_todos(struct task *t)
+{
+    for (int i = 0; i < MAX_FD; i++) {
+        if (t->fd[i]) file_close(t->fd[i]);
+        t->fd[i] = 0;
+    }
+}
+
 /* ====================== SENYALES ===================================
  *
  * Una senyal es un bit. Todo lo demas -cuando se mira, que se hace con el,
@@ -618,9 +690,20 @@ int task_signal(uint64_t pid, int sig)
     if (t && t->state != TASK_ZOMBIE && t->pgd) {
         t->sig_pending |= 1u << sig;
 
-        /* Si dormia, despertarlo: una senyal apuntada en la libreta de
-         * alguien que duerme no sirve de nada hasta que se despierte. */
-        if (t->state == TASK_SLEEPING) t->state = TASK_READY;
+        /* Y despertarlo, porque una senyal apuntada en la libreta de
+         * alguien que duerme no sirve de nada hasta que se despierte.
+         *
+         * Si estaba BLOQUEADO esperando algo, hay que sacarlo de la cola a
+         * mano y marcarle que lo ha despertado una senyal, no el aviso que
+         * esperaba: su llamada al sistema tiene que volver diciendo que la
+         * interrumpieron, no fingir que la condicion se cumplio. */
+        if (t->state == TASK_SLEEPING) {
+            t->state = TASK_READY;
+        } else if (t->state == TASK_BLOCKED) {
+            t->interrumpido = 1;
+            wq_remove(t);
+            t->state = TASK_READY;
+        }
         sched_kick_idle();
         ok = 1;
     }
@@ -657,13 +740,36 @@ void task_console_interrupt(void)
     if (destino) task_signal(destino, SIGINT);
 }
 
-/* ¿Se puede escribir ahi? Y si no, ¿es porque la pila necesita crecer? */
+/* ¿Puede el KERNEL escribir en esa direccion del proceso?
+ *
+ * Preguntarselo a la MMU no basta, y esto costo un fallo raro de
+ * encontrar. Despues de un fork, las paginas del proceso estan marcadas de
+ * solo lectura esperando a que el las toque; si quien escribe es el kernel
+ * -copiando un caracter leido, o un mensaje- la MMU dice que no se puede
+ * y tiene razon, pero la respuesta correcta no es rendirse: es hacer lo
+ * mismo que se haria si hubiera escrito el proceso.
+ *
+ * Asi que aqui se intenta, por orden: ¿se puede ya?, ¿es una pagina
+ * compartida que toca copiar?, ¿es la pila, que aun no ha crecido hasta
+ * ahi? Y solo si nada de eso vale, que no. */
+int user_touch_w(uint64_t va)
+{
+    if (!current || !current->pgd) return 0;
+
+    if (vmm_translate_user_w(va)) return 1;
+
+    if (vmm_cow_fault(current->pgd, va, current->asid) &&
+        vmm_translate_user_w(va)) return 1;
+
+    if (task_grow_stack(va, va) && vmm_translate_user_w(va)) return 1;
+
+    return 0;
+}
+
 static int pila_escribible(uint64_t sp, uint64_t n)
 {
-    for (uint64_t p = sp & ~(uint64_t)(PAGE_SIZE - 1); p < sp + n; p += PAGE_SIZE) {
-        if (vmm_translate_user_w(p)) continue;
-        if (!task_grow_stack(p, p))  return 0;
-    }
+    for (uint64_t p = sp & ~(uint64_t)(PAGE_SIZE - 1); p < sp + n; p += PAGE_SIZE)
+        if (!user_touch_w(p)) return 0;
     return 1;
 }
 
@@ -755,29 +861,49 @@ int task_alive(uint64_t pid)
  *
  * Que la tarea haya desaparecido del todo tambien vale como "termino": el
  * recolector puede haber pasado por ahi antes de que nos despertaramos. */
-int task_wait(uint64_t pid)
+int task_wait(uint64_t pid, int64_t *codigo)
 {
     uint64_t flags = sched_lock_irqsave();
+    int      ret   = 0;
 
     if (current) current->waiting_for = pid;
 
     for (;;) {
         struct task *t = by_pid(pid);
-        if (!t || t->state == TASK_ZOMBIE) break;
-        wq_wait(&exit_wq);
+
+        if (!t) {                          /* ya no existe: nada que contar */
+            if (codigo) *codigo = -1;
+            break;
+        }
+
+        if (t->state == TASK_ZOMBIE) {
+            if (codigo) *codigo = t->exit_code;
+
+            /* Recogido. Ahora si se lo puede llevar el recolector: el
+             * zombi existia precisamente para que su padre leyera esto. */
+            t->parent = 0;
+            wq_wake_one(&reaper_wq);
+            break;
+        }
+
+        if (wq_wait(&exit_wq) < 0) {       /* nos ha interrumpido una senyal */
+            ret = -1;
+            break;
+        }
     }
 
     if (current) current->waiting_for = 0;
 
     sched_unlock_irqrestore(flags);
-    return 0;
+    return ret;
 }
 
-void task_exit(void)
+void task_exit_con(int64_t codigo)
 {
     uint64_t flags = sched_lock_irqsave();
     (void)flags;                 /* este cerrojo no lo soltamos nosotros */
-    current->state = TASK_ZOMBIE;
+    current->exit_code = codigo;
+    current->state     = TASK_ZOMBIE;
     /* Si era un servidor, sus puertos mueren con el. Hay que despertar a
      * quien estuviera esperando o se quedaria bloqueado para siempre
      * esperando a alguien que ya no existe. */
@@ -795,6 +921,8 @@ void task_exit(void)
     schedule_locked();
     for (;;) { }                /* schedule no vuelve a elegirnos nunca */
 }
+
+void task_exit(void) { task_exit_con(-1); }
 
 /* No hay libc: cualquier cosa que parezca de <string.h> hay que escribirla. */
 static int kstrlen(const char *s)
@@ -1137,6 +1265,15 @@ int task_fork(struct trap_frame *f)
     if (!kstack) { vmm_destroy_pgd(pgd, asid); goto fail; }
     *(uint64_t *)kstack = STACK_MAGIC;
 
+    /* Los descriptores SE HEREDAN, y eso es lo que hace util al fork: el
+     * shell prepara una tuberia, se bifurca, y el hijo ya la tiene puesta
+     * sin haber hecho nada.
+     *
+     * Y se copian FUERA del cerrojo del planificador: file_dup lo pide por
+     * su cuenta, y pedirlo dos veces es un interbloqueo contra uno mismo.
+     * La ranura ya esta reservada, asi que nadie mas la va a tocar. */
+    fd_heredar(t, padre);
+
     /* El contexto del hijo es una copia del que tiene el padre ahora mismo
      * en su pila de kernel: los mismos registros y el mismo punto de
      * retorno. Solo cambia x0. */
@@ -1168,6 +1305,7 @@ int task_fork(struct trap_frame *f)
     t->sig_pending = 0;
     t->sig_frame   = 0;
     t->waiting_for = 0;
+    t->parent      = padre->pid;
 
     /* El nombre se copia, no se apunta: el del padre puede vivir en el
      * padre, y el padre puede morirse antes. */
@@ -1268,6 +1406,12 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->sig_tramp   = 0;
     t->waiting_for = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
+
+    /* Entrada, salida y errores a la consola. Si quien lo arranca quiere
+     * otra cosa, que los cambie despues. */
+    for (int i = 0; i < MAX_FD; i++) t->fd[i] = 0;
+    t->fd[0] = t->fd[1] = t->fd[2] = file_consola();
+    t->parent = current ? current->pid : 0;
 
     /* --- Pila de kernel: donde se guardara su contexto en cada syscall --- */
     kstack = kstack_alloc((int)(t - tasks));

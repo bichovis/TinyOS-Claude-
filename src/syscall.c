@@ -14,6 +14,7 @@
 #include "sync.h"
 #include "timer.h"
 #include "mm.h"
+#include "file.h"
 #include "ipc.h"
 #include "mbox.h"
 
@@ -32,7 +33,7 @@ static int user_range_ok(uint64_t va, uint64_t len, int for_write)
 
     /* Comprobar pagina a pagina: el rango puede cruzar varias. */
     for (uint64_t p = va & ~(PAGE_SIZE - 1); p < va + len; p += PAGE_SIZE) {
-        uint64_t ok = for_write ? vmm_translate_user_w(p) : vmm_translate_user(p);
+        uint64_t ok = for_write ? (uint64_t)user_touch_w(p) : vmm_translate_user(p);
         if (!ok) return 0;
     }
     return 1;
@@ -79,24 +80,6 @@ static int64_t sys_recv(uint64_t port, uint64_t umsg)
     return 0;
 }
 
-static int64_t sys_write(uint64_t buf, uint64_t len)
-{
-    if (len > 512) len = 512;
-    if (!user_readable(buf, len))
-        return -1;                       /* el proceso miente: no lo servimos */
-
-    const char *s = (const char *)buf;
-    struct mutex *m = console_mutex();
-
-    mutex_lock(m);
-    for (uint64_t i = 0; i < len; i++) {
-        if (s[i] == '\n') uart_putc('\r');
-        uart_putc(s[i]);
-    }
-    mutex_unlock(m);
-    return (int64_t)len;
-}
-
 void syscall_dispatch(struct trap_frame *f)
 {
     uint64_t nr = f->x[8];
@@ -104,8 +87,11 @@ void syscall_dispatch(struct trap_frame *f)
     int64_t  ret = -1;
 
     switch (nr) {
+    /* Ya no va directo a la UART: va al descriptor que le digan. Que el 1
+     * sea la consola es una costumbre, no una ley, y es exactamente lo que
+     * permite que una tuberia funcione. */
     case SYS_write:
-        ret = sys_write(a0, a1);
+        ret = file_write(task_fd((int)f->x[0]), f->x[1], f->x[2]);
         break;
 
     case SYS_exit:
@@ -121,7 +107,7 @@ void syscall_dispatch(struct trap_frame *f)
             uart_puts("\n");
             uart_end(lf);
         }
-        task_exit();                     /* no vuelve */
+        task_exit_con((int64_t)a0);      /* no vuelve */
         break;
 
     case SYS_yield:
@@ -264,14 +250,48 @@ void syscall_dispatch(struct trap_frame *f)
         break;
 
     case SYS_read:
-        ret = (int64_t)(uint8_t)uart_getc_blocking();
+        ret = file_read(task_fd((int)f->x[0]), f->x[1], f->x[2]);
+        break;
+
+    /* Una tuberia y sus dos extremos, que se le devuelven al proceso como
+     * dos numeros escritos en un array suyo. */
+    case SYS_pipe: {
+        struct fichero *r = 0, *w = 0;
+        if (!user_writable(f->x[0], 2 * sizeof(int))) { ret = -1; break; }
+        if (file_pipe(&r, &w) < 0)                    { ret = -1; break; }
+
+        int fr = task_fd_alloc(r);
+        int fw = task_fd_alloc(w);
+        if (fr < 0 || fw < 0) {
+            if (fr >= 0) task_fd_close(fr); else file_close(r);
+            if (fw >= 0) task_fd_close(fw); else file_close(w);
+            ret = -1;
+            break;
+        }
+
+        ((int *)f->x[0])[0] = fr;
+        ((int *)f->x[0])[1] = fw;
+        ret = 0;
+        break;
+    }
+
+    case SYS_close:
+        ret = task_fd_close((int)f->x[0]);
+        break;
+
+    case SYS_dup2:
+        ret = task_fd_dup2((int)f->x[0], (int)f->x[1]);
         break;
 
     /* Esperar a un hijo. Sin esto no hay shell posible: el prompt volveria
      * antes de que el programa hubiera dicho nada. */
-    case SYS_waitpid:
-        ret = task_wait(f->x[0]);
+    /* Devuelve el codigo con el que salio el hijo, o -1 si nos
+     * interrumpieron esperando. */
+    case SYS_waitpid: {
+        int64_t codigo = -1;
+        ret = (task_wait(f->x[0], &codigo) < 0) ? -1 : codigo;
         break;
+    }
 
     case SYS_mmio_base:
         /* El kernel concede el MMIO al crear el proceso; aqui solo le

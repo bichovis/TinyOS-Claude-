@@ -22,33 +22,29 @@ static char           linea[MAX_LINEA];
 static char           nombre[32];
 static int64_t        mi_puerto;
 
-/* La imagen ya no es un array estatico de 32 KB, que era a la vez
- * desperdicio y techo: se pide del monton, del tamanyo exacto que diga el
- * servidor de ficheros, y se devuelve al arrancar el programa. */
-static unsigned char *imagen;
 
-static void dec(uint64_t v)
-{
-    char n[24];
-    uint64_t l = udec(n, v);
-    n[l] = 0;
-    kprint(n);
-}
 
 /* --- Leer una linea, con eco y borrado ------------------------------- */
 /* El eco lo hace el shell, no el kernel: quien lee es quien decide como
  * se ve lo que se escribe. */
-static uint64_t leer_linea(void)
+/* Devuelve los caracteres leidos, o -1 si se ha acabado la entrada.
+ *
+ * Esa segunda posibilidad no existia hasta que read() pudo fallar. Sin
+ * distinguirla, un shell cuya entrada se cierra se queda dando vueltas
+ * imprimiendo prompts vacios para siempre. */
+static int64_t leer_linea(void)
 {
     uint64_t n = 0;
 
     for (;;) {
-        char c = kgetc();
+        int k = kgetc();
+        if (k < 0) return -1;                    /* se acabo la entrada */
+        char c = (char)k;
 
         if (c == '\r' || c == '\n') {
             kprint("\n");
             linea[n] = 0;
-            return n;
+            return (int64_t)n;
         }
 
         if (c == 8 || c == 127) {            /* retroceso */
@@ -91,13 +87,12 @@ static void nombre_de(const char *orden)
 }
 
 /* --- Traer el programa de la tarjeta ---------------------------------
- * Devuelve los bytes leidos, o 0. Y deja en 'motivo' POR QUE: decir
- * "no encuentro" cuando lo que pasa es que el servidor no esta arrancado
- * manda a buscar el fallo al sitio equivocado. */
+ * Devuelve los bytes leidos y deja la imagen en *img, del monton. Y deja
+ * en 'motivo' POR QUE si no ha podido: decir "no encuentro" cuando lo que
+ * pasa es que el servidor no esta arrancado manda a buscar el fallo al
+ * sitio equivocado. */
 static const char *motivo;
 
-/* Preguntar el tamanyo antes de leer: asi se pide justo eso y ni un byte
- * mas. Antes daba igual porque el buffer era fijo. */
 static uint64_t tamano_de(const char *fichero)
 {
     struct fs_request r;
@@ -125,17 +120,18 @@ static uint64_t tamano_de(const char *fichero)
     return ((struct fs_info *)m.data)->size;
 }
 
-static uint64_t cargar(const char *fichero)
+static uint64_t cargar(const char *fichero, unsigned char **img)
 {
-    uint64_t total = 0;
     motivo = "";
+    *img   = 0;
 
     uint64_t tam = tamano_de(fichero);
     if (!tam) { if (!motivo[0]) motivo = "esta vacio"; return 0; }
 
-    imagen = malloc(tam);
-    if (!imagen) { motivo = "no me cabe en memoria"; return 0; }
+    unsigned char *p = malloc(tam);
+    if (!p) { motivo = "no me cabe en memoria"; return 0; }
 
+    uint64_t total = 0;
     while (total < tam) {
         struct fs_request r;
         r.port = (unsigned long)mi_puerto;
@@ -151,17 +147,154 @@ static uint64_t cargar(const char *fichero)
             motivo = "el servidor de ficheros se ha ido a mitad";
             break;
         }
-        if (m.type != FS_OK || m.len == 0) break;   /* fin del fichero */
+        if (m.type != FS_OK || m.len == 0) break;
 
         uint64_t n = m.len;
         if (total + n > tam) n = tam - total;
         for (uint64_t i = 0; i < n; i++)
-            imagen[total + i] = (unsigned char)m.data[i];
+            p[total + i] = (unsigned char)m.data[i];
         total += n;
     }
 
-    if (!total) { free(imagen); imagen = 0; motivo = "esta vacio"; }
+    if (!total) { free(p); motivo = "esta vacio"; return 0; }
+
+    *img = p;
     return total;
+}
+
+/* --- Partir una orden ------------------------------------------------ */
+
+/* Quita espacios de los dos extremos, ahi mismo. */
+static char *limpiar(char *s)
+{
+    while (*s == ' ') s++;
+    uint64_t n = ustrlen(s);
+    while (n && s[n - 1] == ' ') s[--n] = 0;
+    return s;
+}
+
+/* Deja en 'nombre' el fichero que hay que cargar para esa orden. */
+static int fichero_de(const char *orden)
+{
+    char palabra[32];
+    uint64_t p = 0;
+
+    while (*orden == ' ') orden++;
+    while (*orden && *orden != ' ' && p < sizeof(palabra) - 1)
+        palabra[p++] = *orden++;
+    palabra[p] = 0;
+
+    if (!p) return 0;
+    nombre_de(palabra);
+    return 1;
+}
+
+static void quejarse(const char *que)
+{
+    kprint("  ");
+    kprint(que);
+    kprint(": ");
+    kprint(motivo);
+    kprint("\n");
+}
+
+/* --- Ejecutar -------------------------------------------------------- */
+
+static void una(char *orden)
+{
+    if (!fichero_de(orden)) return;
+
+    unsigned char *img;
+    uint64_t bytes = cargar(nombre, &img);
+    if (!bytes) { quejarse(nombre); return; }
+
+    int64_t pid = fork();
+    if (pid == 0) {
+        exec(img, bytes, orden);
+        kprint("  no he podido convertirme en el programa\n");
+        exit(1);
+    }
+
+    free(img);
+    if (pid < 0) { kprint("  no he podido bifurcarme\n"); return; }
+
+    /* El codigo de salida del hijo. Solo se dice si no es cero, que es
+     * como se comporta cualquier shell: lo normal no se anuncia. */
+    int64_t codigo = waitpid((uint64_t)pid);
+    if (codigo != 0) {
+        char b[24];
+        uint64_t n = udec(b, (uint64_t)(codigo < 0 ? -codigo : codigo));
+        b[n] = 0;
+        kprint("  [salida ");
+        if (codigo < 0) kprint("-");
+        kprint(b);
+        kprint("]\n");
+    }
+}
+
+/* Dos programas encadenados.
+ *
+ * El shell monta la tuberia ANTES de bifurcarse, asi que los dos hijos la
+ * heredan ya puesta. Cada uno se queda con su extremo en el descriptor
+ * que le toca -el 1 para quien escribe, el 0 para quien lee- y cierra los
+ * dos originales.
+ *
+ * Cerrarlos importa mas de lo que parece: mientras quede UN descriptor de
+ * escritura abierto en cualquier proceso, quien lee no vera nunca el final
+ * del fichero y se quedara esperando para siempre. Por eso el padre
+ * tambien cierra los suyos.
+ */
+static void tuberia(char *izq, char *der)
+{
+    if (!fichero_de(izq)) return;
+
+    char nombre_izq[32];
+    ucopy(nombre_izq, nombre, ustrlen(nombre) + 1);
+
+    unsigned char *img1;
+    uint64_t b1 = cargar(nombre_izq, &img1);
+    if (!b1) { quejarse(nombre_izq); return; }
+
+    if (!fichero_de(der)) { free(img1); return; }
+
+    unsigned char *img2;
+    uint64_t b2 = cargar(nombre, &img2);
+    if (!b2) { quejarse(nombre); free(img1); return; }
+
+    int fds[2];
+    if (pipe(fds) < 0) {
+        kprint("  no hay tuberias libres\n");
+        free(img1); free(img2);
+        return;
+    }
+
+    int64_t p1 = fork();
+    if (p1 == 0) {
+        dup2(fds[1], 1);                 /* mi salida es la tuberia */
+        closefd(fds[0]);
+        closefd(fds[1]);
+        exec(img1, b1, izq);
+        exit(1);
+    }
+
+    int64_t p2 = fork();
+    if (p2 == 0) {
+        dup2(fds[0], 0);                 /* mi entrada es la tuberia */
+        closefd(fds[0]);
+        closefd(fds[1]);
+        exec(img2, b2, der);
+        exit(1);
+    }
+
+    /* El padre no usa la tuberia, y si no la suelta el lector nunca vera
+     * el final. */
+    closefd(fds[0]);
+    closefd(fds[1]);
+    free(img1);
+    free(img2);
+
+    if (p1 > 0) waitpid((uint64_t)p1);
+    if (p2 > 0) waitpid((uint64_t)p2);
 }
 
 void _start(int argc, char **argv) __attribute__((section(".text.start")));
@@ -174,70 +307,34 @@ void _start(int argc, char **argv)
     if (mi_puerto < 0) { kprint("  [sh] sin puertos\n"); exit(1); }
 
     kprint("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
-    kprint("  y se arrancan con fork + exec.\n");
-    kprint("  Prueba: ls / cat HOLA.TXT / hello uno dos / salir\n");
+    kprint("  se arrancan con fork + exec, y se encadenan con |\n");
+    kprint("  Prueba: ls / cat hola.txt | upper / cat hola.txt | wc / salir\n");
 
     for (;;) {
         kprint("\n$ ");
-        if (leer_linea() == 0) continue;
 
-        /* La primera palabra es la orden. Se copia aparte porque la linea
-         * entera se le pasa al programa como sus argumentos. */
-        char orden[32];
-        uint64_t o = 0;
-        while (linea[o] == ' ') o++;
-        uint64_t p = 0;
-        while (linea[o] && linea[o] != ' ' && p < sizeof(orden) - 1)
-            orden[p++] = linea[o++];
-        orden[p] = 0;
-        if (!p) continue;
+        int64_t largo = leer_linea();
+        if (largo < 0) {                         /* fin de la entrada */
+            kprint("\n  se acabo la entrada, me voy\n");
+            exit(0);
+        }
+        if (largo == 0) continue;
 
-        if (orden[0] == 's' && orden[1] == 'a') {      /* salir */
+        /* ¿Hay tuberia? Se parte la linea en dos y cada mitad es una orden
+         * completa, con sus propios argumentos. */
+        char *der = 0;
+        for (uint64_t i = 0; linea[i]; i++)
+            if (linea[i] == '|') { linea[i] = 0; der = linea + i + 1; break; }
+
+        char *izq = limpiar(linea);
+        if (!*izq) continue;
+
+        if (izq[0] == 's' && izq[1] == 'a' && !der) {   /* salir */
             kprint("  hasta luego\n");
             exit(0);
         }
 
-        nombre_de(orden);
-
-        uint64_t bytes = cargar(nombre);
-        if (!bytes) {
-            kprint("  ");
-            kprint(nombre);
-            kprint(": ");
-            kprint(motivo);
-            kprint("\n");
-            continue;
-        }
-
-        /* El par de toda la vida: bifurcarse y que el hijo se convierta en
-         * el programa. Cada uno hace una cosa sola, y por eso se pueden
-         * combinar: entre el fork y el exec cabe todo lo que un shell
-         * quiera preparar para el hijo sin afectarse a si mismo.
-         *
-         * El hijo hereda 'imagen' gracias al copy-on-write, asi que exec
-         * puede leer de ahi aunque sea memoria del shell: en ese momento
-         * ya es una copia suya. */
-        int64_t pid = fork();
-
-        if (pid == 0) {
-            exec(imagen, bytes, linea);
-            /* Si exec vuelve, es que ha fallado: el proceso sigue siendo
-             * el shell duplicado y lo unico sensato es irse. */
-            kprint("  no he podido convertirme en el programa\n");
-            exit(1);
-        }
-
-        free(imagen);                  /* la copia del padre */
-        imagen = 0;
-
-        if (pid < 0) {
-            kprint("  no he podido bifurcarme\n");
-            continue;
-        }
-
-        /* Esperar a que acabe. Sin esto el prompt volveria antes de que el
-         * programa hubiera abierto la boca. */
-        waitpid((uint64_t)pid);
-        (void)dec;
+        if (der) tuberia(izq, limpiar(der));
+        else     una(izq);
     }
 }

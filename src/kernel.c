@@ -463,7 +463,8 @@ static void thread_shell(void *arg)
             sh_pid = 0;
             task_set_console(0);
         }
-        command(uart_getc_blocking());
+        int c = uart_getc_blocking();
+        if (c >= 0) command((char)c);
     }
 }
 

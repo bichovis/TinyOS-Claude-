@@ -17,7 +17,24 @@ struct waitqueue {
 /* Duerme al hilo actual en la cola. DEBE llamarse con las IRQ tapadas, y
  * al volver siguen tapadas: eso es lo que hace atomico el par
  * "comprobar condicion / dormirse" y evita perder el despertar. */
-void wq_wait(struct waitqueue *wq);
+/* Devuelve 0 si lo han despertado como es debido, y -1 si lo ha despertado
+ * una SENYAL. Esa segunda posibilidad es lo que hace que un proceso
+ * bloqueado se pueda matar: sin ella, quien se duerme esperando algo que
+ * no llega no se entera nunca de nada.
+ *
+ * Quien lo llama tiene que mirar el valor. Volver de aqui con -1 significa
+ * que la condicion NO se ha cumplido, y la llamada al sistema que estuviera
+ * en curso debe abandonar y decir que la interrumpieron. */
+int  wq_wait(struct waitqueue *wq);
+
+/* La version que no se deja interrumpir, para los cerrojos internos del
+ * kernel: son cortos, no dependen de nadie de fuera, y dejarlos a medias
+ * seria peor que esperar. */
+void wq_wait_uninterruptible(struct waitqueue *wq);
+
+/* Sacar a una tarea de la cola en la que este durmiendo. Lo usa el reparto
+ * de senyales. Con sched_lock cogido. */
+void wq_remove(struct task *t);
 void wq_wake_one(struct waitqueue *wq);   /* seguro desde un handler IRQ    */
 void wq_wake_all(struct waitqueue *wq);
 

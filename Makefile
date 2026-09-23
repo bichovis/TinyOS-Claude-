@@ -27,7 +27,7 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc
 
 # Programas de usuario con mas de un fichero fuente
 EXTRA_fs := user/sd.c
@@ -105,7 +105,7 @@ sdtest: all | $(BUILD)
 	        $(BUILD)/sd.img 2>/dev/null | head -1 | awk '{print $$1}');       \
 	 diskutil eraseDisk "MS-DOS FAT16" TINYOS MBRFormat $$DEV >/dev/null;     \
 	 printf 'Hola desde la tarjeta SD.\nEste fichero lo ha puesto un Mac y lo va a leer TinyOS.\n' > /Volumes/TINYOS/HOLA.TXT; \
-	 for p in hello ls cat run write rm cp mem deep forkd trap kill; do \
+	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc; do \
 	   cp $(BUILD)/$$p.elf /Volumes/TINYOS/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done;                         \
 	 sync; diskutil eject $$DEV >/dev/null
@@ -140,7 +140,7 @@ sdcard: all firmware
 	@cp config.txt $(BUILD)/sdcard/
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
 	@# Para el servidor de ficheros: algo que leer y algo que ejecutar.
-	@for p in hello ls cat run write rm cp mem deep forkd trap kill; do \
+	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc; do \
 	   cp $(BUILD)/$$p.elf $(BUILD)/sdcard/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done
 	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de arranque de la Pi.\n' > $(BUILD)/sdcard/HOLA.TXT

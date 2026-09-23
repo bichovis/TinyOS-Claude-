@@ -2,6 +2,9 @@
 #pragma once
 #include <stdint.h>
 #include "ipc_abi.h"
+#include "file.h"
+
+struct waitqueue;
 
 struct trap_frame;
 
@@ -51,6 +54,14 @@ struct task {
     uint64_t    sig_tramp;    /* por donde vuelve un manejador               */
     uint64_t    sig_frame;    /* donde guardo su contexto, 0 si no hay       */
     uint64_t    waiting_for;  /* a que pid espera, 0 si a ninguno            */
+    struct waitqueue *wq;     /* en que cola duerme, 0 si no duerme          */
+    int         interrumpido; /* 1 si lo desperto una senyal y no un aviso   */
+    uint64_t    parent;       /* quien lo creo: el que recogera su salida    */
+    int64_t     exit_code;    /* lo que devolvio al morir                    */
+
+    /* Sus descriptores. El 0 es la entrada, el 1 la salida, y quien los
+     * pone no es el programa sino quien lo arranco. */
+    struct fichero *fd[MAX_FD];
     const char *name;
     char        namebuf[16]; /* para los que traen su nombre de argv[0]    */
 };
@@ -116,7 +127,8 @@ void scheduler_tick(void);       /* lo llama el timer                       */
 void task_yield(void);           /* ceder la CPU voluntariamente            */
 void task_sleep(uint64_t ticks);
 void task_exit(void);
-int  task_wait(uint64_t pid);    /* espera a que ese pid termine            */
+void task_exit_con(int64_t codigo);   /* y apunta lo que devolvio */
+int  task_wait(uint64_t pid, int64_t *codigo);  /* espera y recoge su salida */
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
 int  task_exec(const uint8_t *image, uint64_t size, const char *args,
@@ -126,6 +138,16 @@ int  task_exec(const uint8_t *image, uint64_t size, const char *args,
  * de la pila, es que hace falta mas. Devuelve 1 si lo ha resuelto. */
 int  task_grow_stack(uint64_t direccion, uint64_t sp);
 uint64_t task_stack_pages(struct task *t);
+
+/* ¿Puede el kernel escribir ahi? Resuelve el copy-on-write y el
+ * crecimiento de la pila si hace falta. */
+int  user_touch_w(uint64_t va);
+
+/* --- Descriptores ----------------------------------------------------- */
+struct fichero *task_fd(int fd);              /* el de este proceso, o 0    */
+int  task_fd_alloc(struct fichero *f);        /* el primer hueco libre      */
+int  task_fd_close(int fd);
+int  task_fd_dup2(int viejo, int nuevo);
 int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
 
 /* --- Senyales --------------------------------------------------------- */

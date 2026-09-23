@@ -103,7 +103,7 @@ int port_send(int id, const struct message *m)
     /* Si el buzon esta lleno, el emisor espera. Eso da control de flujo:
      * un cliente desbocado se frena solo en vez de tumbar al servidor. */
     while (p->count == PORT_QUEUE) {
-        wq_wait(&p->senders);
+        if (wq_wait(&p->senders) < 0) { sched_unlock_irqrestore(f); return -1; }
         if (!p->in_use) { sched_unlock_irqrestore(f); return -1; }  /* murio el servidor */
     }
 
@@ -126,7 +126,7 @@ int port_recv(int id, struct message *out, uint64_t pid)
     if (!p->in_use || p->owner != pid) { sched_unlock_irqrestore(f); return -1; }
 
     while (p->count == 0) {
-        wq_wait(&p->receivers);
+        if (wq_wait(&p->receivers) < 0) { sched_unlock_irqrestore(f); return -1; }
         if (!p->in_use || p->owner != pid) { sched_unlock_irqrestore(f); return -1; }
     }
 

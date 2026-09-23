@@ -80,6 +80,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 23   | fork con copy-on-write                      | hecho  |
 | 24   | exec: convertirse en otro programa          | hecho  |
 | 25   | Senyales, y Ctrl-C                          | hecho  |
+| 26   | Sueño interrumpible, descriptores y tuberias| hecho  |
 
 ## Estructura
 
@@ -107,6 +108,8 @@ Tres cosas que QEMU perdona y el silicio no:
                  forkd.c     se bifurca y mide lo que NO cuesta hacerlo
                  signal.c    el trampolin por donde vuelve un manejador
                  trap.c      atrapa Ctrl-C     kill.c  manda senyales
+                 upper.c     filtro: lee de la entrada y escribe en la salida
+                 wc.c        cuenta lo que le pasa por delante
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -1019,6 +1022,95 @@ Y `SIGKILL` no se puede atrapar. Eso no es una limitacion, es su unico
 motivo de existir: si un proceso pudiera ignorarla, no habria forma de
 acabar con uno que se ha vuelto loco.
 
+## Sueño interrumpible
+
+Las senyales del paso anterior solo llegaban a quien estuviera corriendo.
+Un proceso bloqueado esperando algo que no llega no se enteraba de nada, y
+eso es justo cuando mas falta hace un Ctrl-C.
+
+`wq_wait()` pasa a devolver un valor: **0 si lo desperto el aviso que
+esperaba, -1 si lo desperto una senyal**. Y quien lo llama tiene que
+mirarlo, porque volver con -1 significa que la condicion NO se cumplio y
+la llamada al sistema debe abandonar.
+
+Los cerrojos internos del kernel usan la version que no se deja
+interrumpir: son cortos, no dependen de nadie de fuera, y dejarlos a
+medias seria peor que esperar.
+
+Para sacar a alguien de una cola hizo falta que la tarea supiera **en cual
+esta durmiendo** (`t->wq`), porque una senyal tiene que desenlazarla a
+mano. El efecto se ve asi:
+
+    $ upper          <- se queda esperando una tecla
+    ^C
+      [kernel] upper termina por la senyal 2
+      [salida -1]
+
+Antes de este paso, ese Ctrl-C no habria hecho nada.
+
+## Un zombi con duenyo
+
+`waitpid` perdia el codigo de salida del hijo, porque el recolector se
+llevaba los zombis en cuanto aparecian. Ahora un zombi **con padre vivo no
+se toca**: existe precisamente para que ese padre pueda leer lo que
+devolvio. Cuando el padre lo recoge -o se muere sin hacerlo- deja de tener
+padre, y entonces es del recolector.
+
+Eso es lo que significa de verdad un proceso zombi, y explica por que en
+un Unix se acumulan cuando un padre no espera a sus hijos.
+
+## Descriptores de fichero
+
+Hasta aqui, un programa que escribia llamaba a `SYS_write` y el kernel lo
+mandaba a la UART. Directo, y por eso mismo **imposible de redirigir**: no
+habia ningun sitio donde decir "lo que escriba este, que vaya a otro lado".
+
+Un descriptor es ese sitio. El programa escribe "en el 1" y **quien decide
+que es el 1 es quien lo arranco**. De ahi sale todo lo demas.
+
+    SYS_write(buf, n)        ->  SYS_write(fd, buf, n)
+    SYS_read()  -> un char   ->  SYS_read(fd, buf, n)
+
+Los descriptores **se heredan** al bifurcarse y **sobreviven al exec** —
+esa es la pieza que hace util al par: el shell prepara la tuberia, se
+bifurca, y el hijo ya la tiene puesta sin haber hecho nada, y sigue
+puesta cuando se convierte en otro programa.
+
+## Tuberias
+
+Una cola de bytes con dos extremos y una regla: quien lee se para si no
+hay nada, quien escribe se para si no cabe. Esa espera es todo el
+mecanismo de sincronizacion que hace falta para encadenar programas.
+
+    $ cat hola.txt | upper
+      HOLA DESDE LA TARJETA SD.
+      ESTE FICHERO LO HA PUESTO UN MAC Y LO VA A LEER TINYOS.
+
+    $ ls | wc
+      17 lineas, 461 bytes
+
+Ni `cat` ni `ls` saben que hay alguien detras, y ni `upper` ni `wc` saben
+de donde les llega. Esa ignorancia es lo que los hace combinables.
+
+Lo que la cierra es el **final de fichero**: cuando se cierra el ultimo
+extremo de escritura, quien lee deja de esperar y recibe un cero. Por eso
+el shell cierra sus dos copias de la tuberia despues de bifurcarse —
+mientras quede un solo descriptor de escritura abierto en cualquier
+proceso, el lector espera para siempre.
+
+### Dos interbloqueos que aparecieron por el camino
+
+**Tocar memoria de usuario con el cerrojo cogido.** Las colas de la
+tuberia se manejan con `sched_lock`, y leer del buffer del proceso ahi
+dentro puede provocar un fallo de pagina -la pila crece, una pagina es
+COW- que acabaria pidiendo ese mismo cerrojo. La solucion es copiar a un
+buffer del kernel ANTES de entrar.
+
+**Heredar los descriptores con el cerrojo cogido.** `task_fork` copiaba la
+tabla dentro de la seccion critica, y `file_dup` lo pide por su cuenta.
+Un spinlock contra uno mismo, y el sintoma fue un cuelgue seco en el
+primer `|`.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -1063,13 +1155,13 @@ acabar con uno que se ha vuelto loco.
   ahorraria memoria a cambio de bastante mas codigo.
 - Una pagina no puede compartirse mas de 255 veces. Con `MAX_TASKS` en 24
   no es un limite alcanzable, pero esta ahi.
-- Las senyales solo se entregan al volver a EL0, asi que un proceso
-  bloqueado para siempre en un `recv` no se entera de ninguna. Lo que falta
-  es el sueño interrumpible: que una senyal despierte al durmiente y su
-  llamada al sistema vuelva diciendo que la interrumpieron.
+- Una tuberia son 1 KB y dos extremos: no hay `|` de tres programas
+  seguidos, ni redireccion a ficheros (`>` y `<`), que necesitaria que el
+  shell pudiera abrir uno.
+- Un zombi cuyo padre nunca lo espera se queda ahi hasta que el padre
+  muere. Es exactamente el problema que tienen los Unix de verdad.
 - No se anidan: mientras se atiende una, las demas esperan. Y no hay
   mascaras ni `sigaction`, solo un manejador por senyal.
-- `waitpid` no devuelve el codigo de salida del hijo: se pierde.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
   en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
   carga no hay nada que priorizar.
