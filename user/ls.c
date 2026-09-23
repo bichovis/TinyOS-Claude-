@@ -8,10 +8,11 @@
 
 static struct message m;
 
-void _start(void) __attribute__((section(".text.start")));
+void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
-void _start(void)
+void _start(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     int64_t mio = port_create(-1);
     if (mio < 0) { kprint("  [ls] sin puertos\n"); exit(1); }
 

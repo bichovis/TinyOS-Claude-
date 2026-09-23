@@ -14,7 +14,6 @@
 #include "syscall.h"
 #include "fs_abi.h"
 
-#define PROGRAMA  "HELLO.BIN"
 #define MAX_IMG   (32 * 1024)
 
 static struct message m;
@@ -28,21 +27,46 @@ static void dec(const char *antes, uint64_t v, const char *despues)
     kprint(antes); kprint(num); kprint(despues);
 }
 
-void _start(void) __attribute__((section(".text.start")));
+void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
-void _start(void)
+/* Rehacer la linea de argumentos para el hijo: todo lo que venga despues
+ * de "run". Asi "run HELLO.ELF uno dos" arranca HELLO.ELF viendose a si
+ * mismo como argv[0] y con "uno dos" detras. */
+static char args_hijo[128];
+
+static void juntar_args(int argc, char **argv)
 {
+    uint64_t o = 0;
+    for (int i = 1; i < argc; i++) {
+        if (o && o < sizeof(args_hijo) - 1) args_hijo[o++] = ' ';
+        for (const char *s = argv[i]; *s && o < sizeof(args_hijo) - 1; s++)
+            args_hijo[o++] = *s;
+    }
+    args_hijo[o] = 0;
+}
+
+void _start(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprint("\n  uso: run PROGRAMA.ELF [argumentos]\n");
+        exit(1);
+    }
+    const char *programa = argv[1];
+    juntar_args(argc, argv);
+
     int64_t mio = port_create(-1);
     if (mio < 0) { kprint("  [run] sin puertos\n"); exit(1); }
 
-    kprint("\n  [run] leyendo " PROGRAMA " de la tarjeta...\n");
+    kprint("\n  [run] leyendo ");
+    kprint(programa);
+    kprint(" de la tarjeta...\n");
 
     uint64_t total = 0;
     while (total < MAX_IMG) {
         struct fs_request r;
         r.port = (unsigned long)mio;
         r.arg  = total;
-        ucopy(r.name, PROGRAMA, sizeof(PROGRAMA));
+        ucopy(r.name, programa, ustrlen(programa) + 1);
 
         m.type = FS_READ;
         m.len  = sizeof(r);
@@ -63,7 +87,7 @@ void _start(void)
 
     dec("  [run] ", total, " bytes leidos, se los paso al kernel\n");
 
-    int64_t pid = spawn(imagen, total);
+    int64_t pid = spawn(imagen, total, args_hijo);
     if (pid < 0) kprint("  [run] el kernel no lo ha querido\n");
     else         dec("  [run] arrancado como pid ", (uint64_t)pid, "\n");
 

@@ -155,12 +155,27 @@ void syscall_dispatch(struct trap_frame *f)
      * del hijo. Si nos desalojan a medias, al volver TTBR0 vuelve con
      * nosotros. */
     case SYS_spawn: {
-        uint64_t buf = f->x[0], len = f->x[1];
+        uint64_t buf = f->x[0], len = f->x[1], uargs = f->x[2];
 
         if (len == 0 || len > 256 * 1024) { ret = -1; break; }
         if (!user_readable(buf, len))     { ret = -1; break; }
 
-        ret = task_create_user("spawn", (const uint8_t *)buf, len, 0);
+        /* La linea de argumentos se copia a una variable nuestra antes de
+         * usarla. Comprobar pagina a pagina mientras se copia, porque una
+         * cadena puede acabarse en cualquier sitio y el proceso podria
+         * habernos dado un puntero que se sale a mitad. */
+        char args[128];
+        uint64_t i = 0;
+        for (; i < sizeof(args) - 1; i++) {
+            if (i == 0 || ((uargs + i) & (PAGE_SIZE - 1)) == 0)
+                if (!uargs || !user_readable(uargs + i, 1)) break;
+            char c = ((const char *)uargs)[i];
+            if (!c) break;
+            args[i] = c;
+        }
+        args[i] = 0;
+
+        ret = task_create_user("spawn", (const uint8_t *)buf, len, 0, args);
         break;
     }
 

@@ -96,7 +96,7 @@ void     schedule_locked(void);
 void     sched_unlock_new_task(void);
 int  task_create(const char *name, void (*fn)(void *), void *arg);
 int  task_create_user(const char *name, const uint8_t *image, uint64_t size,
-                      uint64_t mmio_pa);
+                      uint64_t mmio_pa, const char *args);
 void schedule(void);
 void scheduler_tick(void);       /* lo llama el timer                       */
 void task_yield(void);           /* ceder la CPU voluntariamente            */

@@ -70,6 +70,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 13c-2| Que los cuatro nucleos ejecuten hilos       | hecho  |
 | 14   | Pulido: IPIs, cerrojos mas finos            | hecho  |
 | 15   | Servidor de ficheros: SD, FAT16 y `spawn`   | hecho  |
+| 16   | Procesos en ELF y argumentos                | hecho  |
 
 ## Estructura
 
@@ -84,7 +85,6 @@ Tres cosas que QEMU perdona y el silicio no:
     syscall.c    despacho de las llamadas al sistema desde EL0
     ipc.c        puertos de mensajes entre procesos
     user/        programas de usuario, compilados aparte y empotrados:
-                 header.S    la cabecera que lee el cargador
                  hello.c     usa syscalls directas
                  sd.c        driver de la tarjeta SD (EMMC/SDHCI)
                  fs.c        servidor de ficheros FAT16, sirve el puerto 1
@@ -98,6 +98,7 @@ Tres cosas que QEMU perdona y el silicio no:
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
     vmm.c        tablas de traduccion de 3 niveles y espacios de usuario
+    elf.h        lo justo de ELF64 para cargar un programa
     smp.c        despierta los nucleos 1-3 y el demo del contador
     spinlock.c   exclusion mutua entre nucleos (ldaxr/stlxr)
     irq.c        los dos controladores de interrupcion del BCM2837
@@ -183,31 +184,52 @@ memoria libre. Se distingue por el indice de MAIR del propio descriptor.
 
 ## El cargador
 
-El kernel recibe un binario **plano**: una tira de bytes sin secciones ni
-simbolos, porque `objcopy` se los ha comido. Mirandolo no hay forma de saber
-donde acaba el codigo y empiezan los datos — y esa diferencia es justo la
-que decide los permisos de cada pagina.
+El kernel recibe un **ELF** y solo mira una parte minuscula: los program
+headers de tipo `PT_LOAD`. Cada uno dice "coge estos bytes del fichero,
+ponlos en esta direccion, rellena el resto con ceros, y dale estos
+permisos". Todo lo demas —secciones, simbolos, reubicaciones— es para el
+enlazador y el depurador, no para quien ejecuta.
 
-Asi que el programa lo dice de su puno y letra. Los primeros 48 bytes de
-toda imagen son una cabecera (`include/user_abi.h`, emitida por
-`user/header.S`) con las direcciones que el enlazador conoce y el kernel no:
+    LOAD  off 0x1000  vaddr 0x400000  filesz 0x444  memsz 0x444  R E
+    LOAD  off 0x2000  vaddr 0x401000  filesz 0x004  memsz 0x030  RW
 
-    [text_start, text_end)   solo lectura, ejecutable   <- de la imagen
-    [text_end,   data_end)   lectura/escritura          <- de la imagen
-    [data_end,   bss_end )   lectura/escritura          <- ceros
+Ahi esta todo: dos tramos con permisos distintos, y un `memsz` mayor que
+`filesz` en el segundo. Esa diferencia es exactamente `.bss`, y el cargador
+no tiene que hacer nada para rellenarla porque las paginas del PMM ya vienen
+a cero.
 
-El corte entre el primer tramo y el segundo esta alineado a 4 KB en
-`user/user.ld`, y no por estetica: una pagina no puede ser medio ejecutable.
+**Esto sustituyo a una cabecera que nos habiamos inventado.** En el paso 12,
+el kernel recibia un binario plano —una tira de bytes sin secciones, porque
+`objcopy` se las habia comido— y le poniamos delante 48 bytes con magia
+"TOSU" diciendo donde acababa el codigo. Funcionaba. Pero ese problema
+estaba resuelto desde 1999, el enlazador emite ELF sin que se lo pidas, y
+ademas **trae los permisos**, que en la version casera habia que deducir por
+convenio. Menos codigo nuestro y mas garantias.
 
-Con esto un programa de usuario ya puede tener variables globales. Antes no:
-la imagen entera se mapeaba de solo lectura, asi que escribir en `.data` era
-un fallo de permisos y `.bss` ni siquiera estaba mapeada. Y a cambio se gana
-W^X de verdad — `user/hello.c` lo enseña por los dos lados, escribiendo en
-sus globales y muriendo si toca su propio codigo.
+El corte entre tramos sigue alineado a 4 KB en `user/user.ld`, y no por
+estetica: una pagina no puede ser medio ejecutable. Y hay que enlazar con
+`-z max-page-size=4096`, o el enlazador de AArch64 alinea los segmentos a
+64 KB y el fichero engorda quince veces.
 
-Un detalle del que es facil no darse cuenta: `__data_end` en `user.ld` NO se
-alinea. Ese simbolo marca el ultimo byte que `objcopy` escribe en la imagen,
-y si se redondea, la cabecera promete mas bytes de los que hay.
+## Los argumentos
+
+Un proceso nuevo no tenia forma de saber que se esperaba de el: `cat`
+llevaba el nombre del fichero escrito dentro.
+
+El convenio es el de siempre —`x0` = argc, `x1` = argv, y argv apunta a un
+array de punteros terminado en cero— pero lo interesante es *donde* vive
+todo eso. El kernel lo escribe en la **pila del proceso**, que es el unico
+sitio que ya es suyo cuando todavia no existe, y lo hace por el mapa lineal
+del kernel porque esa pagina aun no esta en ningun TTBR0 activo.
+
+    >> me han llamado con 3 argumento(s): [hello] [uno] [dos]
+
+Con eso la cadena entera funciona de verdad:
+
+    run HELLO.ELF  ->  lee el ELF del servidor de ficheros
+                   ->  spawn(imagen, bytes, "HELLO.ELF")
+                   ->  el kernel monta el ELF y le deja argv en la pila
+                   ->  >> me han llamado con 1 argumento(s): [HELLO.ELF]
 
 ## Los cuatro nucleos
 
@@ -507,8 +529,6 @@ microkernel no hace. `exec` es cosa del usuario.
 - El reloj base del EMMC esta puesto a mano (41.666 MHz, el de la placa).
   Lo suyo seria preguntarselo a la GPU por el buzon, pero el buzon es del
   kernel y el driver vive en EL0.
-- Un proceso no recibe argumentos: el kernel lo crea y lo suelta. Por eso
-  `cat` y `run` llevan el nombre del fichero escrito dentro.
 - Un mensaje lleva 48 bytes, asi que cargar un programa de 4 KB son 86
   idas y venidas por el IPC. Funciona y se nota.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta

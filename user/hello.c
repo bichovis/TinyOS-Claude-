@@ -25,11 +25,23 @@ static void kdec(uint64_t v)
 }
 
 /* Que el enlazador ponga _start el primero (ver user/user.ld) */
-void _start(void) __attribute__((section(".text.start")));
+void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
-void _start(void)
+void _start(int argc, char **argv)
 {
     kprint("\n  >> Hola desde EL0. Soy un proceso de usuario.\n");
+
+    /* Los argumentos. El kernel los dejo en mi propia pila antes de que yo
+     * existiera, con x0 = argc y x1 = argv, que es el convenio de siempre. */
+    kprint("  >> me han llamado con ");
+    kdec((uint64_t)argc);
+    kprint(" argumento(s):");
+    for (int i = 0; i < argc; i++) {
+        kprint(" [");
+        kprint(argv[i]);
+        kprint("]");
+    }
+    kprint("\n");
 
     kprint("  >> mi pid es ");
     kdec(getpid());

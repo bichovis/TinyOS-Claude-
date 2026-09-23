@@ -245,10 +245,11 @@ static void responder(uint64_t puerto, uint64_t tipo, const void *datos, uint64_
     msg_send(puerto, &resp);
 }
 
-void _start(void) __attribute__((section(".text.start")));
+void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
-void _start(void)
+void _start(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     kprint("\n  [fs] servidor de ficheros vivo en EL0\n");
 
     /* Lo PRIMERO, antes de tocar el hardware: quedarse con el puerto.

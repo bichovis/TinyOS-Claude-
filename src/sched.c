@@ -18,7 +18,7 @@
 #include "exception.h"
 #include "sync.h"
 #include "ipc.h"
-#include "user_abi.h"
+#include "elf.h"
 #include "smp.h"
 #include "spinlock.h"
 
@@ -495,68 +495,159 @@ static void kcopy(void *dst, const void *src, uint64_t n)
  * por encima se queda a cero, que es justo lo que quiere .bss. Y "dejar a
  * cero" aqui no cuesta nada: pmm_alloc entrega las paginas limpias.
  */
-static int load_range(uint64_t *pgd, const uint8_t *image, uint64_t size,
-                      uint64_t va_ini, uint64_t va_fin, uint64_t copia_hasta,
-                      uint64_t flags)
+/* Cargar un segmento: copiar lo que hay en el fichero y rellenar el resto
+ * con ceros. Ese "resto" es .bss, y no hace falta tratarlo aparte: las
+ * paginas del PMM ya vienen limpias, asi que no hacer nada ES rellenar
+ * con ceros. */
+static int load_segment(uint64_t *pgd, const uint8_t *img, uint64_t size,
+                        uint64_t vaddr, uint64_t off,
+                        uint64_t filesz, uint64_t memsz, uint64_t flags)
 {
-    for (uint64_t va = va_ini; va < va_fin; va += PAGE_SIZE) {
+    for (uint64_t p = 0; p < memsz; p += PAGE_SIZE) {
         uint64_t page = pmm_alloc();
         if (!page) return -1;
 
-        if (va < copia_hasta) {
-            uint64_t n = copia_hasta - va;
-            if (n > PAGE_SIZE) n = PAGE_SIZE;
+        uint64_t n = (p < filesz) ? (filesz - p) : 0;
+        if (n > PAGE_SIZE) n = PAGE_SIZE;
 
-            /* Ni un byte de fuera de la imagen: el fichero podria estar
-             * truncado y la cabecera prometer mas de lo que hay. */
-            uint64_t off = va - USER_BASE;
-            if (off >= size)          n = 0;
-            else if (off + n > size)  n = size - off;
-
-            if (n) kcopy(phys_to_virt(page), image + off, n);
+        if (n) {
+            if (off + p + n > size) return -1;    /* fichero truncado */
+            kcopy(phys_to_virt(page), img + off + p, n);
         }
 
-        if (vmm_map_in(pgd, va, page, flags) < 0) return -1;
+        if (vmm_map_in(pgd, vaddr + p, page, flags) < 0) return -1;
     }
     return 0;
 }
 
-/* Comprueba que la cabecera dice algo coherente. Es codigo aburrido y es
- * exactamente el que evita que una imagen mal construida (o maliciosa)
- * consiga que el kernel mapee donde no debe. */
-static int header_ok(const struct user_header *h, uint64_t size)
+/* Leer un ELF y montarlo en un espacio de direcciones nuevo.
+ *
+ * Lo unico que se mira son los program headers de tipo PT_LOAD: cada uno
+ * dice que bytes del fichero van a que direccion, cuanto ocupan de verdad
+ * y con que permisos. Todo lo demas del fichero -secciones, simbolos- es
+ * para el enlazador y el depurador.
+ *
+ * La comprobacion es aburrida y es exactamente la que evita que un fichero
+ * mal formado (o malicioso) consiga que el kernel mapee donde no debe. */
+static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
+                    uint64_t *entry)
 {
-    if (size < sizeof(*h))                       return 0;
-    if (h->magic != USER_MAGIC)                  return 0;
-    if (h->version != USER_ABI_VER)              return 0;
-    if (h->text_start != USER_BASE)              return 0;
-    if (h->text_end & (PAGE_SIZE - 1))           return 0;  /* el corte de */
-                                                            /* permisos va */
-                                                            /* en frontera */
-    if (h->text_end  <  h->text_start)           return 0;
-    if (h->data_end  <  h->text_end)             return 0;
-    if (h->bss_end   <  h->data_end)             return 0;
-    if (h->entry     <  h->text_start ||
-        h->entry     >= h->text_end)             return 0;  /* entrar en un */
-                                                            /* sitio no     */
-                                                            /* ejecutable   */
-    /* Los datos tienen que estar de verdad en la imagen. El texto no hace
-     * falta comprobarlo igual: text_end esta redondeado a pagina, asi que
-     * un programa pequenyo da una imagen mas corta y el cargador rellena
-     * el resto de la pagina con ceros. */
-    if (h->data_end > h->text_end &&
-        h->data_end - h->text_start > size)      return 0;
-    if (h->bss_end >= USER_STACK_TOP - PAGE_SIZE) return 0; /* pisaria la   */
-                                                            /* pila         */
-    return 1;
+    if (size < sizeof(struct elf64_ehdr)) return -1;
+
+    const struct elf64_ehdr *eh = (const struct elf64_ehdr *)img;
+
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F')      return -1;
+    if (eh->e_ident[4] != ELF_CLASS64)                        return -1;
+    if (eh->e_ident[5] != ELF_DATA_LSB)                       return -1;
+    if (eh->e_type != ET_EXEC || eh->e_machine != EM_AARCH64) return -1;
+    if (eh->e_phentsize != sizeof(struct elf64_phdr))         return -1;
+    if (eh->e_phnum == 0 || eh->e_phnum > 8)                  return -1;
+    if (eh->e_phoff > size ||
+        eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf64_phdr) > size)
+        return -1;
+
+    const struct elf64_phdr *ph =
+        (const struct elf64_phdr *)(img + eh->e_phoff);
+
+    int cargados = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) continue;
+        if (ph[i].p_memsz == 0) continue;
+
+        uint64_t va  = ph[i].p_vaddr;
+        uint64_t mem = ph[i].p_memsz;
+
+        if (ph[i].p_filesz > mem)                 return -1;
+        if (va & (PAGE_SIZE - 1))                 return -1;  /* ver user.ld */
+        if (va < USER_BASE)                       return -1;
+        if (va + mem < va)                        return -1;  /* desbordamiento */
+        if (va + mem > USER_STACK_TOP - PAGE_SIZE) return -1;  /* pisaria la pila */
+
+        /* Los permisos salen del fichero, no de un convenio. Si el tramo
+         * se escribe, nunca se ejecuta; si no, es codigo de solo lectura.
+         * W^X sin tener que pensarlo. */
+        uint64_t flags = (ph[i].p_flags & PF_W) ? MM_USER_DATA : MM_USER_CODE;
+
+        if (load_segment(pgd, img, size, va, ph[i].p_offset,
+                         ph[i].p_filesz, mem, flags) < 0)
+            return -1;
+        cargados++;
+    }
+
+    if (!cargados) return -1;
+    if (eh->e_entry < USER_BASE ||
+        eh->e_entry >= USER_STACK_TOP - PAGE_SIZE) return -1;
+
+    *entry = eh->e_entry;
+    return 0;
+}
+
+/* --- Los argumentos ---------------------------------------------------
+ *
+ * Un proceso nuevo no tiene forma de saber que se espera de el. Hasta
+ * ahora, 'cat' llevaba el nombre del fichero escrito dentro; con esto se
+ * le puede decir al arrancarlo.
+ *
+ * El convenio es el de siempre: x0 = argc, x1 = argv, y argv apunta a un
+ * array de punteros terminado en cero. Todo eso vive en la pila del
+ * proceso, que es el unico sitio que ya es suyo y donde se puede escribir
+ * antes de que exista.
+ *
+ * Se escribe por el mapa lineal del kernel, no por la direccion de
+ * usuario: esa pagina todavia no esta en ningun TTBR0 activo.
+ */
+#define MAX_ARGS   8
+#define ARGS_BYTES 128
+
+static void build_args(uint64_t ustack_pa, const char *args,
+                       uint64_t *argc_out, uint64_t *argv_out, uint64_t *sp_out)
+{
+    char    *k    = (char *)phys_to_virt(ustack_pa);   /* la pagina, en kernel */
+    uint64_t base = USER_STACK_TOP - PAGE_SIZE;        /* la misma, en usuario */
+
+    /* 1. La cadena, arriba del todo. */
+    uint64_t len = 0;
+    if (args) while (args[len] && len < ARGS_BYTES - 1) len++;
+
+    uint64_t o_str = PAGE_SIZE - (len + 1);
+    for (uint64_t i = 0; i < len; i++) k[o_str + i] = args[i];
+    k[o_str + len] = 0;
+
+    /* 2. Partirla por los espacios, ahi mismo. Cada palabra queda como una
+     *    cadena independiente porque el separador pasa a ser un cero. */
+    uint64_t off[MAX_ARGS];
+    uint64_t argc = 0;
+    int      dentro = 0;
+
+    for (uint64_t i = 0; i <= len; i++) {
+        char c = k[o_str + i];
+        if (c == ' ' || c == 0) {
+            k[o_str + i] = 0;
+            dentro = 0;
+        } else if (!dentro) {
+            dentro = 1;
+            if (argc < MAX_ARGS) off[argc++] = o_str + i;
+        }
+    }
+
+    /* 3. El array de punteros, debajo, y alineado a 16 porque el ABI de
+     *    AArch64 exige que la pila lo este. */
+    uint64_t o_argv = (o_str - (argc + 1) * 8) & ~15UL;
+    uint64_t *argv  = (uint64_t *)(k + o_argv);
+
+    for (uint64_t i = 0; i < argc; i++)
+        argv[i] = base + off[i];
+    argv[argc] = 0;                       /* el cero final del convenio */
+
+    *argc_out = argc;
+    *argv_out = base + o_argv;
+    *sp_out   = base + o_argv;
 }
 
 int task_create_user(const char *name, const uint8_t *image, uint64_t size,
-                     uint64_t mmio_pa)
+                     uint64_t mmio_pa, const char *args)
 {
-    const struct user_header *h = (const struct user_header *)image;
-    if (!header_ok(h, size)) return -1;
-
     /* Coger una ranura y soltar el cerrojo enseguida.
      *
      * Cargar un proceso es copiar paginas y construir tablas: milisegundos.
@@ -566,8 +657,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
      *
      * TASK_BLOCKED es la reserva. No es UNUSED, asi que no se la lleva otro
      * task_create; no es READY ni RUNNING, asi que el planificador no la
-     * elige; y no es ZOMBIE, asi que el recolector la ignora. El nombre se
-     * pone ya para que un sched_dump a destiempo no lea un puntero nulo. */
+     * elige; y no es ZOMBIE, asi que el recolector la ignora. */
     uint64_t flags = sched_lock_irqsave();
     struct task *t = 0;
 
@@ -592,27 +682,18 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     }
 
     uint64_t kstack_pa = 0;
+    uint64_t entry     = 0;
 
-    /* --- Tramo 1: texto y rodata. Solo lectura y ejecutable. -------------
-     * Que sea RO no es un detalle: es lo que impide que un programa se
-     * reescriba a si mismo, y lo que permitiria mas adelante compartir
-     * estas paginas entre varias instancias del mismo programa. */
-    if (load_range(pgd, image, size, h->text_start, h->text_end,
-                   h->text_end, MM_USER_CODE) < 0)
-        goto fail;
-
-    /* --- Tramo 2: datos y bss. Escribible y NUNCA ejecutable. ------------
-     * Hasta aqui el proceso no podia tener una sola variable global: la
-     * imagen entera se mapeaba de solo lectura, asi que escribir en .data
-     * era un fallo de permisos y .bss ni siquiera estaba mapeada. */
-    uint64_t rw_end = (h->bss_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    if (load_range(pgd, image, size, h->text_end, rw_end,
-                   h->data_end, MM_USER_DATA) < 0)
+    if (load_elf(pgd, image, size, &entry) < 0)
         goto fail;
 
     /* --- Pila de usuario: una pagina justo debajo de USER_STACK_TOP --- */
     uint64_t ustack = pmm_alloc();
     if (!ustack) goto fail;
+
+    uint64_t argc = 0, argv = 0, sp = USER_STACK_TOP;
+    build_args(ustack, args, &argc, &argv, &sp);
+
     if (vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA) < 0)
         goto fail;
 
@@ -650,9 +731,11 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     struct trap_frame *tf =
         (struct trap_frame *)(kstack + PAGE_SIZE - sizeof(struct trap_frame));
     kzero(tf, sizeof(*tf));
-    tf->elr    = h->entry;           /* ya no se supone: lo dice la imagen  */
+    tf->elr    = entry;              /* lo dice el ELF                      */
     tf->spsr   = 0;                  /* M=0b0000 -> EL0t; DAIF=0 -> IRQ ON  */
-    tf->sp_el0 = USER_STACK_TOP;     /* su pila, no la nuestra              */
+    tf->sp_el0 = sp;                 /* su pila, con argv ya puesto encima  */
+    tf->x[0]   = argc;
+    tf->x[1]   = argv;
 
     kzero(&t->ctx, sizeof(t->ctx));
     t->ctx.pc = (uint64_t)ret_to_user;
@@ -665,8 +748,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     return (int)t->pid;
 
 fail:
-    /* Media carga es peor que ninguna: se devuelve todo lo repartido. Antes
-     * de que existiera el recolector esto no se podia ni escribir. */
+    /* Media carga es peor que ninguna: se devuelve todo lo repartido. */
     if (kstack_pa) pmm_free(kstack_pa);
     vmm_destroy_pgd(pgd, asid);
 

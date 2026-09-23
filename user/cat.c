@@ -1,30 +1,37 @@
 /* user/cat.c - Volcar un fichero de la tarjeta por la consola
  *
- * El nombre esta fijo aqui dentro porque todavia no hay forma de pasarle
- * argumentos a un proceso: el kernel lo crea y lo suelta, sin mas.
+ * El nombre del fichero llega como argumento: "cat HOLA.TXT". El kernel
+ * deja argc en x0 y argv en x1, con las cadenas en la propia pila del
+ * proceso, que es el unico sitio que ya es suyo antes de existir.
  */
 #include "syscall.h"
 #include "fs_abi.h"
 
-#define FICHERO  "HOLA.TXT"
-
 static struct message m;
 static char linea[MSG_DATA_MAX + 1];
 
-void _start(void) __attribute__((section(".text.start")));
+void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
-void _start(void)
+void _start(int argc, char **argv)
 {
+    if (argc < 2) {
+        kprint("\n  uso: cat NOMBRE.EXT\n");
+        exit(1);
+    }
+    const char *fichero = argv[1];
+
     int64_t mio = port_create(-1);
     if (mio < 0) { kprint("  [cat] sin puertos\n"); exit(1); }
 
-    kprint("\n  --- " FICHERO " ---\n");
+    kprint("\n  --- ");
+    kprint(fichero);
+    kprint(" ---\n");
 
     for (uint64_t off = 0; ; ) {
         struct fs_request r;
         r.port = (unsigned long)mio;
         r.arg  = off;
-        ucopy(r.name, FICHERO, sizeof(FICHERO));
+        ucopy(r.name, fichero, ustrlen(fichero) + 1);
 
         m.type = FS_READ;
         m.len  = sizeof(r);

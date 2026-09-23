@@ -6,10 +6,11 @@
  */
 #include "syscall.h"
 
-void _start(void) __attribute__((section(".text.start")));
+void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
-void _start(void)
+void _start(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     uint64_t pid = getpid();
     struct message m;
 

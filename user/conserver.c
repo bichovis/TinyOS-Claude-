@@ -39,10 +39,11 @@ static void hw_puts(uint64_t base, const char *s)
     hw_write(base, s, ustrlen(s));
 }
 
-void _start(void) __attribute__((section(".text.start")));
+void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
-void _start(void)
+void _start(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     uint64_t uart = mmio_base();
     if (!uart) {
         kprint("  [conserver] no tengo MMIO, no puedo trabajar\n");

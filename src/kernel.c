@@ -435,8 +435,8 @@ static void menu(void)
     uart_puts("  d - que los hilos de demostracion hablen (o se callen)\n");
     uart_puts("  f - arrancar el SERVIDOR DE FICHEROS (driver SD en EL0)\n");
     uart_puts("  o - listar la tarjeta\n");
-    uart_puts("  a - volcar HOLA.TXT de la tarjeta\n");
-    uart_puts("  e - cargar HELLO.BIN de la tarjeta y ejecutarlo\n");
+    uart_puts("  a - volcar un fichero: cat HOLA.TXT\n");
+    uart_puts("  e - cargar y ejecutar: run HELLO.ELF\n");
     uart_puts("  w - los 4 nucleos contra un contador (con y sin cerrojo)\n");
     uart_puts("  b - medir velocidad de la memoria\n");
     uart_puts("  t - tiempo e interrupciones\n");
@@ -475,13 +475,13 @@ static void command(char c)
         uart_puts("\n  [kernel] arrancando el driver de consola en EL0,\n");
         uart_puts("           con la pagina de la PL011 mapeada en su espacio\n");
         int pid = task_create_user("conserver", user_conserver,
-                                   user_conserver_size, UART0_PHYS);
+                                   user_conserver_size, UART0_PHYS, "conserver");
         if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'n': {
-        int pid = task_create_user("client", user_client, user_client_size, 0);
+        int pid = task_create_user("client", user_client, user_client_size, 0, "client");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         else {
             uart_puts("\n  [kernel] cliente creado, pid ");
@@ -499,7 +499,8 @@ static void command(char c)
         uart_puts("\n  [kernel] cargando ");
         uart_dec(user_hello_size);
         uart_puts(" bytes en un espacio de direcciones nuevo...\n");
-        int pid = task_create_user("hello", user_hello, user_hello_size, 0);
+        int pid = task_create_user("hello", user_hello, user_hello_size, 0,
+                                   "hello uno dos");
         if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
         else {
             uart_puts("  [kernel] proceso creado, pid ");
@@ -532,25 +533,25 @@ static void command(char c)
         sd_route_pins();
         uart_puts("  [kernel] arrancando el servidor de ficheros en EL0,\n");
         uart_puts("           con la pagina del EMMC mapeada en su espacio\n");
-        int pid = task_create_user("fs", user_fs, user_fs_size, EMMC_PHYS);
+        int pid = task_create_user("fs", user_fs, user_fs_size, EMMC_PHYS, "fs");
         if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'o': {
-        int pid = task_create_user("ls", user_ls, user_ls_size, 0);
+        int pid = task_create_user("ls", user_ls, user_ls_size, 0, "ls");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'a': {
-        int pid = task_create_user("cat", user_cat, user_cat_size, 0);
+        int pid = task_create_user("cat", user_cat, user_cat_size, 0, "cat HOLA.TXT");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'e': {
-        int pid = task_create_user("run", user_run, user_run_size, 0);
+        int pid = task_create_user("run", user_run, user_run_size, 0, "run HELLO.ELF");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }

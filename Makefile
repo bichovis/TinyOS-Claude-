@@ -34,8 +34,12 @@ EXTRA_fs := user/sd.c
 UCFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -ffreestanding -nostdlib \
            -nostartfiles -mcpu=cortex-a53 -mgeneral-regs-only -mstrict-align \
            -fno-stack-protector -fno-pie -fno-common -Iuser -I$(INCDIR)
+# -z max-page-size=4096 : sin esto el enlazador de AArch64 alinea los
+#                         segmentos a 64 KB y el ELF engorda quince veces
+# -s                    : fuera simbolos y secciones; al cargador no le
+#                         hacen falta y ocupan mas que el programa
 ULDFLAGS := -nostdlib -nostartfiles -T user/user.ld \
-            -Wl,--no-warn-rwx-segments
+            -Wl,--no-warn-rwx-segments -Wl,-z,max-page-size=4096 -s
 
 CSRCS   := $(wildcard $(SRCDIR)/*.c)
 ASRCS   := $(wildcard $(SRCDIR)/*.S)
@@ -58,18 +62,18 @@ $(BUILD)/%.S.o: $(SRCDIR)/%.S | $(BUILD)
 # --- Cadena de los programas de usuario ---
 # Cada uno se compila y enlaza por separado (en 0x80000000, ver user/user.ld),
 # se pasa a binario plano y se empotra en el kernel como un array de C.
-.PRECIOUS: $(BUILD)/%.elf $(BUILD)/%.bin $(BUILD)/%_bin.c
+.PRECIOUS: $(BUILD)/%.elf $(BUILD)/%_bin.c
 
-$(BUILD)/%.elf: user/%.c user/header.S user/syscall.h user/sd.c user/sd.h \
-                $(INCDIR)/ipc_abi.h $(INCDIR)/user_abi.h $(INCDIR)/fs_abi.h \
-                user/user.ld | $(BUILD)
+$(BUILD)/%.elf: user/%.c user/syscall.h user/sd.c user/sd.h \
+                $(INCDIR)/ipc_abi.h $(INCDIR)/fs_abi.h user/user.ld | $(BUILD)
 	@echo "  CC-U  user/$*.c"
-	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c $(EXTRA_$*) user/header.S -o $@
+	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c $(EXTRA_$*) -o $@
 
-$(BUILD)/%.bin: $(BUILD)/%.elf
-	@$(OBJCOPY) -O binary $< $@
-
-$(BUILD)/%_bin.c: $(BUILD)/%.bin tools/bin2c.py
+# Lo que se empotra en el kernel es el ELF tal cual. Antes era un binario
+# plano con una cabecera que nos habiamos inventado; ahora el formato ya
+# trae donde va cada tramo y con que permisos, asi que no hay nada que
+# traducir.
+$(BUILD)/%_bin.c: $(BUILD)/%.elf tools/bin2c.py
 	@echo "  BIN2C $@"
 	@python3 tools/bin2c.py $< $@ user_$*
 
@@ -91,16 +95,16 @@ $(BUILD):
 
 # Una imagen de tarjeta para probar el servidor de ficheros sin tocar la SD
 # de verdad: FAT16 con tabla de particiones, como la placa.
-sdtest: $(BUILD)/hello.bin | $(BUILD)
+sdtest: $(BUILD)/hello.elf | $(BUILD)
 	@rm -f $(BUILD)/sd.img
 	@dd if=/dev/zero of=$(BUILD)/sd.img bs=1m count=64 2>/dev/null
 	@DEV=$$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage \
 	        $(BUILD)/sd.img 2>/dev/null | head -1 | awk '{print $$1}');       \
 	 diskutil eraseDisk "MS-DOS FAT16" TINYOS MBRFormat $$DEV >/dev/null;     \
 	 printf 'Hola desde la tarjeta SD.\nEste fichero lo ha puesto un Mac y lo va a leer TinyOS.\n' > /Volumes/TINYOS/HOLA.TXT; \
-	 cp $(BUILD)/hello.bin /Volumes/TINYOS/HELLO.BIN;                         \
+	 cp $(BUILD)/hello.elf /Volumes/TINYOS/HELLO.ELF;                         \
 	 sync; diskutil eject $$DEV >/dev/null
-	@echo "  $(BUILD)/sd.img lista (FAT16, con HOLA.TXT y HELLO.BIN)"
+	@echo "  $(BUILD)/sd.img lista (FAT16, con HOLA.TXT y HELLO.ELF)"
 	@echo "  'make run' la usa automaticamente."
 
 
@@ -131,7 +135,7 @@ sdcard: $(BUILD)/kernel8.img firmware
 	@cp config.txt $(BUILD)/sdcard/
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
 	@# Para el servidor de ficheros: algo que leer y algo que ejecutar.
-	@cp $(BUILD)/hello.bin $(BUILD)/sdcard/HELLO.BIN
+	@cp $(BUILD)/hello.elf $(BUILD)/sdcard/HELLO.ELF
 	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de arranque de la Pi.\n' > $(BUILD)/sdcard/HOLA.TXT
 	@echo
 	@echo "Listo en $(BUILD)/sdcard:"
