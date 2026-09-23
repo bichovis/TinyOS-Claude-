@@ -65,7 +65,8 @@ Tres cosas que QEMU perdona y el silicio no:
 | 11   | Recolector: devolver lo que deja un muerto  | hecho  |
 | 12   | Cargador con secciones: W^X y globales      | hecho  |
 | 13a  | Despertar los nucleos 1, 2 y 3              | hecho  |
-| 13b  | Cerrojos y planificador por nucleo          | —      |
+| 13b  | Cerrojos de verdad y `current` por nucleo   | hecho  |
+| 13c  | Que los cuatro nucleos ejecuten hilos       | —      |
 
 ## Estructura
 
@@ -90,7 +91,8 @@ Tres cosas que QEMU perdona y el silicio no:
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
     vmm.c        tablas de traduccion de 3 niveles y espacios de usuario
-    smp.c        despierta los nucleos 1-3 y recoge su ficha
+    smp.c        despierta los nucleos 1-3 y les manda trabajo
+    spinlock.c   exclusion mutua entre nucleos (ldaxr/stlxr)
     irq.c        los dos controladores de interrupcion del BCM2837
     mbox.c       buzon de la VideoCore: le pregunta a la GPU cuanta RAM hay
     cache.S      invalidacion de la cache de datos antes de encender la MMU
@@ -252,19 +254,75 @@ escritores sobre el mismo FIFO una letra se perdio. Cinco instrucciones
 bastan para tener una carrera de datos; el resto del kernel esta lleno de
 sitios peores. Eso es el paso 13b.
 
+## Cerrojos
+
+`irq_save()` no es un cerrojo, y hasta que hubo cuatro nucleos no habia
+forma de notarlo: tapar las interrupciones calla al nucleo propio y a los
+otros tres no les dice nada.
+
+Un cerrojo de verdad necesita una operacion atomica, y en ARM no existe un
+"test and set": existe un PAR de instrucciones con el hardware vigilando en
+medio. `ldaxr` carga y reserva la direccion, `stlxr` escribe solo si la
+reserva sigue viva y dice si lo consiguio. Las dos letras del medio son lo
+que hace que el cerrojo proteja datos y no solo a si mismo: la `a` de
+*acquire* impide que la seccion critica se lea antes de tenerla, la `l` de
+*release* garantiza que lo escrito dentro ya es visible cuando otro ve el
+cerrojo abierto.
+
+`irq_save()` no desaparece: pasa a ser la mitad de un cerrojo. Uno que
+tambien se coge desde un manejador de interrupciones hay que cogerlo con las
+IRQ tapadas, o a este mismo nucleo le entra una IRQ teniendolo, el manejador
+intenta cogerlo, y se queda esperando a alguien que no va a soltarlo nunca:
+el mismo. De ahi `spin_lock_irqsave()`, y de ahi que el orden importe —
+primero tapar, despues cerrar.
+
+El comando `w` del menu lo enseña. Los cuatro nucleos suman 50000 veces
+cada uno sobre el mismo contador, en una Pi 3B de verdad:
+
+    Esperado: 200000
+      sin cerrojo :  50036
+      con cerrojo : 200000
+
+Fijate en que 50036 es casi exactamente 50000, una sola tanda. Los cuatro
+nucleos trabajaron y el resultado es el de uno: el trabajo de tres se
+evaporo entero.
+
+`contador++` son tres pasos —leer, sumar, escribir— y los cuatro nucleos se
+pelean ademas por la misma linea de cache, asi que mientras uno da los tres
+pasos los otros tres ya han leido el valor viejo. Sin cerrojo no es que
+pierdas algunos incrementos: es que pierdes casi todo el paralelismo que
+creias haber ganado.
+
+(En QEMU salen unos 79000, porque solapa los nucleos menos que el silicio.
+El hardware es mas duro con este error, no mas indulgente.)
+
+Y `current` deja de ser una variable global, porque hacen falta cuatro. Su
+sitio es **TPIDR_EL1**, un registro por nucleo que la arquitectura reserva
+justo para esto. Se sigue escribiendo `current` en todo el kernel, pero
+ahora cada nucleo lee el suyo. Las ranuras 0 a 3 de `tasks[]` quedan
+reservadas para la tarea idle de cada nucleo: el contexto en el que ya
+estaba cuando arranco.
+
 ## Limitaciones conocidas
 
-- Los nucleos 1-3 estan encendidos pero no hacen nada, porque el kernel
-  todavia no es seguro entre nucleos:
-    - `irq_save()` solo tapa las interrupciones del nucleo propio y a los
-      otros tres no les dice nada. `tasks[]`, el bitmap del PMM, las colas
-      de espera y los puertos IPC necesitan cerrojos de verdad.
-    - `current` es una variable global, y hacen falta cuatro. Su sitio es
-      `TPIDR_EL1`, que es un registro por nucleo.
+- Los nucleos 1-3 todavia no entran al planificador: solo ejecutan los
+  encargos de `smp.c`. Lo que falta para que ejecuten hilos es el paso 13c:
+    - el planificador, las colas de espera y los puertos IPC siguen
+      protegidos solo con `irq_save()`. Hoy basta, porque solo el nucleo 0
+      planifica; en cuanto planifiquen cuatro, no.
+    - y ahi aparece el problema de verdad: `wq_wait()` llama a `schedule()`
+      desde dentro de su seccion critica. Un spinlock no se puede llevar a
+      traves de un cambio de contexto, porque quien lo soltaria ya no es
+      quien lo cogio. Hay que soltarlo DESPUES del cambio, desde el hilo
+      que entra.
+    - el temporizador es por nucleo y solo esta inicializado en el 0.
     - el recolector puede liberar la pila de un zombi porque, para que el
       llegue a ejecutarse, el zombi ha tenido que dejar la CPU. Con cuatro
       nucleos el zombi puede seguir corriendo en otro.
-  Eso es el paso 13b.
+- El cerrojo de la UART hace indivisible cada LLAMADA, no cada linea: dos
+  `uart_puts` no se entrelazan, pero un `uart_puts` seguido de un
+  `uart_dec` si puede partirse. Para lineas enteras hay que sostener el
+  cerrojo desde fuera.
 - El kernel conserva su propio driver de UART para depuracion, asi que
   cuando el servidor de consola esta activo hay dos escritores sobre el
   mismo hardware y el texto puede entremezclarse. Un microkernel estricto

@@ -41,9 +41,29 @@ struct task {
     const char *name;
 };
 
-extern struct task *current;
+/* 'current' ya no puede ser una variable: hay cuatro nucleos y cada uno
+ * esta ejecutando una tarea distinta. Su sitio es TPIDR_EL1, un registro
+ * POR NUCLEO que la arquitectura reserva justo para esto: que el software
+ * guarde un puntero a "lo que este nucleo esta haciendo".
+ *
+ * Sigue escribiendose 'current' en todo el kernel, pero ahora cada nucleo
+ * lee el suyo. */
+static inline struct task *this_task(void)
+{
+    uint64_t t;
+    __asm__ volatile("mrs %0, tpidr_el1" : "=r"(t));
+    return (struct task *)t;
+}
+
+static inline void set_this_task(struct task *t)
+{
+    __asm__ volatile("msr tpidr_el1, %0" :: "r"(t));
+}
+
+#define current  this_task()
 
 void sched_init(void);
+void sched_adopt_core(uint64_t core);   /* lo llama cada nucleo secundario */
 int  task_create(const char *name, void (*fn)(void *), void *arg);
 int  task_create_user(const char *name, const uint8_t *image, uint64_t size,
                       uint64_t mmio_pa);

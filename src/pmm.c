@@ -9,6 +9,7 @@
  */
 #include <stdint.h>
 #include "mm.h"
+#include "spinlock.h"
 #include "uart.h"
 
 /* Lo define linker.ld, y es una direccion VIRTUAL: el kernel esta enlazado
@@ -22,6 +23,12 @@ extern char __kernel_end[];
 #define BITMAP_WORDS (MAX_PAGES / 64)
 
 static uint64_t bitmap[BITMAP_WORDS];
+
+/* El bitmap es de los cuatro nucleos. Dos 'pmm_alloc' a la vez sin cerrojo
+ * pueden ver el mismo bit libre y entregar la misma pagina dos veces: el
+ * peor error que puede cometer un gestor de memoria, porque no falla aqui
+ * sino mucho despues y en otro sitio. */
+static struct spinlock pmm_lock = SPINLOCK("pmm");
 static uint64_t first_page;          /* primera pagina que podemos repartir */
 static uint64_t total, used;
 static uint64_t hint;                /* por donde seguir buscando           */
@@ -57,6 +64,8 @@ void pmm_init(uint64_t ram_limit)
 
 uint64_t pmm_alloc(void)
 {
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+
     /* Busqueda circular a partir de la ultima asignacion. Ingenuo pero
      * suficiente; cuando duela lo cambiaremos por listas por orden. */
     for (uint64_t n = 0; n < MAX_PAGES; n++) {
@@ -72,6 +81,11 @@ uint64_t pmm_alloc(void)
             /* Entregar paginas con basura dentro es una fuente inagotable de
              * bugs (y una fuga de informacion entre procesos). Se limpian. */
             uint64_t pa = pfn * PAGE_SIZE;
+            spin_unlock_irqrestore(&pmm_lock, flags);
+
+            /* El borrado, ya fuera del cerrojo: la pagina es nuestra y de
+             * nadie mas, y son 4 KB que no hay por que hacer esperar a los
+             * otros tres nucleos. */
             uint64_t *p = phys_to_virt(pa);   /* el kernel no puede tocar */
                                               /* una direccion fisica     */
             for (uint64_t i = 0; i < PAGE_SIZE / 8; i++)
@@ -79,6 +93,8 @@ uint64_t pmm_alloc(void)
             return pa;
         }
     }
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return 0;                        /* sin memoria */
 }
 
@@ -86,9 +102,13 @@ void pmm_free(uint64_t pa)
 {
     uint64_t pfn = pa / PAGE_SIZE;
     if (pfn < first_page || pfn >= MAX_PAGES) return;
-    if (!is_used(pfn)) return;       /* doble free: lo ignoramos */
-    mark_free(pfn);
-    used--;
+
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    if (is_used(pfn)) {              /* si no, es un doble free: lo ignoramos */
+        mark_free(pfn);
+        used--;
+    }
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 uint64_t pmm_total_pages(void) { return total; }

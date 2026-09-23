@@ -351,6 +351,7 @@ static void menu(void)
     uart_puts("  r - pagina de solo lectura (FATAL: fallo de permisos)\n");
     uart_puts("  x - traducciones VA -> PA del kernel\n");
     uart_puts("  j - estado de los cuatro nucleos\n");
+    uart_puts("  w - los 4 nucleos contra un contador (con y sin cerrojo)\n");
     uart_puts("  b - medir velocidad de la memoria\n");
     uart_puts("  t - tiempo e interrupciones\n");
     uart_puts("  h - ayuda\n");
@@ -443,6 +444,23 @@ static void command(char c)
     case 'j':
         smp_dump();
         break;
+
+    case 'w': {
+        const uint64_t N = 50000;
+        uart_puts("\n  Los cuatro nucleos suman ");
+        uart_dec(N);
+        uart_puts(" veces cada uno sobre el mismo contador.\n");
+        uart_puts("  Esperado: ");
+        uart_dec(N * CORES);
+        uart_puts("\n");
+
+        uart_puts("\n    sin cerrojo : ");
+        uart_dec(smp_hammer(N, 0));
+        uart_puts("\n    con cerrojo : ");
+        uart_dec(smp_hammer(N, 1));
+        uart_puts("\n");
+        break;
+    }
 
     case 'x':
         uart_puts("\n  Lo que ve la MMU (instruccion 'at s1e1r'):\n");

@@ -19,6 +19,7 @@
 #include "sync.h"
 #include "ipc.h"
 #include "user_abi.h"
+#include "smp.h"
 
 /* Definidos en switch.S */
 void cpu_switch_to(struct task *prev, struct task *next);
@@ -31,23 +32,38 @@ static void thread_reaper(void *arg);
 /* switch.S accede al contexto con offsets desde el principio del struct */
 _Static_assert(__builtin_offsetof(struct task, ctx) == 0, "ctx debe ir primero");
 
+/* Las ranuras 0..CORES-1 estan reservadas: son la tarea idle de cada
+ * nucleo, el contexto en el que ya estaba cuando arranco. El resto se
+ * reparten a quien las pida. */
 static struct task tasks[MAX_TASKS];
-static uint64_t    next_pid = 1;
+static uint64_t    next_pid = CORES;
 static volatile int need_resched;
 static uint64_t switches;        /* cambios de contexto totales */
 
-struct task *current;
+static const char *idle_names[CORES] = { "idle0", "idle1", "idle2", "idle3" };
+
+/* Adoptar el contexto en el que ya esta este nucleo como su tarea idle. No
+ * hay que rellenar ctx: se guardara solo la primera vez que ceda la CPU.
+ *
+ * Lo llaman el nucleo 0 desde sched_init() y cada secundario al llegar a C.
+ * Sin esto, 'current' valdria cero en tres de los cuatro nucleos y lo
+ * primero que lo mirase se llevaria el sistema por delante. */
+void sched_adopt_core(uint64_t core)
+{
+    struct task *t = &tasks[core];
+
+    t->state   = TASK_RUNNING;
+    t->pid     = core;
+    t->name    = idle_names[core];
+    t->counter = TASK_QUANTUM;
+    t->stack   = 0;                    /* usa la pila de arranque del suyo */
+
+    set_this_task(t);
+}
 
 void sched_init(void)
 {
-    /* Adoptar el contexto actual como tarea 0. No hay que rellenar ctx:
-     * se guardara solo la primera vez que esta tarea ceda la CPU. */
-    tasks[0].state     = TASK_RUNNING;
-    tasks[0].pid       = 0;
-    tasks[0].name      = "idle";
-    tasks[0].counter   = TASK_QUANTUM;
-    tasks[0].stack     = 0;            /* usa la pila del arranque */
-    current            = &tasks[0];
+    sched_adopt_core(0);
 
     /* El primer hilo del sistema es el que recoge a los muertos. Si no
      * existiera, cada proceso que termina se llevaria su ranura, su pila,
@@ -60,7 +76,7 @@ int task_create(const char *name, void (*fn)(void *), void *arg)
     uint64_t flags = irq_save();
     struct task *t = 0;
 
-    for (int i = 1; i < MAX_TASKS; i++) {
+    for (int i = CORES; i < MAX_TASKS; i++) {
         if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
     }
     if (!t) { irq_restore(flags); return -1; }
@@ -111,12 +127,13 @@ static struct task *pick_next(void)
 
     for (int i = 1; i <= MAX_TASKS; i++) {
         uint64_t idx = (start + (uint64_t)i) % MAX_TASKS;
-        if (idx == 0) continue;
+        if (idx < CORES) continue;      /* las idle no compiten */
         struct task *t = &tasks[idx];
         if (t->state == TASK_READY || t->state == TASK_RUNNING)
             return t;
     }
-    return &tasks[0];                   /* nadie quiere CPU: a dormir */
+    return &tasks[this_core()];         /* nadie quiere CPU: la idle de
+                                           ESTE nucleo, no la del 0 */
 }
 
 void schedule(void)
@@ -132,7 +149,7 @@ void schedule(void)
             prev->state = TASK_READY;
         next->state   = TASK_RUNNING;
         next->counter = TASK_QUANTUM;
-        current       = next;
+        set_this_task(next);
         switches++;
 
         /* Cambiar de espacio de direcciones: una escritura a TTBR0 con la
@@ -245,7 +262,7 @@ static void thread_reaper(void *arg)
         uint64_t flags = irq_save();
 
         struct task *dead = 0;
-        for (int i = 1; i < MAX_TASKS; i++)
+        for (int i = CORES; i < MAX_TASKS; i++)
             if (tasks[i].state == TASK_ZOMBIE) { dead = &tasks[i]; break; }
 
         if (!dead) {
@@ -388,7 +405,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     uint64_t flags = irq_save();
     struct task *t = 0;
 
-    for (int i = 1; i < MAX_TASKS; i++)
+    for (int i = CORES; i < MAX_TASKS; i++)
         if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
     if (!t) { irq_restore(flags); return -1; }
 

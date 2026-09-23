@@ -176,6 +176,19 @@ at_el1:
     // enlazador hay que bajarla a fisico restandole esto.
     ldr     x9, =KERNEL_VA_BASE
 
+    // TPIDR_EL1 a cero, y esto NO es opcional.
+    //
+    // Ahi vive 'current', el puntero a la tarea que ejecuta este nucleo.
+    // Cuando era una variable de C vivia en .bss y el bucle de mas abajo
+    // la ponia a cero gratis. Un registro no esta en .bss: arranca con lo
+    // que haya dejado el firmware, y en una Pi de verdad eso es basura.
+    //
+    // El primer tick del temporizador llega antes de que sched_init()
+    // ponga TPIDR, y scheduler_tick() hace "if (!current) return;". Con
+    // basura el guardia pasa de largo y se desreferencia un puntero
+    // inventado. QEMU lo resetea a cero y no se nota; la placa no.
+    msr     tpidr_el1, xzr
+
     // x28 = numero de nucleo, y ya no se toca en todo el arranque.
     // MPIDR_EL1 identifica el nucleo actual; los bits [7:0] son el "Aff0".
     mrs     x28, mpidr_el1

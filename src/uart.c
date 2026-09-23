@@ -10,6 +10,7 @@
 #include "uart.h"
 #include "sync.h"
 #include "irq.h"
+#include "spinlock.h"
 
 /* --- Registros GPIO --------------------------------------------------- */
 #define GPIO_BASE     (PERIPHERAL_BASE + 0x200000)
@@ -84,11 +85,27 @@ void uart_init(void)
     mmio_write(UART0_CR, (1 << 0) | (1 << 8) | (1 << 9));
 }
 
-void uart_putc(char c)
+/* La PL011 es una sola y los nucleos son cuatro. Sin cerrojo, entre el
+ * "¿hay hueco?" y el "escribe" se cuela otro nucleo y se pierde un
+ * caracter; con lineas enteras, el texto sale entrelazado.
+ *
+ * El cerrojo se coge en las funciones publicas y no aqui dentro: asi lo
+ * que queda indivisible es la LINEA, que es la unidad que tiene sentido
+ * leer, y no el caracter suelto. */
+static struct spinlock uart_lock = SPINLOCK("uart");
+
+static void putc_raw(char c)
 {
     /* Espera a que la FIFO de transmision tenga hueco. */
     while (mmio_read(UART0_FR) & FR_TXFF) { }
     mmio_write(UART0_DR, (uint32_t)c);
+}
+
+void uart_putc(char c)
+{
+    uint64_t f = spin_lock_irqsave(&uart_lock);
+    putc_raw(c);
+    spin_unlock_irqrestore(&uart_lock, f);
 }
 
 char uart_getc(void)
@@ -100,18 +117,22 @@ char uart_getc(void)
 
 void uart_puts(const char *s)
 {
+    uint64_t f = spin_lock_irqsave(&uart_lock);
     for (; *s; s++) {
-        if (*s == '\n') uart_putc('\r');   /* los terminales quieren CRLF */
-        uart_putc(*s);
+        if (*s == '\n') putc_raw('\r');   /* los terminales quieren CRLF */
+        putc_raw(*s);
     }
+    spin_unlock_irqrestore(&uart_lock, f);
 }
 
 static void uart_hex(uint64_t value, int nibbles)
 {
+    uint64_t f = spin_lock_irqsave(&uart_lock);
     for (int i = nibbles - 1; i >= 0; i--) {
         uint32_t d = (value >> (i * 4)) & 0xF;
-        uart_putc(d < 10 ? (char)('0' + d) : (char)('A' + d - 10));
+        putc_raw(d < 10 ? (char)('0' + d) : (char)('A' + d - 10));
     }
+    spin_unlock_irqrestore(&uart_lock, f);
 }
 
 void uart_hex32(uint32_t v) { uart_hex(v, 8);  }
@@ -125,7 +146,10 @@ void uart_dec(uint64_t v)
     int  n = 0;
     if (v == 0) { uart_putc('0'); return; }
     while (v) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
-    while (n--) uart_putc(tmp[n]);
+
+    uint64_t f = spin_lock_irqsave(&uart_lock);
+    while (n--) putc_raw(tmp[n]);
+    spin_unlock_irqrestore(&uart_lock, f);
 }
 
 /* --- Recepcion por interrupcion ---------------------------------------

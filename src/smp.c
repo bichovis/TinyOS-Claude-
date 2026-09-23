@@ -18,6 +18,9 @@
 #include "mm.h"
 #include "uart.h"
 #include "timer.h"
+#include "sched.h"
+#include "spinlock.h"
+#include "irq.h"
 
 extern char              secondary_entry[];   /* boot.S */
 extern volatile uint64_t smp_go;              /* boot.S, en .data */
@@ -64,15 +67,88 @@ static void fill_info(uint64_t core)
     cores[core].alive = 1;
 }
 
+/* ====================== EL TALLER ==================================
+ *
+ * Los secundarios todavia no entran al planificador: eso es el paso 13c.
+ * Pero ya pueden hacer algo, y hay una cosa que conviene hacer antes que
+ * ninguna otra, que es comprobar que los cerrojos funcionan.
+ *
+ * El nucleo 0 deja un encargo y levanta la generacion; los tres lo ven,
+ * lo hacen y avisan. Todos martillean el MISMO contador.
+ */
+static struct {
+    volatile uint64_t gen;           /* sube cada vez que hay encargo nuevo */
+    volatile uint64_t iters;
+    volatile uint64_t con_cerrojo;
+    volatile uint64_t hechos;
+} job;
+
+static volatile uint64_t contador;
+static struct spinlock   contador_lock = SPINLOCK("contador");
+
+/* El incremento en disputa. Sin cerrojo son tres pasos -leer, sumar,
+ * escribir- y entre ellos cabe entero otro nucleo haciendo lo mismo: los
+ * dos leen el mismo valor y los dos escriben el mismo, asi que dos
+ * incrementos cuentan como uno. */
+static void martillear(uint64_t iters, int con_cerrojo)
+{
+    for (uint64_t i = 0; i < iters; i++) {
+        if (con_cerrojo) {
+            uint64_t f = spin_lock_irqsave(&contador_lock);
+            contador++;
+            spin_unlock_irqrestore(&contador_lock, f);
+        } else {
+            contador++;
+        }
+    }
+}
+
 /* Lo llama boot.S en cada nucleo secundario, ya en EL1, con la MMU
  * encendida y su propia pila. Primera instruccion de C que ejecuta un
  * nucleo que no es el 0 en la historia de este kernel. */
 void secondary_main(uint64_t core)
 {
+    /* Adoptar el contexto de arranque de este nucleo como su tarea idle,
+     * para que 'current' (o sea, TPIDR_EL1) valga algo aqui tambien. */
+    sched_adopt_core(core);
+
     fill_info(core);
 
-    for (;;)
-        __asm__ volatile("wfi");
+    uint64_t visto = 0;
+    for (;;) {
+        while (job.gen == visto)
+            __asm__ volatile("wfe");     /* dormido hasta que haya encargo */
+        visto = job.gen;
+
+        martillear(job.iters, (int)job.con_cerrojo);
+
+        uint64_t f = spin_lock_irqsave(&contador_lock);
+        job.hechos++;                    /* tambien es un dato compartido */
+        spin_unlock_irqrestore(&contador_lock, f);
+    }
+}
+
+uint64_t smp_hammer(uint64_t iters, int con_cerrojo)
+{
+    contador        = 0;
+    job.hechos      = 0;
+    job.iters       = iters;
+    job.con_cerrojo = (uint64_t)con_cerrojo;
+
+    /* El encargo entero visible ANTES que la senyal que lo anuncia, o un
+     * nucleo podria empezar a trabajar leyendo el numero de vueltas viejo. */
+    __asm__ volatile("dmb ish" ::: "memory");
+    job.gen++;
+    __asm__ volatile("dsb sy\n sev" ::: "memory");
+
+    martillear(iters, con_cerrojo);      /* el nucleo 0 tambien trabaja */
+
+    /* Esperar a los otros tres, con limite. */
+    uint64_t limite = timer_now() + timer_hz() * 5;
+    while (job.hechos < CORES - 1 && timer_now() < limite)
+        ;
+
+    return contador;
 }
 
 int smp_start_secondaries(void)
