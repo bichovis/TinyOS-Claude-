@@ -19,8 +19,13 @@
 #include "ipc.h"
 #include "fs_abi.h"
 
-/* La consola es una sola para todo el mundo y no se cierra nunca. */
-static struct fichero consola = { F_CONSOLA, 1, 0, { 0 }, 0 };
+/* La consola es una sola para todo el mundo y no se cierra nunca.
+ *
+ * Por nombre y no por posicion: con la posicion, anyadir un campo a la
+ * struct obliga a venir aqui a contar comas, y el compilador solo avisa
+ * porque se lo hemos pedido con -Werror. Lo que no se inicializa se queda
+ * a cero, que para el mutex es exactamente lo que hace mutex_init. */
+static struct fichero consola = { .tipo = F_CONSOLA, .refs = 1 };
 
 /* Una transaccion con el servidor de ficheros cada vez (ver mas abajo). */
 static struct mutex fs_mtx;
@@ -386,6 +391,8 @@ struct fichero *file_opendir(const char *ruta)
     f->refs = 1;
     f->p    = 0;
     f->off  = 0;                          /* aqui es el indice */
+    f->anyadir = 0;
+    mutex_init(&f->mtx);
     for (int i = 0; i < FICH_NOMBRE; i++) f->nombre[i] = 0;
     for (int i = 0; i < FICH_NOMBRE - 1 && ruta[i]; i++) f->nombre[i] = ruta[i];
     return f;
@@ -419,35 +426,71 @@ int64_t file_seek(struct fichero *f, int64_t desplazamiento, int desde)
 {
     if (!f || f->tipo != F_FICHERO) return -1;
 
+    mutex_lock(&f->mtx);
+
     int64_t base;
     switch (desde) {
     case DESDE_INICIO: base = 0; break;
     case DESDE_ACTUAL: base = (int64_t)f->off; break;
     case DESDE_FINAL: {
         uint64_t tam = 0;
-        if (fs_estado(f->nombre, &tam, 0, 0) < 0) return -1;
+        if (fs_estado(f->nombre, &tam, 0, 0) < 0) { mutex_unlock(&f->mtx); return -1; }
         base = (int64_t)tam;
         break;
     }
-    default: return -1;
+    default: mutex_unlock(&f->mtx); return -1;
     }
 
     int64_t nuevo = base + desplazamiento;
-    if (nuevo < 0) return -1;              /* antes del principio no hay nada */
+    if (nuevo < 0) { mutex_unlock(&f->mtx); return -1; }  /* antes del principio no hay nada */
 
+    /* Un lseek sobre un descriptor abierto para anyadir mueve el numero,
+     * pero no mueve donde se escribe: la proxima escritura seguira yendo
+     * al final. No es un descuido, es lo que dice POSIX, y es la unica
+     * manera de que la garantia de O_APPEND siga en pie -si un lseek
+     * pudiera desactivarla, no seria una garantia-. */
     f->off = (uint64_t)nuevo;
+
+    mutex_unlock(&f->mtx);
     return nuevo;
 }
 
 struct fichero *file_open(const char *nombre, int modo)
 {
     struct message resp;
+    uint64_t final = 0;
 
-    /* Leer exige que exista; escribir exige lo contrario: crearlo, y
-     * vaciarlo si ya estaba. Eso es exactamente lo que significa ">". */
+    /* Tres aperturas y tres contratos distintos con lo que ya hubiera:
+     *
+     *   O_LEER      exige que exista.
+     *   O_ESCRIBIR  lo crea, y si estaba lo VACIA. Eso es ">".
+     *   O_ANYADIR   lo crea si no esta, y si estaba NO lo toca. Eso es ">>".
+     *
+     * La diferencia entre los dos ultimos es toda la diferencia entre
+     * "esto sustituye a lo que habia" y "esto se suma a lo que habia", y
+     * es lo unico que separa un fichero de salida de un diario. */
     if (modo == O_ESCRIBIR) {
         if (fs_transaccion(FS_CREATE, nombre, 0, 0, 0, &resp) < 0) return 0;
         if (resp.type != FS_OK) return 0;
+    } else if (modo == O_ANYADIR) {
+        /* Si ya esta, nos quedamos con su tamanyo; si no, se crea vacio.
+         *
+         * Son DOS peticiones, y entre ellas cabe otro. Aqui no importa:
+         * el que gane crea el fichero y el que pierda se lo encuentra
+         * hecho, y en los dos casos acaba con un descriptor que escribe
+         * al final. Lo que no se puede hacer con esto es "creamelo solo
+         * si no existe" -O_CREAT|O_EXCL-, que es precisamente la que
+         * necesita ser indivisible, y por eso en Unix es una bandera del
+         * open y no dos llamadas. */
+        if (fs_transaccion(FS_SIZE, nombre, 0, 0, 0, &resp) < 0) return 0;
+        if (resp.type == FS_OK) {
+            struct fs_info *i = (struct fs_info *)resp.data;
+            if (i->flags & FS_ES_DIR) return 0;      /* un directorio no */
+            final = i->size;
+        } else {
+            if (fs_transaccion(FS_CREATE, nombre, 0, 0, 0, &resp) < 0) return 0;
+            if (resp.type != FS_OK) return 0;
+        }
     } else {
         if (fs_transaccion(FS_SIZE, nombre, 0, 0, 0, &resp) < 0) return 0;
         if (resp.type != FS_OK) return 0;
@@ -459,7 +502,13 @@ struct fichero *file_open(const char *nombre, int modo)
     f->tipo = F_FICHERO;
     f->refs = 1;
     f->p    = 0;
-    f->off  = 0;
+    /* Recien abierto para anyadir, el descriptor ya esta al final: un
+     * ftell() nada mas abrir tiene que decir el tamanyo, no cero. Lo que
+     * se escriba luego no usara este numero -lo resuelve el servidor-,
+     * pero lo que se PREGUNTE si. */
+    f->off  = final;
+    f->anyadir = (modo == O_ANYADIR);
+    mutex_init(&f->mtx);
     for (int i = 0; i < FICH_NOMBRE; i++) f->nombre[i] = 0;
     for (int i = 0; i < FICH_NOMBRE - 1 && nombre[i]; i++) f->nombre[i] = nombre[i];
     return f;
@@ -469,16 +518,27 @@ static int64_t fichero_read(struct fichero *f, uint64_t uva, uint64_t n)
 {
     if (n > FS_CHUNK) n = FS_CHUNK;
 
+    /* Leer tambien mueve el desplazamiento, asi que tambien va dentro del
+     * cerrojo: "mira por donde ibas, pide, y avanza" son tres cosas, y dos
+     * procesos que compartan el descriptor pueden meterse en medio y leer
+     * los dos el mismo trozo. */
+    mutex_lock(&f->mtx);
+
     struct message resp;
-    if (fs_transaccion(FS_READ, f->nombre, f->off, 0, 0, &resp) < 0) return -1;
-    if (resp.type == FS_EOF) return 0;            /* se acabo el fichero */
-    if (resp.type != FS_OK)  return -1;
+    if (fs_transaccion(FS_READ, f->nombre, f->off, 0, 0, &resp) < 0) {
+        mutex_unlock(&f->mtx);
+        return -1;
+    }
+    if (resp.type == FS_EOF) { mutex_unlock(&f->mtx); return 0; }  /* se acabo */
+    if (resp.type != FS_OK)  { mutex_unlock(&f->mtx); return -1; }
 
     uint64_t hay = resp.len;
     if (hay > n) hay = n;
 
     uint64_t puestos = copiar_a_usuario(uva, resp.data, hay);
     f->off += puestos;
+
+    mutex_unlock(&f->mtx);
     return (int64_t)puestos;
 }
 
@@ -496,6 +556,22 @@ static int64_t fichero_write(struct fichero *f, uint64_t uva, uint64_t n)
 {
     uint64_t puestos = 0;
 
+    /* Todo el bucle bajo un solo cerrojo, y no cada vuelta por su cuenta.
+     *
+     * Escribir 500 bytes son tres mensajes, y si el cerrojo se soltara
+     * entre uno y otro, quien comparta este descriptor podria colar los
+     * suyos en medio. No se perderia nada -el desplazamiento es comun-
+     * pero saldrian dos lineas trenzadas, que para un fichero de texto es
+     * lo mismo que haberlas perdido.
+     *
+     * Esto NO protege a dos procesos que hayan abierto el fichero cada uno
+     * por su lado: son dos descripciones distintas y dos cerrojos
+     * distintos. Para ese caso esta O_ANYADIR, que no necesita cerrojo
+     * ninguno porque no hay nada compartido que proteger. Son dos
+     * problemas que se parecen y tienen respuestas que no se parecen en
+     * nada. */
+    mutex_lock(&f->mtx);
+
     while (puestos < n) {
         uint64_t trozo = n - puestos;
         if (trozo > FS_CHUNK) trozo = FS_CHUNK;
@@ -504,16 +580,33 @@ static int64_t fichero_write(struct fichero *f, uint64_t uva, uint64_t n)
         uint64_t hay = copiar_de_usuario(tmp, uva + puestos, trozo);
         if (hay == 0) break;                  /* memoria ilegible */
 
-        struct message resp;
-        if (fs_transaccion(FS_WRITE, f->nombre, f->off, tmp, hay, &resp) < 0 ||
-            resp.type != FS_OK)
-            return puestos ? (int64_t)puestos : -1;
+        /* Abierto para anyadir, no se manda un desplazamiento: se manda la
+         * pregunta. Quien sabe donde acaba el fichero es el servidor, y
+         * que lo resuelva el es lo que hace que la colocacion y la
+         * escritura sean una sola cosa. */
+        uint64_t donde = f->anyadir ? FS_AL_FINAL : f->off;
 
-        f->off  += hay;
+        struct message resp;
+        if (fs_transaccion(FS_WRITE, f->nombre, donde, tmp, hay, &resp) < 0 ||
+            resp.type != FS_OK)
+            break;
+
+        /* Y el servidor contesta donde cayo. Con FS_AL_FINAL es lo unico
+         * que lo dice; sin ello, un ftell() sobre un fichero abierto para
+         * anyadir estaria inventandose el numero. */
+        if (f->anyadir) {
+            if (resp.len < sizeof(struct fs_escrito)) break;   /* no lo dijo */
+            struct fs_escrito *e = (struct fs_escrito *)resp.data;
+            f->off = e->off + hay;
+        } else {
+            f->off += hay;
+        }
+
         puestos += hay;
     }
 
-    return (int64_t)puestos;
+    mutex_unlock(&f->mtx);
+    return puestos ? (int64_t)puestos : (n ? -1 : 0);
 }
 
 /* --- La interfaz comun ------------------------------------------------ */
@@ -582,8 +675,10 @@ int file_pipe(struct fichero **lectura, struct fichero **escritura)
     p->hay_datos.head = p->hay_datos.tail = 0;
     p->hay_hueco.head = p->hay_hueco.tail = 0;
 
-    r->tipo = F_PIPE_R; r->refs = 1; r->p = p;
-    w->tipo = F_PIPE_W; w->refs = 1; w->p = p;
+    r->tipo = F_PIPE_R; r->refs = 1; r->p = p; r->anyadir = 0;
+    w->tipo = F_PIPE_W; w->refs = 1; w->p = p; w->anyadir = 0;
+    mutex_init(&r->mtx);
+    mutex_init(&w->mtx);
 
     *lectura = r;
     *escritura = w;

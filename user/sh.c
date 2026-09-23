@@ -264,7 +264,13 @@ static int aplicar(int hay, const char *ent, const char *sal)
         closefd((int)fd);
     }
     if (hay & 2) {
-        int64_t fd = openf(sal, O_ESCRIBIR);
+        /* ">" vacia y ">>" anyade, y la diferencia entera esta en el modo
+         * con el que se abre: el shell no hace nada distinto despues. Lo
+         * que no hace -y es lo que importa- es abrir con ">" y luego
+         * saltar al final, que es lo que uno escribiria si no supiera que
+         * existe O_ANYADIR y produciria un fichero correcto justo hasta
+         * que dos programas anyadan a la vez. */
+        int64_t fd = openf(sal, (hay & 4) ? O_ANYADIR : O_ESCRIBIR);
         if (fd < 0) { printf("  no puedo escribir %s\n", sal); return -1; }
         dup2((int)fd, 1);
         closefd((int)fd);
@@ -299,7 +305,7 @@ struct orden {
     char  texto[MAX_LINEA];
     char  ent[FS_PATH_MAX];        /* fichero para "<", vacio si no hay */
     char  sal[FS_PATH_MAX];        /* fichero para ">"                  */
-    int   hay;                     /* bit 0 = hay "<", bit 1 = hay ">"  */
+    int   hay;                     /* bit 0 = "<", bit 1 = ">", bit 2 = ">>" */
 };
 
 /* Trocear, con dos reglas: las comillas agrupan, y "<" y ">" son fichas
@@ -326,9 +332,18 @@ static int trocear(const char *s, char **argv, char *texto, uint64_t max)
 
         argv[n++] = texto + escribe;
 
-        if (*s == '<' || *s == '>') {          /* ficha de un solo signo */
-            if (escribe + 2 < max) { texto[escribe++] = *s; texto[escribe++] = 0; }
-            s++;
+        /* Fichas de signos. ">>" es UNA, y hay que mirarlo antes que ">"
+         * o saldrian dos seguidas y la segunda se comeria el nombre. Es la
+         * regla del troceador mas larga primero, que en un lenguaje de
+         * verdad se llama "maximal munch" y aqui son cuatro lineas. */
+        if (*s == '<' || *s == '>') {
+            int doble = (s[0] == '>' && s[1] == '>');
+            if (escribe + 3 < max) {
+                texto[escribe++] = *s;
+                if (doble) texto[escribe++] = *s;
+                texto[escribe++] = 0;
+            }
+            s += doble ? 2 : 1;
             continue;
         }
 
@@ -388,15 +403,19 @@ static int preparar(struct orden *o, const char *linea)
     for (int i = 0; i < n; i++) {
         char *t = o->argv[i];
 
-        if ((t[0] == '<' || t[0] == '>') && t[1] == 0) {
-            char *destino = (t[0] == '<') ? o->ent : o->sal;
+        int entrada = (t[0] == '<' && t[1] == 0);
+        int salida  = (t[0] == '>' && t[1] == 0);
+        int anyade  = (t[0] == '>' && t[1] == '>' && t[2] == 0);
+
+        if (entrada || salida || anyade) {
+            char *destino = entrada ? o->ent : o->sal;
 
             if (i + 1 >= n) {
                 printf("  falta el fichero despues de %s\n", t);
                 return 0;
             }
             ucopiar(destino, o->argv[++i], FS_PATH_MAX);
-            o->hay |= (t[0] == '<') ? 1 : 2;
+            o->hay |= entrada ? 1 : (anyade ? 2 | 4 : 2);
             continue;
         }
         o->argv[w++] = t;
@@ -593,7 +612,7 @@ int main(int argc, char **argv)
 
     printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
     printf("  se arrancan con fork + exec, se encadenan con | y se\n");
-    printf("  redirigen con < y >\n");
+    printf("  redirigen con <, > y >>\n");
     printf("  Hay directorios (cd, pwd, mkdir) y entorno (export, env, $VAR)\n");
     printf("  Prueba: ls / mkdir docs / cd docs / cat /hola.txt > copia.txt\n");
     printf("          cd .. / ls docs / wc < hola.txt / salir\n");

@@ -24,7 +24,7 @@
 #define FS_SIZE        1     /* name -> tamanyo en bytes                   */
 #define FS_READ        2     /* name + arg=offset -> hasta FS_CHUNK bytes  */
 #define FS_LIST        3     /* arg=indice -> name y tamanyo de esa entrada*/
-#define FS_WRITE       4     /* name + arg=offset + data -> escribe        */
+#define FS_WRITE       4     /* name + arg=offset | FS_AL_FINAL + data     */
 #define FS_CREATE      5     /* name -> lo crea, o lo vacia si ya estaba   */
 #define FS_DELETE      6     /* name -> lo borra                           */
 #define FS_MKDIR       7     /* name -> crea un directorio                 */
@@ -38,6 +38,39 @@
 #define FS_ES_DIRECTORIO 103 /* pedias un fichero y es un directorio       */
 #define FS_NO_VACIO  104     /* rmdir sobre un directorio con cosas dentro */
 #define FS_EXISTE    105     /* el destino de un rename ya esta cogido     */
+
+/* --- Un desplazamiento que no es un desplazamiento --------------------
+ *
+ * FS_AL_FINAL en 'arg' de un FS_WRITE no quiere decir "escribe en el byte
+ * 4294967295": quiere decir "escribe donde acabe el fichero AHORA, y dime
+ * donde fue".
+ *
+ * Parece un atajo para ahorrarse un FS_SIZE y no lo es. Si el cliente
+ * pregunta el tamanyo y luego escribe ahi, entre las dos peticiones cabe
+ * otro cliente, y los dos escriben en el mismo sitio: el segundo tapa al
+ * primero y nadie se entera. Preguntar y actuar son dos cosas, y entre
+ * dos cosas siempre cabe una tercera.
+ *
+ * La unica forma de que no quepa es que sean UNA. Y eso obliga a que la
+ * decision la tome quien es duenyo del dato, no quien lo consulta: el
+ * final del fichero esta en la entrada de directorio, que es del
+ * servidor. Aqui sale gratis, porque el servidor atiende un mensaje
+ * entero antes de mirar el siguiente: dentro de una peticion no hay
+ * nadie mas. La indivisibilidad no se ha construido, se ha colocado
+ * donde ya estaba.
+ *
+ * Esto es O_APPEND, y es por lo que existe. Es tambien por lo que dos
+ * procesos pueden escribir en el mismo log sin ponerse de acuerdo. */
+#define FS_AL_FINAL   0xFFFFFFFFul
+
+/* Lo que FS_WRITE devuelve en data[]: donde cayo de verdad.
+ *
+ * Hace falta porque con FS_AL_FINAL el cliente no lo sabe -no lo sabia
+ * nadie hasta que se escribio- y sin ello no podria decir por donde va su
+ * descriptor. Una peticion que decide algo tiene que contar que decidio. */
+struct fs_escrito {
+    unsigned long off;               /* primer byte que se escribio        */
+};
 
 /* Cuatro errores donde antes habia uno. No es burocracia: "no existe",
  * "es un directorio", "no esta vacio" y "ya existe" mandan a sitios

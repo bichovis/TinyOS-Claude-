@@ -43,6 +43,23 @@ struct fichero {
      * donde vamos. No hay nada que cerrar al otro lado. */
     char         nombre[FICH_NOMBRE];
     uint64_t     off;
+
+    /* Abierto con O_ANYADIR: el desplazamiento de arriba deja de mandar y
+     * cada escritura se coloca al final en el momento de escribir. */
+    int          anyadir;
+
+    /* Un cerrojo por FICHERO ABIERTO, no por proceso ni por tarjeta.
+     *
+     * Una escritura de mas de FS_CHUNK bytes son varios mensajes, y entre
+     * uno y otro puede correr quien comparta este descriptor -un hijo de
+     * un fork, o el otro extremo de un dup2-. Sin esto, el bucle de
+     * fichero_write lee f->off, manda un trozo, suma, y el de al lado hace
+     * lo mismo con el mismo off: dos trozos en el mismo sitio.
+     *
+     * Va aqui y no en el kernel entero porque lo que protege es este
+     * desplazamiento, y el desplazamiento es de la estructura. El cerrojo
+     * vive donde vive el dato que defiende. */
+    struct mutex mtx;
 };
 
 void    file_init(void);
@@ -66,7 +83,7 @@ int64_t fs_tamano(const char *ruta);     /* -1 si no esta o es directorio */
  * servidor, que es el unico que lo sabe. */
 int fs_es_directorio(const char *ruta);
 
-/* Abre un fichero de la tarjeta. modo es O_LEER u O_ESCRIBIR. */
+/* Abre un fichero de la tarjeta. modo es O_LEER, O_ESCRIBIR u O_ANYADIR. */
 struct fichero *file_open(const char *nombre, int modo);
 
 /* Y un directorio, para recorrerlo. Un descriptor de directorio es lo

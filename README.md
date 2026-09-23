@@ -104,6 +104,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 47   | La libc crece: setjmp, qsort, strtol        | hecho  |
 | 48   | errno, o hacer que el kernel diga por que   | hecho  |
 | 49   | Ficheros con buffer: FILE, fopen, fprintf   | hecho  |
+| 50   | Anyadir al final: O_APPEND y `>>`           | hecho  |
 
 ## Estructura
 
@@ -3587,6 +3588,203 @@ descriptor. Hay que descontar lo que queda por consumir en el cubo al leer,
 o sumar lo que queda por escribir. Sin eso, un `ftell` tras leer un solo
 caracter contesta 512.
 
+## Anyadir al final, o quien decide donde acaba un fichero
+
+Anyadir al final de un fichero parecen dos lineas: averiguas donde acaba y
+escribes ahi.
+
+    long fin = lseek(fd, 0, DESDE_FINAL);
+    lseek(fd, fin, DESDE_INICIO);
+    write(fd, linea, n);
+
+Eso funciona perfectamente, y sigue funcionando mientras seas el unico. En
+cuanto hay otro escribiendo en el mismo fichero, el numero que devolvio el
+primer `lseek` describe un fichero que ya no existe: entre averiguarlo y
+usarlo, el final se ha movido. Los dos escriben en el mismo sitio, el
+segundo tapa al primero, y nadie se entera de nada porque las dos
+escrituras devolvieron el numero de bytes que se les pidio.
+
+**Preguntar y actuar son dos cosas, y entre dos cosas siempre cabe una
+tercera.** No hay forma de arreglarlo escribiendo mejor las dos lineas. La
+unica salida es que dejen de ser dos.
+
+### Donde tiene que vivir la indivisibilidad
+
+Que sean una obliga a decidir quien las hace, y ahi esta lo interesante:
+no puede ser quien escribe. El que escribe es un cliente, y lo unico que
+sabe del final del fichero es lo que le hayan contestado hace un rato.
+
+El final de un fichero esta en su entrada de directorio, y la entrada de
+directorio es del servidor. Asi que la decision baja ahi, y el cliente
+deja de tomarla: manda un desplazamiento que no es un desplazamiento.
+
+    #define FS_AL_FINAL   0xFFFFFFFFul
+
+`FS_AL_FINAL` en el `arg` de un `FS_WRITE` no quiere decir "escribe en el
+byte 4294967295". Quiere decir *donde acabe, y dime donde fue*.
+
+En el servidor el cambio son dos lineas dentro de `fichero_escribir`, y lo
+que importa de ellas es donde estan colocadas:
+
+    dir_read(dlba, doff, &primero, &tam);
+
+    if (offset == (uint32_t)FS_AL_FINAL) offset = tam;
+    if (offset > tam) return -1;
+
+El tamanyo se lee y se usa sin soltar el control en medio. **Y no hay
+ningun cerrojo, ni hace falta ninguno:** el servidor atiende un mensaje
+entero antes de mirar el siguiente, asi que dentro de una peticion no hay
+nadie mas. La indivisibilidad no se ha construido, se ha *colocado* donde
+ya estaba.
+
+Esa es la leccion del paso, y no es de sistemas de ficheros: es de
+microkernels. Un servidor con estado puede regalar garantias que un
+cliente no puede fabricar por mucho cuidado que ponga, porque las
+garantias no salen del cuidado, salen de quien es duenyo del dato.
+
+### Una peticion que decide algo tiene que contar que decidio
+
+Con `FS_AL_FINAL` el cliente manda la escritura sin saber donde va a caer,
+y despues tampoco lo sabe. Eso no vale: un descriptor tiene que poder
+decir por donde va, porque `ftell` pregunta. Asi que la respuesta a
+`FS_WRITE`, que hasta ahora era un `FS_OK` pelado, lleva algo dentro:
+
+    struct fs_escrito {
+        unsigned long off;               /* primer byte que se escribio */
+    };
+
+Y el kernel la usa para poner el descriptor al dia:
+
+    uint64_t donde = f->anyadir ? FS_AL_FINAL : f->off;
+    ...
+    if (f->anyadir) {
+        struct fs_escrito *e = (struct fs_escrito *)resp.data;
+        f->off = e->off + hay;
+    } else {
+        f->off += hay;
+    }
+
+### O_ANYADIR no es una posicion, es una propiedad
+
+`O_ANYADIR` no quiere decir "abrelo y ponme al final". Eso lo puede hacer
+el programa solo con un `lseek`, y es justo lo que no sirve. Es una
+propiedad del **descriptor**: mientras este abierto asi, *cada* escritura
+se coloca al final en el momento de escribir, y el desplazamiento que
+guarda la estructura deja de mandar.
+
+De ahi sale un detalle que parece un descuido y es lo contrario: un
+`lseek` sobre un descriptor abierto para anyadir mueve el numero, pero no
+mueve donde se escribe. La siguiente escritura seguira yendo al final. Lo
+dice POSIX, y es la unica manera de que la garantia siga en pie: si un
+`lseek` pudiera desactivarla, no seria una garantia, seria una costumbre.
+
+Tres aperturas, tres contratos con lo que ya hubiera:
+
+| modo         | si no existe | si existe      | es       |
+|--------------|--------------|----------------|----------|
+| `O_LEER`     | falla        | lo lee         | abrir    |
+| `O_ESCRIBIR` | lo crea      | **lo vacia**   | `>`      |
+| `O_ANYADIR`  | lo crea      | **no lo toca** | `>>`     |
+
+La diferencia entre los dos ultimos es toda la diferencia entre "esto
+sustituye a lo que habia" y "esto se suma a lo que habia", que es la que
+separa un fichero de salida de un diario.
+
+En la libc es la tercera letra de `fopen`, y en el shell es una ficha mas
+en el troceador. `>>` tiene que mirarse **antes** que `>` o saldrian dos
+fichas seguidas y la segunda se comeria el nombre del fichero; en un
+lenguaje de verdad la regla se llama *maximal munch* y aqui son cuatro
+lineas.
+
+## El otro problema, que se parece y no es el mismo
+
+Hay una segunda forma de que dos escrituras se pisen, y tiene una
+respuesta completamente distinta. Merece la pena verlas juntas porque
+confundirlas es facil.
+
+Un `write` de 500 bytes no es un mensaje: son tres, porque en uno solo
+caben 240 utiles. Y entre mensaje y mensaje, quien **comparta ese mismo
+descriptor** -un hijo de un `fork`, el otro extremo de un `dup2`- puede
+colar los suyos. Aqui el desplazamiento es comun, asi que no se pierde
+nada; lo que sale son dos lineas trenzadas, que en un fichero de texto es
+lo mismo que haberlas perdido.
+
+La respuesta es un cerrojo, y lo unico que hay que acertar es donde
+ponerlo:
+
+    struct fichero {
+        ...
+        uint64_t     off;
+        int          anyadir;
+        struct mutex mtx;      /* una escritura entera, indivisible */
+    };
+
+No es del kernel, ni del proceso, ni de la tarjeta: es de **la descripcion
+de fichero abierta**, porque lo que protege es ese `off` de ahi arriba. El
+cerrojo vive donde vive el dato que defiende. Y por eso `fork` lo comparte
+sin hacer nada especial: comparte la estructura entera, que es exactamente
+lo que Unix llama *open file description* y exactamente lo que hay que
+compartir.
+
+Lo que **no** arregla ese cerrojo es el caso de antes: dos procesos que
+abren el fichero cada uno por su lado tienen dos descripciones distintas y
+dos cerrojos distintos, y un cerrojo que no comparten no sincroniza nada.
+Para ese caso esta `O_ANYADIR`, que no necesita cerrojo ninguno porque no
+hay nada compartido que proteger.
+
+**Dos problemas que se parecen y tienen respuestas que no se parecen en
+nada.** Uno es "esto lo comparten dos, hay que serializarlo" y el otro es
+"esto no lo comparte nadie, hay que bajarlo a quien sabe la respuesta".
+
+## Una prueba que falla cuando debe, otra vez
+
+`anyadir` hace las dos mitades, y la segunda es la que hace util a la
+primera. Tres hijos escriben 20 lineas de 16 bytes cada uno en el mismo
+fichero: 960 bytes si no se pierde nada. Las lineas llevan dentro la letra
+del hijo repetida, asi que una linea con dos letras distintas es una
+escritura partida por la mitad y se ve sin contar nada.
+
+    con O_ANYADIR (cada hijo abre el suyo):
+      esperados 960 bytes, hay 960
+      por hijo: 20 20 20  (tendrian que ser 20 cada uno)
+      ok: no se ha perdido nada
+    con lseek al final y luego write:
+      esperados 960 bytes, hay 656
+      por hijo: 13 14 14  (tendrian que ser 20 cada uno)
+      y eso es lo que tenia que pasar: se han perdido lineas
+
+19 lineas de 60 desaparecidas, y ningun `write` devolvio un error.
+
+La contraprueba lleva un `sleep(1)` entre el `lseek` y el `write`, y eso
+hay que decirlo: **no fabrica el fallo, ensancha su ventana.** Sin el, el
+fallo sigue estando y aparece cuando le apetece, que en una prueba es peor
+que no aparecer, porque convierte un error en un misterio.
+
+Y fijate en lo que *no* es el problema en esa segunda mitad: los hijos
+comparten un descriptor heredado, y si escribieran sin el `lseek` saldria
+bien, porque compartirian el desplazamiento. Es la pregunta -el `lseek`,
+que habiamos puesto para ir sobre seguro- lo que parte la escritura en
+dos.
+
+## Tres sitios donde estaba escrita la misma lista
+
+La lista de programas estaba en el `Makefile` tres veces: `UPROGS`, y a
+mano otras dos dentro de `sdtest` y de `sdcard`. Estaba anotada como
+limitacion desde hacia pasos, con un "ya se han desincronizado una vez".
+Se habian desincronizado dos: `malo` aparecia dos veces en las dos copias
+e `init` en ninguna.
+
+Ahora la lista esta una vez y la otra se deduce:
+
+    BINPROGS := $(filter-out init sh fs conserver client,$(UPROGS))
+
+Los cinco que se quitan son los que el kernel lleva dentro, asi que no
+tienen nada que hacer en la tarjeta. Lo que hacia peligroso el duplicado
+no era el trabajo de escribirlo tres veces: es que olvidarse de uno **no
+da ningun error**. El programa compila, el sistema arranca, y lo unico que
+pasa es que ese programa no esta en la tarjeta y el shell dice que no
+existe, que es lo mismo que dice cuando te equivocas al teclear.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -3600,8 +3798,6 @@ caracter contesta 512.
   salir.
 - No hay zonas horarias. El reloj esta en hora local porque FAT lo esta, y
   el sistema no sabe cual es.
-- La lista de programas esta escrita tres veces en el Makefile (UPROGS,
-  sdtest y sdcard). Ya se han desincronizado una vez.
 - No hay `stat` sobre un descriptor abierto (`fstat`), ni permisos, ni
   duenyo: FAT no los guarda.
 
@@ -3614,8 +3810,10 @@ caracter contesta 512.
   correcto. (Lo que si se saco de el es la carga de un proceso, que son
   milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
   sin el y publica con el otra vez.)
-- El shell no tiene historial, ni segundo plano, ni tuberias de mas de dos,
-  ni `>>`: lee, carga, arranca y espera.
+- El shell no tiene historial, ni segundo plano, ni tuberias de mas de
+  dos, ni `2>`: lee, carga, arranca y espera. Redirigir stderr pide poder
+  nombrar el descriptor de destino (`2>&1`), y eso es una sintaxis nueva,
+  no una llamada nueva.
 - `strtol` sigue sin detectar desbordamiento, aunque ya hay `ERANGE` donde
   ponerlo.
 - `errno` es una variable global y no una por hilo. Con un solo hilo por
@@ -3629,16 +3827,21 @@ caracter contesta 512.
   de respuesta y las respuestas no dicen a quien pertenecen, asi que un
   mutex las serializa. La tarjeta es un solo dispositivo de todas formas,
   pero el limite es del mecanismo, no del hardware.
-- Padre e hijo si comparten el desplazamiento -`fork` comparte la propia
-  `struct fichero`, que es la descripcion de fichero abierta de Unix-, pero
-  avanzarlo no es indivisible: `fichero_write` lee `f->off`, manda la
-  peticion al servidor y luego lo suma. Dos procesos escribiendo a la vez
-  en el mismo descriptor desde dos nucleos pueden colarse en medio y caer
-  encima de los mismos bytes. Un Unix de verdad tiene un cerrojo por
-  fichero abierto alrededor de los tres pasos.
-- No hay `O_APPEND`, que es lo que hace que dos escritores a la vez no se
-  pisen aunque no se hablen: el desplazamiento se coloca al final DENTRO de
-  la operacion, no antes. Sin el no hay `>>` que valga.
+- Dos escrituras con `O_ANYADIR` de mas de 240 bytes desde descriptores
+  DISTINTOS no se pierden, pero pueden entrelazarse: cada mensaje se
+  coloca al final por su cuenta, asi que una linea larga puede salir
+  partida con otra en medio. El cerrojo de `struct fichero` no llega ahi
+  -son dos descripciones distintas- y el servidor no sabe que esos tres
+  mensajes eran uno. Un Unix de verdad los mete bajo el cerrojo del inodo.
+- No hay `O_CREAT | O_EXCL`, que es la apertura que necesita ser
+  indivisible de verdad: "creamelo solo si no existe". `file_open` con
+  `O_ANYADIR` pregunta el tamanyo y, si no esta, lo crea, y entre las dos
+  peticiones cabe otro. Para anyadir da igual -el que pierde se lo
+  encuentra hecho- pero es exactamente por lo que en Unix eso es una
+  bandera del `open` y no dos llamadas.
+- Un descriptor abierto para leer no comprueba que no sea un directorio:
+  `file_open` con `O_LEER` acepta el `FS_OK` de un `FS_SIZE` sin mirar
+  `FS_ES_DIR`. El fallo aparece despues, al leer, y dice lo que no es.
 - El buffer de teclas se queda en el kernel aunque el driver este fuera.
   Es deliberado (ver "El teclado, tambien en EL0"), pero significa que el
   kernel sigue sabiendo que es una consola.
@@ -3714,8 +3917,11 @@ caracter contesta 512.
   se nota: `upper` sigue leyendo y escribiendo el descriptor a pelo justo
   por eso, y no porque se nos olvidara cambiarlo. La libc de verdad tiene
   `setvbuf` para poder decidirlo desde fuera; aqui no lo hay.
-- No hay `"r+"`, ni `setvbuf`, ni `scanf`. Los dos primeros son decisiones;
-  el tercero es que aun no ha hecho falta.
+- `fopen` entiende `"r"`, `"w"` y `"a"`, pero no `"r+"` ni `"a+"`, ni hay
+  `setvbuf` ni `scanf`. Los modos mixtos son una decision -un cubo que se
+  usa en las dos direcciones tiene que saber en cual se uso la ultima vez
+  y vaciarse al cambiar de sentido, que es donde mas se equivoca todo el
+  mundo-; `scanf` es que aun no ha hecho falta.
 - `ungetc` acepta **uno** solo, y solo si antes se leyo algo del cubo. Es lo
   que garantiza el estandar, y mas de uno obligaria a un buffer aparte.
 - El monton de un proceso se mapea entero al pedirlo: `sbrk` es ansioso.

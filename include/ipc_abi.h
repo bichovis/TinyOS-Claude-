@@ -254,6 +254,17 @@ struct estado {
 
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */
+#define O_ANYADIR         2   /* lo crea si no esta, y cada write va al final*/
+
+/* O_ANYADIR no es "abrelo y ponme al final". Eso lo puede hacer el
+ * programa solo, con un lseek, y es justo lo que no sirve: deja un hueco
+ * entre averiguar donde acaba y escribir ahi, y en ese hueco cabe otro
+ * escritor.
+ *
+ * Es una propiedad del DESCRIPTOR, no una posicion: mientras este abierto
+ * asi, cada escritura se coloca al final en el momento de escribir. Por
+ * eso dos programas pueden anyadir al mismo fichero sin hablarse, y por
+ * eso ">>" no es ">" con un lseek delante. */
 
 /* --- Senyales ----------------------------------------------------------
  * Los numeros son los de siempre, para que no haya que aprenderselos otra

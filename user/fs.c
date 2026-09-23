@@ -1046,9 +1046,20 @@ static void dir_read(uint32_t lba, uint32_t off, uint32_t *cluster, uint32_t *ta
 /* Escribir 'n' bytes en 'offset'. Extiende el fichero si hace falta.
  *
  * No se admiten agujeros: escribir mas alla del final obligaria a rellenar
- * con ceros lo de en medio, y eso son mas casos que valor. */
+ * con ceros lo de en medio, y eso son mas casos que valor.
+ *
+ * 'offset' puede ser FS_AL_FINAL, que no es una posicion sino una orden:
+ * "donde acabe". Se resuelve DESPUES del dir_read, que es lo unico que
+ * importa de todo esto. El tamanyo se lee y se usa sin soltar el control
+ * en medio, porque este servidor atiende un mensaje entero antes de mirar
+ * el siguiente; no hay ningun cerrojo y no hace falta ninguno. Si el
+ * cliente hubiera preguntado el tamanyo por su cuenta y luego escrito,
+ * serian dos peticiones, y entre dos peticiones cabe otro cliente.
+ *
+ * 'donde' devuelve la posicion que se acabo usando, que con FS_AL_FINAL el
+ * que llama no puede saber de otra forma. */
 static int fichero_escribir(struct volumen *v, const char *nombre, uint32_t offset,
-                            const uint8_t *datos, uint32_t n)
+                            const uint8_t *datos, uint32_t n, uint32_t *donde)
 {
     uint32_t dlba, doff;
     if (dir_lookup(v, nombre, &dlba, &doff) < 0) {
@@ -1057,7 +1068,10 @@ static int fichero_escribir(struct volumen *v, const char *nombre, uint32_t offs
 
     uint32_t primero, tam;
     dir_read(dlba, doff, &primero, &tam);
+
+    if (offset == (uint32_t)FS_AL_FINAL) offset = tam;
     if (offset > tam) return -1;
+    if (donde) *donde = offset;
 
     uint32_t bytes_por_clus = v->sec_per_clus * 512;
 
@@ -1882,11 +1896,19 @@ int main(int argc, char **argv)
         case FS_WRITE: {
             uint32_t n = (uint32_t)pet.len;
             if (n > FS_CHUNK) n = FS_CHUNK;
+
+            uint32_t donde = 0;
             if (fichero_escribir(v, ruta, (uint32_t)r->arg,
-                                 (const uint8_t *)r->data, n) < 0)
+                                 (const uint8_t *)r->data, n, &donde) < 0)
                 responder(quien, FS_ERROR, "", 0);
-            else
-                responder(quien, FS_OK, "", 0);
+            else {
+                /* Y se contesta DONDE cayo. Con FS_AL_FINAL es la unica
+                 * forma de que el cliente sepa por donde va su
+                 * descriptor. */
+                struct fs_escrito e;
+                e.off = donde;
+                responder(quien, FS_OK, &e, sizeof(e));
+            }
             break;
         }
 

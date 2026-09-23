@@ -39,7 +39,18 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir
+
+# Los que van a /usr/bin de la tarjeta: todos menos los cinco que el kernel
+# lleva dentro (init, sh, fs, conserver, client) y por tanto no necesitan
+# estar en el disco.
+#
+# Esta lista estaba escrita A MANO otras dos veces, en sdtest y en sdcard,
+# y ya se habian desincronizado: 'malo' aparecia dos veces en las dos y
+# 'init' en ninguna. Un programa nuevo habia que acordarse de anyadirlo en
+# tres sitios, y olvidarse de uno no da ningun error: simplemente ese
+# programa no esta en la tarjeta y el shell dice que no existe.
+BINPROGS := $(filter-out init sh fs conserver client,$(UPROGS))
 
 # Programas de usuario con mas de un fichero fuente
 EXTRA_fs := user/sd.c
@@ -196,7 +207,7 @@ sdtest: all | $(BUILD)
 	 mkdir -p "$$D/ETC"; \
 	 printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > "$$D/ETC/RC"; \
 	 mkdir -p "$$D/USR/BIN"; \
-	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha libc malo; do \
+	 for p in $(BINPROGS); do \
 	   cp $(BUILD)/$$p.elf "$$D/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF"; \
 	 done;                         \
 	 sync; diskutil eject $$DEV >/dev/null
@@ -241,7 +252,7 @@ sdcard: all firmware
 	@mkdir -p $(BUILD)/sddata/ETC
 	@printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > $(BUILD)/sddata/ETC/RC
 	@mkdir -p $(BUILD)/sddata/USR/BIN
-	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha libc malo; do \
+	@for p in $(BINPROGS); do \
 	   cp $(BUILD)/$$p.elf $(BUILD)/sddata/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done
 	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de datos de la Pi.\n' > $(BUILD)/sddata/HOLA.TXT

@@ -140,7 +140,10 @@ int fflush(FILE *f)
 
 FILE *fopen(const char *ruta, const char *modo)
 {
-    if (!modo || (modo[0] != 'r' && modo[0] != 'w')) { errno = EINVAL; return 0; }
+    if (!modo || (modo[0] != 'r' && modo[0] != 'w' && modo[0] != 'a')) {
+        errno = EINVAL;
+        return 0;
+    }
 
     FILE *f = 0;
     for (int i = 0; i < MAX_ABIERTOS; i++)
@@ -148,13 +151,26 @@ FILE *fopen(const char *ruta, const char *modo)
 
     if (!f) { errno = EMFILE; return 0; }
 
-    int64_t fd = openf(ruta, modo[0] == 'r' ? O_LEER : O_ESCRIBIR);
+    /* Las tres letras son los tres contratos con lo que ya hubiera:
+     * 'r' exige que este, 'w' lo vacia, 'a' lo respeta y escribe detras.
+     * El cubo de arriba no cambia en nada: esto se decide una vez, al
+     * abrir, y luego lo cumple el descriptor sin que la libc vuelva a
+     * pensar en ello. */
+    int64_t fd = openf(ruta, modo[0] == 'r' ? O_LEER :
+                             modo[0] == 'a' ? O_ANYADIR : O_ESCRIBIR);
     if (fd < 0) return 0;                  /* openf ya puso errno */
 
     f->fd   = (int)fd;
     f->modo = M_MIO | (modo[0] == 'r' ? M_LEER : M_ESCRIBIR);
     f->n    = 0;
     f->pos  = 0;
+
+    /* En modo 'a' no hay nada mas que hacer para que ftell diga el
+     * tamanyo desde el primer momento: el descriptor ya viene colocado al
+     * final, y ftell no guarda ninguna posicion propia -se la pregunta al
+     * descriptor cada vez-. Un campo mas aqui seria una segunda copia de
+     * un numero que ya existe, y las dos copias acaban discrepando. */
+
     return f;
 }
 
