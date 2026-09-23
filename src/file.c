@@ -16,13 +16,18 @@
 #include "mm.h"
 #include "uart.h"
 #include "spinlock.h"
+#include "ipc.h"
+#include "fs_abi.h"
 
 /* La consola es una sola para todo el mundo y no se cierra nunca. */
-static struct fichero consola = { F_CONSOLA, 1, 0 };
+static struct fichero consola = { F_CONSOLA, 1, 0, { 0 }, 0 };
+
+/* Una transaccion con el servidor de ficheros cada vez (ver mas abajo). */
+static struct mutex fs_mtx;
 
 struct fichero *file_consola(void) { return &consola; }
 
-void file_init(void) { }
+void file_init(void) { mutex_init(&fs_mtx); }
 
 /* Copiar entre el espacio del proceso y el kernel con un buffer de por
  * medio.
@@ -155,6 +160,151 @@ static int64_t consola_read(uint64_t uva, uint64_t n)
     return (int64_t)copiar_a_usuario(uva, &b, 1);
 }
 
+/* --- Ficheros: el kernel como CLIENTE del servidor -------------------
+ *
+ * Hasta aqui el kernel solo recibia peticiones. Para redirigir con > y <
+ * tiene que hacer lo contrario: pedirle algo a un proceso de EL0, y
+ * esperar la respuesta.
+ *
+ * No es tan raro como suena. El hilo que hace read() ya esta dentro del
+ * kernel, con su pila y su entrada en la tabla de tareas; puede mandar un
+ * mensaje y dormirse esperando la contestacion igual que se duerme
+ * esperando una tecla. Lo unico que le falta es un puerto donde recibirla,
+ * y de eso se encarga PORT_KERNEL: un puerto de duenyo 0, que es un pid
+ * que no existe -los procesos empiezan en CORES- y por tanto solo el
+ * kernel puede vaciar.
+ *
+ * La direccion de la dependencia es la que importa: el kernel no llama al
+ * servidor, le escribe. Si el servidor no esta, el mensaje no llega a
+ * ninguna parte y read() devuelve error; no hay nada que se cuelgue
+ * esperando codigo que no existe.
+ *
+ * Una transaccion cada vez. Hay un solo puerto de respuesta y las
+ * respuestas no llevan marca de a quien pertenecen, asi que dos lecturas a
+ * la vez podrian llevarse la contestacion cambiada. Un mutex lo evita, al
+ * precio de serializar la tarjeta -que de todas formas es un solo
+ * dispositivo y solo sabe atender una cosa a la vez-. */
+static int fs_listo;
+
+static int fs_transaccion(uint64_t tipo, const char *nombre, uint64_t off,
+                          const char *datos, uint64_t len,
+                          struct message *resp)
+{
+    mutex_lock(&fs_mtx);
+
+    if (!fs_listo) {
+        if (port_create(0, PORT_KERNEL) != PORT_KERNEL) {
+            mutex_unlock(&fs_mtx);
+            return -1;
+        }
+        fs_listo = 1;
+    }
+
+    struct message m;
+    for (uint64_t i = 0; i < sizeof(m.data); i++) m.data[i] = 0;
+
+    struct fs_request *r = (struct fs_request *)m.data;
+    m.from = 0;
+    m.type = tipo;
+
+    /* len son los BYTES UTILES DE data[], no el tamanyo de la peticion.
+     * Es lo unico que le dice al servidor cuantos bytes escribir; mandarle
+     * el sizeof entero hacia que escribiera los 96 del buffer, ceros
+     * incluidos, y los ficheros salian con el tamanyo redondeado a
+     * multiplos de FS_CHUNK. */
+    m.len  = len;
+    r->port = PORT_KERNEL;
+    r->arg  = off;
+    for (int i = 0; i < FICH_NOMBRE && nombre[i]; i++) r->name[i] = nombre[i];
+    if (datos)
+        for (uint64_t i = 0; i < len && i < FS_CHUNK; i++) r->data[i] = datos[i];
+
+    int ok = -1;
+    if (port_send(PORT_FILES, &m) == 0 &&
+        port_recv(PORT_KERNEL, resp, 0) == 0)
+        ok = 0;
+
+    mutex_unlock(&fs_mtx);
+    return ok;
+}
+
+struct fichero *file_open(const char *nombre, int modo)
+{
+    struct message resp;
+
+    /* Leer exige que exista; escribir exige lo contrario: crearlo, y
+     * vaciarlo si ya estaba. Eso es exactamente lo que significa ">". */
+    if (modo == O_ESCRIBIR) {
+        if (fs_transaccion(FS_CREATE, nombre, 0, 0, 0, &resp) < 0) return 0;
+        if (resp.type != FS_OK) return 0;
+    } else {
+        if (fs_transaccion(FS_SIZE, nombre, 0, 0, 0, &resp) < 0) return 0;
+        if (resp.type != FS_OK) return 0;
+    }
+
+    struct fichero *f = kmalloc(sizeof(struct fichero));
+    if (!f) return 0;
+
+    f->tipo = F_FICHERO;
+    f->refs = 1;
+    f->p    = 0;
+    f->off  = 0;
+    for (int i = 0; i < FICH_NOMBRE; i++) f->nombre[i] = 0;
+    for (int i = 0; i < FICH_NOMBRE - 1 && nombre[i]; i++) f->nombre[i] = nombre[i];
+    return f;
+}
+
+static int64_t fichero_read(struct fichero *f, uint64_t uva, uint64_t n)
+{
+    if (n > FS_CHUNK) n = FS_CHUNK;
+
+    struct message resp;
+    if (fs_transaccion(FS_READ, f->nombre, f->off, 0, 0, &resp) < 0) return -1;
+    if (resp.type == FS_EOF) return 0;            /* se acabo el fichero */
+    if (resp.type != FS_OK)  return -1;
+
+    uint64_t hay = resp.len;
+    if (hay > n) hay = n;
+
+    uint64_t puestos = copiar_a_usuario(uva, resp.data, hay);
+    f->off += puestos;
+    return (int64_t)puestos;
+}
+
+/* Escribir TODO lo que pidan, dando tantas vueltas como haga falta.
+ *
+ * Un mensaje solo lleva FS_CHUNK bytes utiles, asi que la tentacion es
+ * escribir 96 y devolver 96. Es legal -write() puede devolver menos de lo
+ * que se le pide, y el que llama esta obligado a repetir- pero es una
+ * trampa: casi nadie repite, y el fallo no se ve. Sale un fichero de 110
+ * bytes donde tenia que haber 116, con un trozo de en medio ausente, y
+ * como el principio y el final estan bien parece correcto.
+ *
+ * Que una interfaz PERMITA algo no quiere decir que convenga hacerlo. */
+static int64_t fichero_write(struct fichero *f, uint64_t uva, uint64_t n)
+{
+    uint64_t puestos = 0;
+
+    while (puestos < n) {
+        uint64_t trozo = n - puestos;
+        if (trozo > FS_CHUNK) trozo = FS_CHUNK;
+
+        char tmp[FS_CHUNK];
+        uint64_t hay = copiar_de_usuario(tmp, uva + puestos, trozo);
+        if (hay == 0) break;                  /* memoria ilegible */
+
+        struct message resp;
+        if (fs_transaccion(FS_WRITE, f->nombre, f->off, tmp, hay, &resp) < 0 ||
+            resp.type != FS_OK)
+            return puestos ? (int64_t)puestos : -1;
+
+        f->off  += hay;
+        puestos += hay;
+    }
+
+    return (int64_t)puestos;
+}
+
 /* --- La interfaz comun ------------------------------------------------ */
 
 int64_t file_read(struct fichero *f, uint64_t uva, uint64_t n)
@@ -162,6 +312,7 @@ int64_t file_read(struct fichero *f, uint64_t uva, uint64_t n)
     if (!f) return -1;
     if (f->tipo == F_CONSOLA) return consola_read(uva, n);
     if (f->tipo == F_PIPE_R)  return pipe_read(f->p, uva, n);
+    if (f->tipo == F_FICHERO) return fichero_read(f, uva, n);
     return -1;                              /* el extremo que no toca */
 }
 
@@ -170,6 +321,7 @@ int64_t file_write(struct fichero *f, uint64_t uva, uint64_t n)
     if (!f) return -1;
     if (f->tipo == F_CONSOLA) return consola_write(uva, n);
     if (f->tipo == F_PIPE_W)  return pipe_write(f->p, uva, n);
+    if (f->tipo == F_FICHERO) return fichero_write(f, uva, n);
     return -1;
 }
 

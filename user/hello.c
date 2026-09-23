@@ -4,6 +4,8 @@
  * propio espacio de direcciones (0x400000), y se ejecuta en EL0. No puede
  * llamar a uart_puts ni a nada del kernel; solo a traves de 'svc'.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include "syscall.h"
 
 /* Dos variables globales. Hasta el paso 12 esto era imposible: el kernel
@@ -13,72 +15,57 @@
 static int  veces = 41;       /* .data: llega con su valor desde la imagen */
 static char marca[32];        /* .bss : no esta en la imagen, llega a cero */
 
-/* Imprimir un numero por la via directa del kernel (SYS_write). El cliente
- * del servidor de consola lo hace por mensajes; este proceso usa la syscall
- * a proposito, para que se vean los dos caminos. */
-static void kdec(uint64_t v)
-{
-    char buf[24];
-    uint64_t n = udec(buf, v);
-    buf[n] = 0;
-    kprint(buf);
-}
-
 /* Que el enlazador ponga _start el primero (ver user/user.ld) */
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
-    kprint("\n  >> Hola desde EL0. Soy un proceso de usuario.\n");
+    printf("\n  >> Hola desde EL0. Soy un proceso de usuario.\n");
 
     /* Los argumentos. El kernel los dejo en mi propia pila antes de que yo
      * existiera, con x0 = argc y x1 = argv, que es el convenio de siempre. */
-    kprint("  >> me han llamado con ");
-    kdec((uint64_t)argc);
-    kprint(" argumento(s):");
+    printf("  >> me han llamado con ");
+    printf("%lu", (uint64_t)argc);
+    printf(" argumento(s):");
     for (int i = 0; i < argc; i++) {
-        kprint(" [");
-        kprint(argv[i]);
-        kprint("]");
+        printf(" [");
+        printf("%s", argv[i]);
+        printf("]");
     }
-    kprint("\n");
+    printf("\n");
 
-    kprint("  >> mi pid es ");
-    kdec(getpid());
-    kprint("\n");
+    printf("  >> mi pid es ");
+    printf("%lu", getpid());
+    printf("\n");
 
     /* --- .data: viene con valor, y se puede cambiar --- */
-    kprint("  >> global de .data: ");
-    kdec((uint64_t)veces);
+    printf("  >> global de .data: ");
+    printf("%lu", (uint64_t)veces);
     veces++;
-    kprint(" -> le sumo uno -> ");
-    kdec((uint64_t)veces);
-    kprint("\n");
+    printf(" -> le sumo uno -> ");
+    printf("%lu", (uint64_t)veces);
+    printf("\n");
 
     /* --- .bss: no esta en la imagen y aun asi llega a cero --- */
-    kprint("  >> global de .bss, sin inicializar: ");
-    kdec((uint64_t)marca[0]);
+    printf("  >> global de .bss, sin inicializar: ");
+    printf("%lu", (uint64_t)marca[0]);
     for (int i = 0; i < 11; i++)
         marca[i] = (char)("escribible"[i]);
-    kprint(" -> escribo en ella -> ");
-    kprint(marca);
-    kprint("\n");
+    printf(" -> escribo en ella -> ");
+    printf("%s", marca);
+    printf("\n");
 
     for (int i = 1; i <= 3; i++) {
-        kprint("  >> vuelta ");
-        kdec((uint64_t)i);
-        kprint(", uptime ");
-        kdec(uptime());
-        kprint(" ms\n");
+        printf("  >> vuelta ");
+        printf("%lu", (uint64_t)i);
+        printf(", uptime ");
+        printf("%lu", uptime());
+        printf(" ms\n");
         sleep(60);                 /* syscall bloqueante: el kernel me duerme */
     }
 
-    kprint("  >> Ahora intento leer memoria del kernel (0x80000)...\n");
+    printf("  >> Ahora intento leer memoria del kernel (0x80000)...\n");
     volatile unsigned int *kernel_mem = (volatile unsigned int *)0x80000UL;
     unsigned int robado = *kernel_mem;      /* deberia morir aqui */
 
-    kprint("  >> LO HE CONSEGUIDO, el aislamiento no funciona: ");
-    kdec(robado);
-    kprint("\n");
+    printf("  >> LO HE CONSEGUIDO, el aislamiento no funciona: 0x%08x\n", robado);
     exit(1);
 }

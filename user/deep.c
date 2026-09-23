@@ -10,6 +10,8 @@
  * instruccion. El proceso no se entera de nada: para el, la pila
  * simplemente es lo bastante grande.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include "syscall.h"
 
 static uint64_t sp_ahora(void)
@@ -17,14 +19,6 @@ static uint64_t sp_ahora(void)
     uint64_t v;
     __asm__ volatile("mov %0, sp" : "=r"(v));
     return v;
-}
-
-static void num(const char *antes, uint64_t v, const char *despues)
-{
-    char b[24];
-    uint64_t n = udec(b, v);
-    b[n] = 0;
-    kprint(antes); kprint(b); kprint(despues);
 }
 
 static uint64_t hondo;
@@ -55,9 +49,7 @@ static uint64_t bajar(uint64_t n)
     return r + (uint64_t)relleno[511];   /* vivo despues de la llamada */
 }
 
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     uint64_t niveles = 200;
 
@@ -72,14 +64,14 @@ void _start(int argc, char **argv)
     uint64_t arriba = sp_ahora();
     hondo = arriba;
 
-    num("\n  pila al empezar : ", arriba, "\n");
-    num("  bajando ", niveles, " niveles, medio KB cada uno...\n");
+    printf("\n  pila al empezar : %lu\n", arriba);
+    printf("  bajando %lu niveles, medio KB cada uno...\n", niveles);
 
     bajar(niveles);
 
-    num("  pila mas abajo  : ", hondo, "\n");
-    num("  se ha comido    : ", (arriba - hondo) / 1024, " KB\n");
-    kprint("  y he vuelto entero\n");
+    printf("  pila mas abajo  : %lu\n", hondo);
+    printf("  se ha comido    : %lu KB\n", (arriba - hondo) / 1024);
+    printf("  y he vuelto entero\n");
 
     exit(0);
 }

@@ -82,6 +82,8 @@ Tres cosas que QEMU perdona y el silicio no:
 | 25   | Senyales, y Ctrl-C                          | hecho  |
 | 26   | Sueño interrumpible, descriptores y tuberias| hecho  |
 | 27   | El teclado, tambien en EL0                  | hecho  |
+| 28   | Redireccion: < y >                          | hecho  |
+| 29   | Una libc: crt0, printf y libc.a             | hecho  |
 
 ## Estructura
 
@@ -104,15 +106,20 @@ Tres cosas que QEMU perdona y el silicio no:
                  sh.c        interprete de ordenes: lee, carga, arranca, espera
                  write.c     escribe un fichero      rm.c  lo borra
                  cp.c        copia uno en otro       mem.c  ensenya el monton
-                 umalloc.c   malloc/free de usuario, encima de sbrk
                  deep.c      recursion honda: se come la pila a proposito
                  forkd.c     se bifurca y mide lo que NO cuesta hacerlo
-                 signal.c    el trampolin por donde vuelve un manejador
                  trap.c      atrapa Ctrl-C     kill.c  manda senyales
                  upper.c     filtro: lee de la entrada y escribe en la salida
                  wc.c        cuenta lo que le pasa por delante
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
+    lib/         la libc de los programas, archivada en build/libc.a:
+                 crt0.S      _start: lo que corre ANTES de main()
+                 stdio.c     printf, snprintf, putchar, puts, getchar
+                 string.c    memcpy, memset, strlen, strcmp... las de siempre
+                 stdlib.c    exit, atoi, abs
+                 malloc.c    malloc/free de usuario, encima de sbrk
+                 signal.c    el trampolin por donde vuelve un manejador
     tools/       bin2c.py           binario de usuario -> array de C
                  fetch-firmware.sh  baja el firmware de Broadcom para la SD
     config.txt   lo que la GPU lee antes de arrancar la CPU
@@ -1186,6 +1193,254 @@ Con esto el kernel ya no toca ningun periferico de entrada/salida salvo
 para imprimir sus propios mensajes de arranque. La UART, la SD y el teclado
 estan los tres fuera.
 
+## Redireccion: < y >
+
+`ls > lista.txt` parece cosa del shell, y casi todo lo es: partir la linea,
+quedarse con el nombre, y no pasarle el ">" al programa, que no tiene por
+que enterarse. Pero hay una pieza que el shell no puede poner. El programa
+va a escribir "en el 1", y alguien tiene que hacer que el 1 sea un fichero.
+
+Eso es un descriptor nuevo, `F_FICHERO`, y tiene una peculiaridad: **el
+fichero no esta en el kernel**. Esta en el servidor de EL0, detras de un
+puerto de mensajes. Un descriptor que apunta a algo que vive en otro
+proceso.
+
+**El kernel, de cliente.** Hasta aqui el kernel solo recibia peticiones. Un
+proceso llamaba, el kernel contestaba, y la direccion era siempre la misma.
+Para esto tiene que hacer lo contrario: pedirle algo a un proceso de EL0 y
+esperar la respuesta.
+
+No es tan raro como suena. El hilo que hace `read()` ya esta dentro del
+kernel, con su pila y su entrada en la tabla de tareas; puede mandar un
+mensaje y dormirse esperando la contestacion igual que se duerme esperando
+una tecla. Lo unico que le faltaba era un puerto donde recibirla:
+
+```c
+    port_send(PORT_FILES,  &peticion);
+    port_recv(PORT_KERNEL, &respuesta, 0);   /* duenyo: el pid 0 */
+```
+
+`PORT_KERNEL` es de duenyo 0, y el 0 es un pid que no existe -los procesos
+empiezan en `CORES`-, asi que solo el kernel puede vaciarlo. Y la direccion
+de la dependencia sigue siendo la buena: el kernel no *llama* al servidor,
+le *escribe*. Si el servidor no esta, el mensaje no llega a ninguna parte y
+`read()` devuelve error; no hay nada que se cuelgue esperando codigo que no
+existe.
+
+**Lo barato que sale un protocolo sin estado.** El servidor de ficheros no
+tiene `open` ni `close`: cada peticion lleva el nombre y el desplazamiento.
+Eso, que se decidio en el paso 15 para no tener descriptores que perder
+cuando un cliente muere sin avisar, resulta que hace que un fichero abierto
+sea exactamente esto:
+
+```c
+    char     nombre[16];
+    uint64_t off;
+```
+
+No hay handshake, no hay handle que pedir, no hay nada que cerrar al otro
+lado. `file_close` sobre un `F_FICHERO` es un `kfree` y ya. Una decision
+tomada por un motivo (robustez) pagando un coste (buscar en el directorio
+en cada peticion) resulta regalar otra cosa trece pasos despues. Pasa mas
+de lo que parece.
+
+**Donde va cada cosa en el shell.** La redireccion se aplica **en el hijo**,
+entre el `fork` y el `exec`:
+
+```c
+    int64_t pid = fork();
+    if (pid == 0) {
+        aplicar(hay, ent, sal);        /* abre y dup2 sobre el 0 o el 1 */
+        exec(img, bytes, orden);
+    }
+```
+
+Si se hiciera en el padre, el shell se quedaria con el 1 apuntando al
+fichero y no volveria a hablar con la consola nunca. Y en una tuberia va
+**despues** del `dup2` del pipe, que es lo que hace que en `a > f | b` la
+salida de `a` acabe en el fichero y `b` no vea nada: gana la ultima
+redireccion, que es lo mismo que hace cualquier shell y sale solo de
+respetar el orden en que se escribieron.
+
+**Dos fallos que costaron lo mismo de encontrar y uno de arreglar.**
+
+El primero: `openf` devolvia -1 siempre, con el mensaje "no puedo escribir
+OUT.TXT". `PORT_KERNEL` es el 2, y el shell pide un puerto con
+`port_create(-1)` -"el que sea"- y se llevaba justo ese. Ahora la busqueda
+lo salta. Que el mensaje dijera QUE fichero y en QUE direccion fallaba
+llevo derecho al sitio; si hubiera dicho "error de redireccion" habria
+habido que ir a buscarlo.
+
+El segundo: los ficheros salian con tamanyos multiplos de 96 y el texto
+cortado. `message.len` son los bytes utiles de `data[]`, y yo le mandaba el
+`sizeof` de la peticion entera, asi que el servidor escribia los 96 bytes
+del buffer, ceros incluidos. Un campo mal interpretado, no un error de
+logica, y por eso funcionaba *casi*: el sintoma no era "no escribe", era
+"escribe de mas".
+
+Y una comprobacion que conviene hacer siempre con `>`: que **vacia** un
+fichero que ya existia.
+
+```
+    cat hola.txt > x.txt        ls -> X.TXT 116 bytes
+    upper < hola.txt > x.txt    ls -> X.TXT  82 bytes
+```
+
+Si el segundo hubiera dejado 116 bytes, los ultimos 34 serian basura del
+anterior, y el fichero pareceria correcto hasta que alguien llegara al
+final. Por eso `O_ESCRIBIR` manda `FS_CREATE` antes de nada: crear y vaciar
+son la misma operacion, y eso es exactamente lo que significa `>`.
+
+**Un tercer fallo, que aparecio despues.** `cat hola.txt | upper > u.txt`
+daba 116 bytes unas veces y 110 otras. La misma orden, dos resultados.
+
+`fichero_write` escribia como mucho `FS_CHUNK` -96 bytes, lo que cabe en un
+mensaje- y devolvia eso. Es **legal**: `write()` puede escribir menos de lo
+que se le pide y el que llama esta obligado a repetir. Pero `upper` hacia
+un solo `write` y se quedaba tan ancho, y con una tuberia detras eso nunca
+habia fallado porque la tuberia se lo tragaba todo. Al ponerle un fichero
+detras, empezo a perder el trozo que no cupo. Y lo peor: el principio y el
+final del fichero estaban bien, asi que parecia correcto.
+
+Se arreglo por los dos lados, que es lo que corresponde. `fichero_write` da
+ahora tantas vueltas como haga falta, porque que una interfaz PERMITA
+devolver menos no quiere decir que convenga hacerlo cuando se puede evitar.
+Y `upper` repite el `write`, porque esa obligacion es suya y algun dia se
+encontrara con alguien que si devuelva menos.
+
+La moraleja repite una de antes: **una prueba que pasa con una tuberia no
+te dice nada sobre un fichero.** El camino corto funcionaba por una
+propiedad del otro extremo, no por ser correcto.
+
+## Una libc: crt0, printf y libc.a
+
+Hasta aqui cada programa empezaba asi:
+
+```c
+    void _start(int argc, char **argv) __attribute__((section(".text.start")));
+
+    void _start(int argc, char **argv)
+    {
+        ...
+        exit(0);
+    }
+```
+
+y para imprimir un numero hacia esto, copiado de fichero en fichero:
+
+```c
+    static void num(const char *antes, uint64_t v, const char *despues)
+    {
+        char b[24];
+        uint64_t n = udec(b, v);
+        b[n] = 0;
+        kprint(antes); kprint(b); kprint(despues);
+    }
+```
+
+Estaba en **diez** de los dieciocho programas, con el mismo nombre y el
+mismo cuerpo. Eso ya no es reutilizar poco: es una biblioteca escrita a
+mano y sin darse cuenta.
+
+**crt0, o por que main no es el principio.** Todo programa en C empieza en
+`main`, y esa frase esconde una mentira util: el principio es `_start`. El
+kernel entra por el punto de entrada del ELF con argc en `x0` y argv en
+`x1`, que es justo donde el convenio de AArch64 espera los dos primeros
+argumentos, asi que no hay nada que colocar. Lo que si hay que hacer es lo
+de despues:
+
+```asm
+    _start:
+        mov     x29, xzr        /* cortar la cadena de marcos de pila */
+        mov     x30, xzr
+        bl      main            /* argc y argv ya estan donde toca */
+        bl      exit            /* main devolvio en w0; exit lo quiere ahi */
+    1:  b       1b
+```
+
+Son cinco instrucciones, y son las que convierten `return 0` en un proceso
+que termina bien. Sin ellas, un `main` que devuelve se va por el final de
+la funcion y salta a una direccion basura.
+
+**printf.** No es magia: es un bucle sobre una cadena que, al encontrar un
+`%`, saca el siguiente argumento y lo convierte a texto. Lo unico que no se
+puede escribir en C normal es "saca el siguiente argumento", y para eso
+estan los `va_` de `<stdarg.h>`, que **si** da el compilador aunque no haya
+libc: son parte del lenguaje, no de la biblioteca.
+
+Hay un detalle que no es opcional en esta maquina: el modificador `l`. Un
+`int` son 32 bits y un puntero o un `uint64_t` son 64. Sacar de la pila el
+tamanyo equivocado no estropea *ese* numero, desplaza **todos los
+siguientes**. De ahi que `%lu` y `%d` sean cosas distintas de verdad.
+
+Y lo mismo por dentro: `printf` y `snprintf` comparten todo el codigo. Lo
+unico que cambia es a donde van los caracteres, a un descriptor o a un
+buffer:
+
+```c
+    struct destino { int fd; char *buf; size_t cap, n, total; };
+```
+
+`total` cuenta lo producido **quepa o no**, que es lo que permite a
+`snprintf` decirte cuanto sitio habria hecho falta.
+
+La salida a descriptor se acumula en 128 bytes y se vacia al llenarse. Sin
+eso, cada caracter seria una llamada al sistema, y una llamada al sistema
+cuesta una excepcion, un cambio de nivel y un viaje por la tabla de
+vectores. Una linea de ochenta caracteres costaria ochenta.
+
+**El atributo que encuentra fallos.** La declaracion lleva esto:
+
+```c
+    int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+```
+
+y no es decoracion: hace que GCC compruebe que los `%` cuadran con los
+argumentos. Nada mas convertir los programas salto un error real en
+`hello.c` -un `unsigned int` impreso con `%lu`- que el `udec(b, v)` de
+antes se tragaba sin rechistar, porque la conversion implicita a
+`uint64_t` lo arreglaba por accidente. Una herramienta que solo sirve para
+"no equivocarse al escribir" acaba encontrando cosas.
+
+**libc.a, y por que el orden del enlazador importa.** La biblioteca se
+archiva con `ar` y se pasa **al final**:
+
+```
+    $(CC) ... $(CRT0) user/prog.c $(LIBC) -o prog.elf
+```
+
+El enlazador recorre los ficheros **una vez**, y de un archivo solo saca
+los objetos que ya sabe que le faltan. Puesto antes que quien lo usa, no
+aporta nada. El crt0 va suelto y delante porque tiene que estar siempre.
+
+El efecto se mide:
+
+| programa | antes | ahora |
+|----------|-------|-------|
+| `upper`  | 4528  | 4576  |
+| `ls`     | 5512  | 7384  |
+
+`upper` no usa `printf` y crece 48 bytes; `ls` si, y se lleva los ~1,9 KB.
+Eso es el enlazado selectivo funcionando: cada programa paga lo que usa.
+
+**Una precaucion contada bien.** `lib/string.c` se compila con
+`-fno-tree-loop-distribute-patterns`. Esa optimizacion reconoce un bucle de
+copia byte a byte y lo sustituye por una llamada a `memcpy`; dentro de
+`memcpy` eso es recursion infinita. Es un fallo famoso.
+
+Aqui **no pasa**, y conviene saber por que antes de repetir la leyenda:
+`-ffreestanding` le dice a GCC que no de por hecha la biblioteca estandar,
+y eso ya desactiva la transformacion. Se comprueba desensamblando sin el
+flag: `memcpy`, `memset` y `strcpy` salen como bucles, sin un solo `bl`.
+El flag se pone igualmente, no porque haga falta hoy, sino para que la
+correccion de `memcpy` no dependa de un efecto secundario de otro flag.
+
+**Lo que queda del viejo syscall.h.** Al mudar `kprint`, `kgetc`, `exit`,
+`malloc`, `ustrlen`, `ucopy` y `udec` a `<stdio.h>`, `<stdlib.h>` y
+`<string.h>`, el fichero vuelve a ser lo que decia su nombre: la frontera
+con el kernel, y nada mas. Esa es la otra mitad de tener una libc; no solo
+gana el que escribe programas, gana tambien lo que queda debajo.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -1193,8 +1448,20 @@ estan los tres fuera.
   correcto. (Lo que si se saco de el es la carga de un proceso, que son
   milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
   sin el y publica con el otra vez.)
-- El shell no tiene redireccion (`>`, `<`), ni historial, ni segundo plano,
-  ni tuberias de mas de dos: lee, carga, arranca y espera.
+- El shell no tiene historial, ni segundo plano, ni tuberias de mas de dos,
+  ni `>>`: lee, carga, arranca y espera.
+- La libc no tiene coma flotante (`%f` no existe, y el FPU esta apagado),
+  ni `errno`, ni ficheros con buffer (`FILE`, `fopen`): se trabaja con
+  descriptores. `printf` entiende banderas, anchura y `l`, pero no
+  precision (`%.3s`).
+- Una transaccion con el servidor de ficheros cada vez. Hay un solo puerto
+  de respuesta y las respuestas no dicen a quien pertenecen, asi que un
+  mutex las serializa. La tarjeta es un solo dispositivo de todas formas,
+  pero el limite es del mecanismo, no del hardware.
+- Un descriptor de fichero no comparte el desplazamiento entre padre e
+  hijo. En Unix `fork` duplica el descriptor y los dos avanzan el MISMO
+  offset; aqui `file_dup` solo sube el contador y el offset es de la
+  estructura, asi que dos procesos que escriban en el mismo fd se pisan.
 - El buffer de teclas se queda en el kernel aunque el driver este fuera.
   Es deliberado (ver "El teclado, tambien en EL0"), pero significa que el
   kernel sigue sabiendo que es una consola.

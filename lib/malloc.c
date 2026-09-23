@@ -1,4 +1,4 @@
-/* user/umalloc.c - El monton de un proceso
+/* lib/malloc.c - El monton de un proceso
  *
  * Es el MISMO algoritmo que src/kheap.c: lista de trozos libres ordenada
  * por direccion, cabecera delante de cada uno, partir al reservar y fundir
@@ -12,6 +12,7 @@
  * Todo lo demas -el partir, el fundir, la fragmentacion que aparece si no
  * fundes- es identico, porque el problema es el mismo.
  */
+#include "stdlib.h"
 #include "syscall.h"
 
 #define ALINEA      16
@@ -47,7 +48,7 @@ static void insertar(struct bloque *b)
     }
 }
 
-void *malloc(uint64_t n)
+void *malloc(size_t n)
 {
     if (!n) return 0;
 

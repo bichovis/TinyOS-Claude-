@@ -10,35 +10,27 @@
  * baja. Y esta bien que no baje: devolverlo para volver a pedirlo en dos
  * lineas serian dos llamadas al sistema tiradas.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include "syscall.h"
 
 #define N  64
 
 static void *trozos[N];
 
-static void num(const char *antes, uint64_t v, const char *despues)
-{
-    char b[24];
-    uint64_t n = udec(b, v);
-    b[n] = 0;
-    kprint(antes); kprint(b); kprint(despues);
-}
-
 static void tope(const char *que)
 {
-    num("  ", (uint64_t)sbrk(0), "");
-    kprint("   ");
-    kprint(que);
-    kprint("\n");
+    printf("  %lu", (uint64_t)sbrk(0));
+    printf("   ");
+    printf("%s", que);
+    printf("\n");
 }
 
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
-    kprint("\n  tope del monton (sbrk)   que acaba de pasar\n");
+    printf("\n  tope del monton (sbrk)   que acaba de pasar\n");
     tope("al empezar: el monton esta vacio");
 
     /* 1. Muchos bloques pequenyos. El tope sube a saltos, no bloque a
@@ -61,17 +53,17 @@ void _start(int argc, char **argv)
         for (uint64_t i = 0; i < 48 * 1024; i++) b[i] = (unsigned char)i;
         for (uint64_t i = 0; i < 48 * 1024; i++)
             if (b[i] != (unsigned char)i) {
-                kprint("  los 48 KB no son mios: ALGO VA MAL\n");
+                printf("  los 48 KB no son mios: ALGO VA MAL\n");
                 exit(1);
             }
-        kprint("  los 48 KB se escriben y se releen bien\n");
+        printf("  los 48 KB se escriben y se releen bien\n");
         free(grande);
     }
 
     /* 4. Y devolverle al kernel lo que ya no hace falta. */
     void *antes = sbrk(0);
     sbrk(-16 * 1024);
-    if (sbrk(0) < antes) kprint("  sbrk negativo: el tope baja y las paginas vuelven\n");
+    if (sbrk(0) < antes) printf("  sbrk negativo: el tope baja y las paginas vuelven\n");
 
     exit(0);
 }

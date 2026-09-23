@@ -12,6 +12,9 @@
  * del shell", y eso no es purismo: significa que anyadir una orden es
  * copiar un fichero a la SD, sin tocar ni recompilar nada.
  */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "syscall.h"
 #include "fs_abi.h"
 
@@ -37,12 +40,12 @@ static int64_t leer_linea(void)
     uint64_t n = 0;
 
     for (;;) {
-        int k = kgetc();
+        int k = getchar();
         if (k < 0) return -1;                    /* se acabo la entrada */
         char c = (char)k;
 
         if (c == '\r' || c == '\n') {
-            kprint("\n");
+            printf("\n");
             linea[n] = 0;
             return (int64_t)n;
         }
@@ -50,7 +53,7 @@ static int64_t leer_linea(void)
         if (c == 8 || c == 127) {            /* retroceso */
             if (n) {
                 n--;
-                kprint("\b \b");             /* borrar en pantalla */
+                printf("\b \b");             /* borrar en pantalla */
             }
             continue;
         }
@@ -58,7 +61,7 @@ static int64_t leer_linea(void)
         if (c >= ' ' && n < MAX_LINEA - 1) {
             linea[n++] = c;
             char eco[2] = { c, 0 };
-            kprint(eco);
+            printf("%s", eco);
         }
     }
 }
@@ -99,11 +102,11 @@ static uint64_t tamano_de(const char *fichero)
     r.port = (unsigned long)mi_puerto;
     r.arg  = 0;
     for (int i = 0; i < FS_NAME_MAX; i++) r.name[i] = 0;
-    ucopy(r.name, fichero, ustrlen(fichero) + 1);
+    memcpy(r.name, fichero, strlen(fichero) + 1);
 
     m.type = FS_SIZE;
     m.len  = sizeof(r);
-    ucopy(m.data, (const char *)&r, sizeof(r));
+    memcpy(m.data, (const char *)&r, sizeof(r));
 
     if (msg_send(PORT_FILES, &m) < 0) {
         motivo = "no hay servidor de ficheros: arrancalo con 'f'";
@@ -136,11 +139,11 @@ static uint64_t cargar(const char *fichero, unsigned char **img)
         struct fs_request r;
         r.port = (unsigned long)mi_puerto;
         r.arg  = total;
-        ucopy(r.name, fichero, ustrlen(fichero) + 1);
+        memcpy(r.name, fichero, strlen(fichero) + 1);
 
         m.type = FS_READ;
         m.len  = sizeof(r);
-        ucopy(m.data, (const char *)&r, sizeof(r));
+        memcpy(m.data, (const char *)&r, sizeof(r));
 
         if (msg_send(PORT_FILES, &m) < 0 ||
             msg_recv((uint64_t)mi_puerto, &m) < 0) {
@@ -168,12 +171,80 @@ static uint64_t cargar(const char *fichero, unsigned char **img)
 static char *limpiar(char *s)
 {
     while (*s == ' ') s++;
-    uint64_t n = ustrlen(s);
+    uint64_t n = strlen(s);
     while (n && s[n - 1] == ' ') s[--n] = 0;
     return s;
 }
 
 /* Deja en 'nombre' el fichero que hay que cargar para esa orden. */
+/* Separar la redireccion del resto de la orden.
+ *
+ * "cat hola.txt > salida.txt" se convierte en la orden "cat hola.txt" y el
+ * destino "SALIDA.TXT". Se hace CORTANDO la cadena en el < o el >: a
+ * partir de ahi el programa no vera nada, y eso es justo lo que se quiere.
+ * El programa no recibe ">" como argumento porque la redireccion no es
+ * asunto suyo; es un acuerdo entre el shell y el kernel sobre que hay
+ * detras del 0 y del 1.
+ *
+ * Los nombres los pone el que llama en buffers suyos, y no en 'nombre',
+ * que lo usa cargar() para el ejecutable: en "cat < a > b" hay tres
+ * ficheros en juego a la vez. */
+static void mayusculas(char *dst, const char *s, uint64_t max)
+{
+    uint64_t o = 0;
+    while (*s == ' ') s++;
+    while (*s && *s != ' ' && o < max - 1) {
+        char c = *s++;
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        dst[o++] = c;
+    }
+    dst[o] = 0;
+}
+
+/* Devuelve: bit 0 si hay "<", bit 1 si hay ">".
+ *
+ * El final de la cadena se mide ANTES de tocarla. Despues del primer corte
+ * hay un cero en medio, y buscar el segundo signo mirando "hasta el cero"
+ * no encontraria nada: en "cat < a > b" el ">" queda detras. */
+static int redirecciones(char *orden, char *ent, char *sal)
+{
+    int hay = 0;
+    ent[0] = sal[0] = 0;
+
+    uint64_t fin = strlen(orden);
+
+    for (uint64_t i = 0; i < fin; i++) {
+        if (orden[i] != '<' && orden[i] != '>') continue;
+
+        char cual = orden[i];
+        orden[i] = 0;                    /* la orden termina aqui */
+
+        if (cual == '<') { mayusculas(ent, orden + i + 1, 32); hay |= 1; }
+        else             { mayusculas(sal, orden + i + 1, 32); hay |= 2; }
+    }
+    return hay;
+}
+
+/* Aplicar la redireccion. Se llama YA EN EL HIJO, despues del fork y antes
+ * del exec: si se hiciera en el padre, el shell se quedaria con el 0 o el
+ * 1 apuntando al fichero y no volveria a hablar con la consola nunca. */
+static int aplicar(int hay, const char *ent, const char *sal)
+{
+    if (hay & 1) {
+        int64_t fd = openf(ent, O_LEER);
+        if (fd < 0) { printf("  no puedo leer "); printf("%s", ent); printf("\n"); return -1; }
+        dup2((int)fd, 0);
+        closefd((int)fd);
+    }
+    if (hay & 2) {
+        int64_t fd = openf(sal, O_ESCRIBIR);
+        if (fd < 0) { printf("  no puedo escribir "); printf("%s", sal); printf("\n"); return -1; }
+        dup2((int)fd, 1);
+        closefd((int)fd);
+    }
+    return 0;
+}
+
 static int fichero_de(const char *orden)
 {
     char palabra[32];
@@ -191,17 +262,23 @@ static int fichero_de(const char *orden)
 
 static void quejarse(const char *que)
 {
-    kprint("  ");
-    kprint(que);
-    kprint(": ");
-    kprint(motivo);
-    kprint("\n");
+    printf("  ");
+    printf("%s", que);
+    printf(": ");
+    printf("%s", motivo);
+    printf("\n");
 }
 
 /* --- Ejecutar -------------------------------------------------------- */
 
 static void una(char *orden)
 {
+    /* Primero se recorta la redireccion: lo que quede es la orden de
+     * verdad, y es eso lo que se busca en la tarjeta y lo que recibe el
+     * programa como argumentos. */
+    char ent[32], sal[32];
+    int  hay = redirecciones(orden, ent, sal);
+
     if (!fichero_de(orden)) return;
 
     unsigned char *img;
@@ -210,26 +287,20 @@ static void una(char *orden)
 
     int64_t pid = fork();
     if (pid == 0) {
+        if (aplicar(hay, ent, sal) < 0) exit(1);
         exec(img, bytes, orden);
-        kprint("  no he podido convertirme en el programa\n");
+        printf("  no he podido convertirme en el programa\n");
         exit(1);
     }
 
     free(img);
-    if (pid < 0) { kprint("  no he podido bifurcarme\n"); return; }
+    if (pid < 0) { printf("  no he podido bifurcarme\n"); return; }
 
     /* El codigo de salida del hijo. Solo se dice si no es cero, que es
      * como se comporta cualquier shell: lo normal no se anuncia. */
     int64_t codigo = waitpid((uint64_t)pid);
-    if (codigo != 0) {
-        char b[24];
-        uint64_t n = udec(b, (uint64_t)(codigo < 0 ? -codigo : codigo));
-        b[n] = 0;
-        kprint("  [salida ");
-        if (codigo < 0) kprint("-");
-        kprint(b);
-        kprint("]\n");
-    }
+    if (codigo != 0)
+        printf("  [salida %ld]\n", (long)codigo);
 }
 
 /* Dos programas encadenados.
@@ -246,10 +317,14 @@ static void una(char *orden)
  */
 static void tuberia(char *izq, char *der)
 {
+    char ent1[32], sal1[32], ent2[32], sal2[32];
+    int  hay1 = redirecciones(izq, ent1, sal1);
+    int  hay2 = redirecciones(der, ent2, sal2);
+
     if (!fichero_de(izq)) return;
 
     char nombre_izq[32];
-    ucopy(nombre_izq, nombre, ustrlen(nombre) + 1);
+    memcpy(nombre_izq, nombre, strlen(nombre) + 1);
 
     unsigned char *img1;
     uint64_t b1 = cargar(nombre_izq, &img1);
@@ -263,7 +338,7 @@ static void tuberia(char *izq, char *der)
 
     int fds[2];
     if (pipe(fds) < 0) {
-        kprint("  no hay tuberias libres\n");
+        printf("  no hay tuberias libres\n");
         free(img1); free(img2);
         return;
     }
@@ -273,6 +348,11 @@ static void tuberia(char *izq, char *der)
         dup2(fds[1], 1);                 /* mi salida es la tuberia */
         closefd(fds[0]);
         closefd(fds[1]);
+        /* La redireccion va DESPUES de la tuberia, y por eso gana: en
+         * "a > f | b", la salida de a acaba en el fichero y b no ve nada.
+         * Es lo que hace cualquier shell, y sale solo de respetar el
+         * orden en que se escribieron las dos cosas. */
+        if (aplicar(hay1, ent1, sal1) < 0) exit(1);
         exec(img1, b1, izq);
         exit(1);
     }
@@ -282,6 +362,7 @@ static void tuberia(char *izq, char *der)
         dup2(fds[0], 0);                 /* mi entrada es la tuberia */
         closefd(fds[0]);
         closefd(fds[1]);
+        if (aplicar(hay2, ent2, sal2) < 0) exit(1);
         exec(img2, b2, der);
         exit(1);
     }
@@ -297,25 +378,25 @@ static void tuberia(char *izq, char *der)
     if (p2 > 0) waitpid((uint64_t)p2);
 }
 
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
     mi_puerto = port_create(-1);
-    if (mi_puerto < 0) { kprint("  [sh] sin puertos\n"); exit(1); }
+    if (mi_puerto < 0) { printf("  [sh] sin puertos\n"); exit(1); }
 
-    kprint("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
-    kprint("  se arrancan con fork + exec, y se encadenan con |\n");
-    kprint("  Prueba: ls / cat hola.txt | upper / cat hola.txt | wc / salir\n");
+    printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
+    printf("  se arrancan con fork + exec, se encadenan con | y se\n");
+    printf("  redirigen con < y >\n");
+    printf("  Prueba: ls / cat hola.txt | upper / upper < hola.txt > dos.txt\n");
+    printf("          wc < hola.txt / salir\n");
 
     for (;;) {
-        kprint("\n$ ");
+        printf("\n$ ");
 
         int64_t largo = leer_linea();
         if (largo < 0) {                         /* fin de la entrada */
-            kprint("\n  se acabo la entrada, me voy\n");
+            printf("\n  se acabo la entrada, me voy\n");
             exit(0);
         }
         if (largo == 0) continue;
@@ -330,7 +411,7 @@ void _start(int argc, char **argv)
         if (!*izq) continue;
 
         if (izq[0] == 's' && izq[1] == 'a' && !der) {   /* salir */
-            kprint("  hasta luego\n");
+            printf("  hasta luego\n");
             exit(0);
         }
 

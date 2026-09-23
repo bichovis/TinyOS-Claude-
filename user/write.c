@@ -6,6 +6,9 @@
  * linea. No sabe nada de FAT ni de la tarjeta: solo habla por el puerto
  * de ficheros, igual que 'cat'.
  */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "syscall.h"
 #include "fs_abi.h"
 
@@ -22,36 +25,34 @@ static uint64_t pedir(uint64_t tipo, const char *nombre, uint64_t arg,
     r.arg  = arg;
 
     for (int i = 0; i < FS_NAME_MAX; i++) r.name[i] = 0;
-    ucopy(r.name, nombre, ustrlen(nombre) + 1);
+    memcpy(r.name, nombre, strlen(nombre) + 1);
 
     for (uint64_t i = 0; i < FS_CHUNK; i++)
         r.data[i] = (i < n && datos) ? datos[i] : 0;
 
     m.type = tipo;
     m.len  = n;
-    ucopy(m.data, (const char *)&r, sizeof(r));
+    memcpy(m.data, (const char *)&r, sizeof(r));
 
     if (msg_send(PORT_FILES, &m) < 0)   return FS_ERROR;
     if (msg_recv((uint64_t)mio, &m) < 0) return FS_ERROR;
     return m.type;
 }
 
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     if (argc < 3) {
-        kprint("\n  uso: write NOMBRE.EXT texto...\n");
+        printf("\n  uso: write NOMBRE.EXT texto...\n");
         exit(1);
     }
 
     mio = port_create(-1);
-    if (mio < 0) { kprint("  [write] sin puertos\n"); exit(1); }
+    if (mio < 0) { printf("  [write] sin puertos\n"); exit(1); }
 
     const char *fichero = argv[1];
 
     if (pedir(FS_CREATE, fichero, 0, 0, 0) != FS_OK) {
-        kprint("  [write] no he podido crearlo\n");
+        printf("  [write] no he podido crearlo\n");
         exit(1);
     }
 
@@ -75,12 +76,12 @@ void _start(int argc, char **argv)
 
     if (n && pedir(FS_WRITE, fichero, off, buf, n) != FS_OK) goto mal;
 
-    kprint("\n  escrito en ");
-    kprint(fichero);
-    kprint("\n");
+    printf("\n  escrito en ");
+    printf("%s", fichero);
+    printf("\n");
     exit(0);
 
 mal:
-    kprint("\n  [write] la tarjeta ha fallado escribiendo\n");
+    printf("\n  [write] la tarjeta ha fallado escribiendo\n");
     exit(1);
 }

@@ -5,6 +5,8 @@
  *
  * Los pids salen del comando 'l' del menu del kernel.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include "syscall.h"
 
 static uint64_t numero(const char *s)
@@ -14,12 +16,10 @@ static uint64_t numero(const char *s)
     return v;
 }
 
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     if (argc < 2) {
-        kprint("\n  uso: kill PID [senyal]   (por defecto 15, SIGTERM)\n");
+        printf("\n  uso: kill PID [senyal]   (por defecto 15, SIGTERM)\n");
         exit(1);
     }
 
@@ -27,10 +27,10 @@ void _start(int argc, char **argv)
     int      sig = (argc > 2) ? (int)numero(argv[2]) : SIGTERM;
 
     if (kill(pid, sig) < 0) {
-        kprint("\n  no hay ningun proceso con ese pid\n");
+        printf("\n  no hay ningun proceso con ese pid\n");
         exit(1);
     }
 
-    kprint("\n  senyal enviada\n");
+    printf("\n  senyal enviada\n");
     exit(0);
 }

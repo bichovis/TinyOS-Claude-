@@ -7,6 +7,15 @@
 #define MAX_PORTS      8
 #define PORT_QUEUE     8
 
+/* El puerto por el que el KERNEL recibe respuestas del servidor de
+ * ficheros. Su duenyo es el pid 0, que no existe -los procesos empiezan en
+ * CORES-, asi que ningun proceso puede vaciarlo.
+ *
+ * Esta reservado: port_create(-1) lo salta. Sin eso se lo lleva el primer
+ * proceso que pida un puerto sin decir cual, que resulta ser el shell, y
+ * la redireccion falla con un "no puedo escribir" que no dice por que. */
+#define PORT_KERNEL    2
+
 struct port {
     int          in_use;
     uint64_t     owner;                  /* pid que puede recibir de el     */

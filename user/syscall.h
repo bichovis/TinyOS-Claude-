@@ -31,13 +31,6 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a
     return (int64_t)x0;
 }
 
-static inline uint64_t ustrlen(const char *s)
-{
-    uint64_t n = 0;
-    while (s[n]) n++;
-    return n;
-}
-
 /* --- Llamadas basicas -------------------------------------------------- */
 /* --- Descriptores ------------------------------------------------------
  * El 0 es la entrada y el 1 la salida, por costumbre. Quien arranca el
@@ -57,36 +50,15 @@ static inline int64_t closefd(int fd)
 static inline int64_t dup2(int viejo, int nuevo)
 { return syscall2(SYS_dup2, (uint64_t)viejo, (uint64_t)nuevo); }
 
-/* Escribir una cadena entera en la salida. El kernel acepta trozos
- * pequenyos por llamada, asi que aqui se da la vuelta hasta acabar. */
-static inline void kprint(const char *s)
-{
-    uint64_t n = ustrlen(s), o = 0;
-    while (o < n) {
-        int64_t k = write(1, s + o, n - o);
-        if (k <= 0) break;
-        o += (uint64_t)k;
-    }
-}
-static inline void exit(int code)         { syscall2(SYS_exit, (uint64_t)code, 0); }
-
-/* Un caracter de la entrada. Bloquea hasta que llegue; -1 si se acaba o
- * si nos interrumpe una senyal. */
-static inline int kgetc(void)
-{
-    char c;
-    return (read(0, &c, 1) == 1) ? (int)(unsigned char)c : -1;
-}
-
-/* --- El monton del proceso (user/umalloc.c) ---------------------------
- * Encima de sbrk(), el mismo asignador que usa el kernel para el suyo. */
-void *malloc(uint64_t n);
-void  free(void *p);
+/* Lo que antes estaba aqui -kprint, kgetc, exit, malloc, ustrlen, ucopy,
+ * udec- se ha ido a la libc, que es donde le tocaba: <stdio.h>,
+ * <stdlib.h> y <string.h>. Este fichero vuelve a ser lo que decia su
+ * nombre, la frontera con el kernel y nada mas. */
 
 /* Paginas de 4 KB libres en todo el sistema. */
 static inline uint64_t freepages(void) { return (uint64_t)syscall2(SYS_freepages, 0, 0); }
 
-/* --- Senyales (user/signal.c) -----------------------------------------
+/* --- Senyales (lib/signal.c) ------------------------------------------
  * signal() registra que hacer cuando llegue una; 0 vuelve a la accion por
  * defecto. SIGKILL no se puede atrapar. */
 int signal(int sig, void (*manejador)(int));
@@ -127,6 +99,10 @@ static inline int64_t msg_recv(uint64_t port, struct message *m)
 /* --- MMIO concedido (solo para drivers) -------------------------------- */
 static inline uint64_t mmio_base(void)    { return (uint64_t)syscall2(SYS_mmio_base, 0, 0); }
 
+/* Abrir un fichero de la tarjeta y quedarselo en un descriptor. */
+static inline int64_t openf(const char *nombre, uint64_t modo)
+                                          { return syscall2(SYS_open, (uint64_t)nombre, modo); }
+
 /* Para escribir un driver: pedir que una interrupcion llegue como mensaje,
  * devolverla cuando ya esta atendida, y entregarle al kernel las teclas. */
 static inline int64_t irq_register(uint64_t irq, uint64_t puerto)
@@ -151,18 +127,3 @@ static inline uint64_t clock_rate(uint64_t id)
 static inline int64_t spawn(const void *imagen, uint64_t bytes, const char *args)
 { return syscall3(SYS_spawn, (uint64_t)imagen, bytes, (uint64_t)args); }
 
-/* --- Utilidades sin libc ----------------------------------------------- */
-static inline void ucopy(char *dst, const char *src, uint64_t n)
-{
-    for (uint64_t i = 0; i < n; i++) dst[i] = src[i];
-}
-
-static inline uint64_t udec(char *out, uint64_t v)
-{
-    char tmp[21];
-    uint64_t n = 0, i = 0;
-    if (v == 0) { out[0] = '0'; return 1; }
-    while (v) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
-    while (n) out[i++] = tmp[--n];
-    return i;
-}

@@ -3,21 +3,13 @@
  * Como 'upper', no sabe de donde vienen los bytes. Y como escribe su
  * resultado en la salida, se le puede encadenar otra cosa detras.
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include "syscall.h"
 
 static char buf[128];
 
-static void num(const char *antes, uint64_t v, const char *despues)
-{
-    char b[24];
-    uint64_t n = udec(b, v);
-    b[n] = 0;
-    kprint(antes); kprint(b); kprint(despues);
-}
-
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
@@ -32,7 +24,7 @@ void _start(int argc, char **argv)
             if (buf[i] == '\n') lineas++;
     }
 
-    num("\n  ", lineas, " lineas, ");
-    num("", bytes, " bytes\n");
+    printf("\n  %lu lineas, ", lineas);
+    printf("%lu bytes\n", bytes);
     exit(0);
 }

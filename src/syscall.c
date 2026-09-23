@@ -276,6 +276,31 @@ void syscall_dispatch(struct trap_frame *f)
         break;
     }
 
+    /* Abrir un fichero de la tarjeta. Devuelve un descriptor, que es lo
+     * que hace que el shell pueda ponerlo en el 0 o en el 1 con dup2 y que
+     * el programa no se entere de nada. */
+    case SYS_open: {
+        char nombre[FICH_NOMBRE];
+        if (!user_readable(f->x[0], 1)) { ret = -1; break; }
+
+        uint64_t i = 0;
+        for (; i < FICH_NOMBRE - 1; i++) {
+            if (!vmm_translate_user(f->x[0] + i)) break;
+            char c = ((const char *)f->x[0])[i];
+            if (!c) break;
+            nombre[i] = c;
+        }
+        nombre[i] = 0;
+        if (i == 0) { ret = -1; break; }
+
+        struct fichero *fi = file_open(nombre, (int)f->x[1]);
+        if (!fi) { ret = -1; break; }
+
+        ret = task_fd_alloc(fi);
+        if (ret < 0) file_close(fi);     /* no habia descriptor libre */
+        break;
+    }
+
     case SYS_close:
         ret = task_fd_close((int)f->x[0]);
         break;

@@ -11,6 +11,9 @@
  * dependeria de un proceso que puede morirse, y eso es justo lo que un
  * microkernel no hace.
  */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "syscall.h"
 #include "fs_abi.h"
 
@@ -18,16 +21,6 @@
 
 static struct message m;
 static unsigned char imagen[MAX_IMG];
-
-static void dec(const char *antes, uint64_t v, const char *despues)
-{
-    char num[24];
-    uint64_t n = udec(num, v);
-    num[n] = 0;
-    kprint(antes); kprint(num); kprint(despues);
-}
-
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
 
 /* Rehacer la linea de argumentos para el hijo: todo lo que venga despues
  * de "run". Asi "run HELLO.ELF uno dos" arranca HELLO.ELF viendose a si
@@ -45,39 +38,39 @@ static void juntar_args(int argc, char **argv)
     args_hijo[o] = 0;
 }
 
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     if (argc < 2) {
-        kprint("\n  uso: run PROGRAMA.ELF [argumentos]\n");
+        printf("\n  uso: run PROGRAMA.ELF [argumentos]\n");
         exit(1);
     }
     const char *programa = argv[1];
     juntar_args(argc, argv);
 
     int64_t mio = port_create(-1);
-    if (mio < 0) { kprint("  [run] sin puertos\n"); exit(1); }
+    if (mio < 0) { printf("  [run] sin puertos\n"); exit(1); }
 
-    kprint("\n  [run] leyendo ");
-    kprint(programa);
-    kprint(" de la tarjeta...\n");
+    printf("\n  [run] leyendo ");
+    printf("%s", programa);
+    printf(" de la tarjeta...\n");
 
     uint64_t total = 0;
     while (total < MAX_IMG) {
         struct fs_request r;
         r.port = (unsigned long)mio;
         r.arg  = total;
-        ucopy(r.name, programa, ustrlen(programa) + 1);
+        memcpy(r.name, programa, strlen(programa) + 1);
 
         m.type = FS_READ;
         m.len  = sizeof(r);
-        ucopy(m.data, (const char *)&r, sizeof(r));
+        memcpy(m.data, (const char *)&r, sizeof(r));
         if (msg_send(PORT_FILES, &m) < 0) {
-            kprint("  [run] no hay servidor de ficheros: arrancalo con 'f'\n");
+            printf("  [run] no hay servidor de ficheros: arrancalo con 'f'\n");
             exit(1);
         }
 
         if (msg_recv((uint64_t)mio, &m) < 0) break;
-        if (m.type == FS_ERROR) { kprint("  [run] no existe\n"); exit(1); }
+        if (m.type == FS_ERROR) { printf("  [run] no existe\n"); exit(1); }
         if (m.type != FS_OK || m.len == 0) break;
 
         for (uint64_t i = 0; i < m.len; i++)
@@ -85,11 +78,11 @@ void _start(int argc, char **argv)
         total += m.len;
     }
 
-    dec("  [run] ", total, " bytes leidos, se los paso al kernel\n");
+    printf("  [run] %lu bytes leidos, se los paso al kernel\n", total);
 
     int64_t pid = spawn(imagen, total, args_hijo);
-    if (pid < 0) kprint("  [run] el kernel no lo ha querido\n");
-    else         dec("  [run] arrancado como pid ", (uint64_t)pid, "\n");
+    if (pid < 0) printf("  [run] el kernel no lo ha querido\n");
+    else         printf("  [run] arrancado como pid %lu\n", (uint64_t)pid);
 
     exit(0);
 }

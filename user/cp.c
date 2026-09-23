@@ -7,6 +7,9 @@
  * verdad: copiar 8 KB son casi noventa idas y venidas por el IPC y varios
  * clusters encadenados en la FAT.
  */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "syscall.h"
 #include "fs_abi.h"
 
@@ -24,51 +27,41 @@ static uint64_t pedir(uint64_t tipo, const char *nombre, uint64_t arg,
     r.arg  = arg;
 
     for (int i = 0; i < FS_NAME_MAX; i++) r.name[i] = 0;
-    ucopy(r.name, nombre, ustrlen(nombre) + 1);
+    memcpy(r.name, nombre, strlen(nombre) + 1);
     for (uint64_t i = 0; i < FS_CHUNK; i++)
         r.data[i] = (i < n && datos) ? datos[i] : 0;
 
     m.type = tipo;
     m.len  = n;
-    ucopy(m.data, (const char *)&r, sizeof(r));
+    memcpy(m.data, (const char *)&r, sizeof(r));
 
     if (msg_send(PORT_FILES, &m) < 0)    return FS_ERROR;
     if (msg_recv((uint64_t)mio, &m) < 0) return FS_ERROR;
     return m.type;
 }
 
-static void dec(uint64_t v)
-{
-    char n[24];
-    uint64_t l = udec(n, v);
-    n[l] = 0;
-    kprint(n);
-}
-
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     if (argc < 3) {
-        kprint("\n  uso: cp ORIGEN DESTINO\n");
+        printf("\n  uso: cp ORIGEN DESTINO\n");
         exit(1);
     }
 
     mio = port_create(-1);
-    if (mio < 0) { kprint("  [cp] sin puertos\n"); exit(1); }
+    if (mio < 0) { printf("  [cp] sin puertos\n"); exit(1); }
 
     const char *origen  = argv[1];
     const char *destino = argv[2];
 
     if (pedir(FS_SIZE, origen, 0, 0, 0) != FS_OK) {
-        kprint("\n  ");
-        kprint(origen);
-        kprint(": no esta en la tarjeta\n");
+        printf("\n  ");
+        printf("%s", origen);
+        printf(": no esta en la tarjeta\n");
         exit(1);
     }
 
     if (pedir(FS_CREATE, destino, 0, 0, 0) != FS_OK) {
-        kprint("\n  [cp] no he podido crear el destino\n");
+        printf("\n  [cp] no he podido crear el destino\n");
         exit(1);
     }
 
@@ -81,16 +74,16 @@ void _start(int argc, char **argv)
         for (uint64_t i = 0; i < n; i++) trozo[i] = m.data[i];
 
         if (pedir(FS_WRITE, destino, off, trozo, n) != FS_OK) {
-            kprint("\n  [cp] la tarjeta ha fallado escribiendo\n");
+            printf("\n  [cp] la tarjeta ha fallado escribiendo\n");
             exit(1);
         }
         off += n;
     }
 
-    kprint("\n  copiados ");
-    dec(off);
-    kprint(" bytes en ");
-    kprint(destino);
-    kprint("\n");
+    printf("\n  copiados ");
+    printf("%lu", off);
+    printf(" bytes en ");
+    printf("%s", destino);
+    printf("\n");
     exit(0);
 }

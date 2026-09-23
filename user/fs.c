@@ -15,6 +15,8 @@
  *   +FATs               el directorio raiz, 512 entradas de 32 bytes
  *   +raiz               los datos, en clusters de 4 sectores
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include "syscall.h"
 #include "sd.h"
 #include "fs_abi.h"
@@ -548,12 +550,10 @@ static void responder(uint64_t puerto, uint64_t tipo, const void *datos, uint64_
     msg_send(puerto, &resp);
 }
 
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    kprint("\n  [fs] servidor de ficheros vivo en EL0\n");
+    printf("\n  [fs] servidor de ficheros vivo en EL0\n");
 
     /* Lo PRIMERO, antes de tocar el hardware: quedarse con el puerto.
      *
@@ -564,52 +564,35 @@ void _start(int argc, char **argv)
      * de cerrojo entre procesos: quien lo tiene, manda. */
     int64_t puerto = port_create(PORT_FILES);
     if (puerto != PORT_FILES) {
-        kprint("  [fs] ya hay un servidor de ficheros: me voy\n");
+        printf("  [fs] ya hay un servidor de ficheros: me voy\n");
         exit(1);
     }
 
     volatile uint32_t *emmc = (volatile uint32_t *)mmio_base();
     if (!emmc) {
-        kprint("  [fs] no tengo el MMIO del EMMC, no puedo trabajar\n");
+        printf("  [fs] no tengo el MMIO del EMMC, no puedo trabajar\n");
         exit(1);
     }
 
-    {
-        char n[24];
-        uint64_t l = udec(n, clock_rate(CLK_EMMC));
-        n[l] = 0;
-        kprint("  [fs] reloj base del EMMC segun la GPU: ");
-        kprint(n);
-        kprint(" Hz\n");
-    }
-    kprint("  [fs] arrancando la tarjeta SD...\n");
+    printf("  [fs] reloj base del EMMC segun la GPU: %lu Hz\n",
+           clock_rate(CLK_EMMC));
+
+    printf("  [fs] arrancando la tarjeta SD...\n");
     if (sd_init(emmc) < 0) {
-        char n[16];
-        uint64_t l = udec(n, sd_host_version());
-        n[l] = 0;
-        kprint("  [fs] la tarjeta no arranca\n       controlador SDHCI version ");
-        kprint(n);
-        kprint("\n       ");
-        kprint(sd_last_error());
-        kprint("\n");
+        printf("  [fs] la tarjeta no arranca\n"
+               "       controlador SDHCI version %lu\n"
+               "       %s\n",
+               (uint64_t)sd_host_version(), sd_last_error());
         exit(1);
     }
 
     if (montar() < 0) {
-        kprint("  [fs] no encuentro una particion FAT16 que entienda\n");
+        printf("  [fs] no encuentro una particion FAT16 que entienda\n");
         exit(1);
     }
 
-    {
-        char n[24];
-        uint64_t l = udec(n, sd_sd_clock());
-        n[l] = 0;
-        kprint("  [fs] tarjeta a ");
-        kprint(n);
-        kprint(" Hz\n");
-    }
-
-    kprint("  [fs] FAT16 montada\n");
+    printf("  [fs] tarjeta a %lu Hz\n", (uint64_t)sd_sd_clock());
+    printf("  [fs] FAT16 montada\n");
 
     for (;;) {
         if (msg_recv(PORT_FILES, &pet) < 0) continue;

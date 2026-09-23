@@ -72,6 +72,13 @@ struct message {
 #define SYS_console_push 27   /* (buffer, bytes) -> 0 | -1                  */
 #define SYS_console_int  28   /* () -> Ctrl-C al proceso de primer plano    */
 
+/* Abrir un fichero de la tarjeta y quedarselo en un descriptor. Es lo que
+ * hace falta para que el shell pueda redirigir con > y <. */
+#define SYS_open         29   /* (nombre, modo) -> fd | -1                  */
+
+#define O_LEER            0
+#define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */
+
 /* --- Senyales ----------------------------------------------------------
  * Los numeros son los de siempre, para que no haya que aprenderselos otra
  * vez. Solo estan los tres que hacen falta.

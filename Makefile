@@ -5,6 +5,7 @@
 CROSS   ?= aarch64-elf-
 CC      := $(CROSS)gcc
 OBJCOPY := $(CROSS)objcopy
+AR      := $(CROSS)ar
 OBJDUMP := $(CROSS)objdump
 QEMU    ?= qemu-system-aarch64
 
@@ -34,7 +35,7 @@ EXTRA_fs := user/sd.c
 UCFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -ffreestanding -nostdlib \
            -nostartfiles -mcpu=cortex-a53 -mgeneral-regs-only -mstrict-align \
            -fno-stack-protector -fno-pie -fno-common \
-           -ffunction-sections -fdata-sections -Iuser -I$(INCDIR)
+           -ffunction-sections -fdata-sections -Iuser -Ilib -I$(INCDIR)
 # -z max-page-size=4096 : sin esto el enlazador de AArch64 alinea los
 #                         segmentos a 64 KB y el ELF engorda quince veces
 # -s                    : fuera simbolos y secciones; al cargador no le
@@ -42,6 +43,15 @@ UCFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -ffreestanding -nostdlib \
 ULDFLAGS := -nostdlib -nostartfiles -T user/user.ld \
             -Wl,--no-warn-rwx-segments -Wl,-z,max-page-size=4096 -s \
             -Wl,--gc-sections
+
+# --- La libc de los programas de usuario ------------------------------
+# Una biblioteca de verdad: se archiva con ar y se enlaza al final. El
+# enlazador saca de ella SOLO los objetos que hagan falta, asi que un
+# programa que no use printf no lo lleva dentro.
+LIBCSRC := lib/string.c lib/stdio.c lib/stdlib.c lib/malloc.c lib/signal.c
+LIBCOBJ := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIBCSRC))
+CRT0    := $(BUILD)/lib/crt0.o
+LIBC    := $(BUILD)/libc.a
 
 CSRCS   := $(wildcard $(SRCDIR)/*.c)
 ASRCS   := $(wildcard $(SRCDIR)/*.S)
@@ -66,11 +76,40 @@ $(BUILD)/%.S.o: $(SRCDIR)/%.S | $(BUILD)
 # se pasa a binario plano y se empotra en el kernel como un array de C.
 .PRECIOUS: $(BUILD)/%.elf $(BUILD)/%_bin.c
 
-$(BUILD)/%.elf: user/%.c user/syscall.h user/sd.c user/sd.h user/umalloc.c \
-                user/signal.c \
+$(BUILD)/lib:
+	@mkdir -p $(BUILD)/lib
+
+$(BUILD)/lib/%.o: lib/%.c lib/stdio.h lib/string.h lib/stdlib.h | $(BUILD)/lib
+	@echo "  CC-L  $<"
+	@$(CC) $(UCFLAGS) -c $< -o $@
+
+# string.c y solo string.c lleva un flag de mas.
+# -ftree-loop-distribute-patterns reconoce un bucle de copia byte a byte y
+# lo sustituye por una llamada a memcpy; dentro de memcpy eso es recursion
+# infinita. Con -ffreestanding no llega a pasar, pero asi la correccion de
+# memcpy no depende de un efecto secundario de otro flag. Ver lib/string.c.
+$(BUILD)/lib/string.o: lib/string.c lib/string.h | $(BUILD)/lib
+	@echo "  CC-L  $< (sin reconocimiento de patrones)"
+	@$(CC) $(UCFLAGS) -fno-tree-loop-distribute-patterns -c $< -o $@
+
+$(CRT0): lib/crt0.S | $(BUILD)/lib
+	@echo "  AS-L  $<"
+	@$(CC) $(UCFLAGS) -c $< -o $@
+
+$(LIBC): $(LIBCOBJ)
+	@echo "  AR    $@"
+	@rm -f $@
+	@$(AR) rcs $@ $(LIBCOBJ)
+
+# El crt0 va SUELTO y delante; la libc va archivada y al final. El orden
+# importa: el enlazador recorre los archivos una vez y solo saca de ellos
+# lo que ya sabe que le falta, asi que una biblioteca puesta antes que
+# quien la usa no aporta nada.
+$(BUILD)/%.elf: user/%.c user/syscall.h user/sd.c user/sd.h \
+                $(CRT0) $(LIBC) \
                 $(INCDIR)/ipc_abi.h $(INCDIR)/fs_abi.h user/user.ld | $(BUILD)
 	@echo "  CC-U  user/$*.c"
-	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c user/umalloc.c user/signal.c $(EXTRA_$*) -o $@
+	@$(CC) $(UCFLAGS) $(ULDFLAGS) $(CRT0) user/$*.c $(EXTRA_$*) $(LIBC) -o $@
 
 # Lo que se empotra en el kernel es el ELF tal cual. Antes era un binario
 # plano con una cabecera que nos habiamos inventado; ahora el formato ya

@@ -11,6 +11,7 @@
 #include "sched.h"
 #include "sync.h"
 #include "ipc.h"
+#include "file.h"
 
 #define TICK_HZ      100
 
@@ -865,6 +866,7 @@ void kernel_main(uint64_t dtb_ptr)
 
     pmm_init(ram_base + ram_size);
     ipc_init();
+    file_init();
     mem_stats();
 
     /* La MMU lleva encendida desde boot.S: no habia alternativa, el kernel

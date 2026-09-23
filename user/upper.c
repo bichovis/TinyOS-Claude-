@@ -5,13 +5,12 @@
  * del teclado; si lo arranca detras de una tuberia, del programa anterior.
  * Esa ignorancia es justamente lo que lo hace combinable.
  */
+#include <stdlib.h>
 #include "syscall.h"
 
 static char buf[128];
 
-void _start(int argc, char **argv) __attribute__((section(".text.start")));
-
-void _start(int argc, char **argv)
+int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
@@ -22,7 +21,14 @@ void _start(int argc, char **argv)
         for (int64_t i = 0; i < n; i++)
             if (buf[i] >= 'a' && buf[i] <= 'z') buf[i] = (char)(buf[i] - 32);
 
-        write(1, buf, (uint64_t)n);
+        /* write() puede escribir MENOS de lo que se le pide, y entonces
+         * hay que volver. Con una tuberia detras no pasa nunca y el fallo
+         * no se ve; con un fichero detras, si. */
+        for (int64_t o = 0; o < n; ) {
+            int64_t k = write(1, buf + o, (uint64_t)(n - o));
+            if (k <= 0) break;
+            o += k;
+        }
     }
     exit(0);
 }
