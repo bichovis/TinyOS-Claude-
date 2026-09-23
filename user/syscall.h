@@ -131,6 +131,19 @@ static inline int64_t realpath(const char *ruta, char *salida)
                                           { return syscall2(SYS_realpath, (uint64_t)ruta,
                                                             (uint64_t)salida); }
 
+/* --- Solo para init ---------------------------------------------------
+ * Arrancar un programa de los que el kernel lleva dentro, y decir quien
+ * manda en la consola. A cualquier otro proceso le contestan -1. */
+static inline int64_t bootstrap(const char *nombre, char *const argv[],
+                                char *const envp[], uint64_t dispositivo)
+{
+    return syscall4(SYS_bootstrap, (uint64_t)nombre, (uint64_t)argv,
+                    (uint64_t)envp, dispositivo);
+}
+
+static inline int64_t consola(uint64_t pid)
+{ return syscall2(SYS_consola, pid, 0); }
+
 /* Mapear un fichero: convertirlo en un puntero. No lo lee ahora; los
  * trozos van llegando segun se tocan. */
 static inline const char *mmap(const char *ruta, uint64_t *tam)

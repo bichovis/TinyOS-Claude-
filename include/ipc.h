@@ -16,6 +16,17 @@
  * la redireccion falla con un "no puedo escribir" que no dice por que. */
 #define PORT_KERNEL    2
 
+/* Los tres de abajo estan RESERVADOS: el 0 para la consola, el 1 para los
+ * ficheros y el 2 para el kernel. port_create(-1) empieza a repartir a
+ * partir del 3.
+ *
+ * Que un puerto "de los conocidos" se pueda repartir por sorteo es un
+ * fallo que ya paso una vez -el kernel se quedaba sin el suyo- y volvio a
+ * pasar en cuanto init pidio un puerto antes que el servidor de ficheros:
+ * se llevo el 1, y el servidor se encontro su sitio ocupado y se murio.
+ * Un numero reservado que no esta reservado no es un numero reservado. */
+#define PORT_PRIMERO_LIBRE  3
+
 struct port {
     int          in_use;
     uint64_t     owner;                  /* pid que puede recibir de el     */

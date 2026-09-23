@@ -27,16 +27,6 @@ extern const uint8_t  user_cat[];        extern const uint64_t user_cat_size;
 extern const uint8_t  user_run[];        extern const uint64_t user_run_size;
 extern const uint8_t  user_sh[];         extern const uint64_t user_sh_size;
 
-/* Registros de la PL011. Se los concedemos al driver de consola para que
- * pueda hacer su trabajo desde EL0 sin pasar por el kernel. Aqui hace falta
- * la direccion FISICA (es la que se va a meter en una tabla de paginas),
- * no la virtual por la que los ve el kernel. */
-#define UART0_PHYS  (PERIPHERAL_PA + 0x201000)
-
-/* Registros del controlador EMMC. Se los concedemos al servidor de
- * ficheros por el mismo camino: una pagina de MMIO en su espacio, y a
- * partir de ahi habla con la tarjeta sin pasar por el kernel. */
-#define EMMC_PHYS   (PERIPHERAL_PA + 0x300000)
 
 /* --- Enrutar los pines de la tarjeta al EMMC --------------------------
  *
@@ -458,13 +448,17 @@ static void thread_shell(void *arg)
      * y la interrupcion de recepcion lo despierta. Latencia minima y cero
      * CPU consumida mientras no escribes. */
     for (;;) {
-        if (sh_pid) {
-            if (task_alive(sh_pid)) { task_sleep(10); continue; }
-            uart_puts("\n  [kernel] el interprete ha terminado."
-                      " Vuelvo a leer yo.\n");
-            sh_pid = 0;
-            task_set_console(0);
-        }
+        /* Si la consola es de otro, el menu se aparta.
+         *
+         * Esto no es cortesia: los dos leen del MISMO anillo de teclas, y
+         * leer los dos a la vez no es que salga desordenado, es que se
+         * reparten las letras. Escribir "env" daba "nvs" en el shell y una
+         * 'e' en el menu, cada uno convencido de haber leido bien.
+         *
+         * Desde que init reparte la consola, el menu es solo una
+         * herramienta de depuracion: manda quien la tenga. */
+        if (task_console_pid()) { task_sleep(10); continue; }
+
         int c = uart_getc_blocking();
         if (c >= 0) command((char)c);
     }
@@ -686,6 +680,10 @@ static void command(char c)
         break;
 
     case 'z': {
+        if (task_console_pid()) {
+            uart_puts("\n  [kernel] la consola ya es de alguien\n");
+            break;
+        }
         if (sh_pid && task_alive(sh_pid)) {
             uart_puts("\n  [kernel] ya hay un interprete\n");
             break;
@@ -937,6 +935,25 @@ void kernel_main(uint64_t dtb_ptr)
      * linea se han limitado a contar sus ticks. */
     uart_puts("\n  Abriendo el planificador a los cuatro nucleos...\n");
     sched_start_smp();
+
+    /* Y AQUI SE ACABA LO QUE EL KERNEL SABE DEL SISTEMA.
+     *
+     * Arranca un proceso, init, y se olvida. Quien levanta los drivers,
+     * en que orden, de donde sale el entorno y que interprete se usa son
+     * decisiones que ya no estan aqui: estan en user/init.c y en /etc/rc.
+     *
+     * El menu se queda porque sigue siendo util para depurar, pero ya no
+     * es el camino: es una herramienta. Si nadie toca una tecla, el
+     * sistema arranca solo. */
+    {
+        struct args a, e;
+        args_de_cadena(&a, "init");
+        args_de_cadena(&e, "");
+
+        int pid = task_bootstrap("init", &a, &e, DEV_NINGUNO);
+        if (pid < 0) uart_puts("\n  [kernel] no arranca init. Queda el menu.\n");
+        else         task_set_init_pid((uint64_t)pid);
+    }
 
     menu();
 

@@ -5,6 +5,10 @@
  * escribir en el registro de datos de la UART.
  */
 #pragma once
+
+/* Los dos perifericos que se pueden conceder a un driver de EL0. Viven
+ * aqui y no en kernel.c porque quien decide a quien se conceden ya no es
+ * el menu: es task_bootstrap, y el unico que puede pedirlo es init. */
 #include <stdint.h>
 #include "mm.h"
 
@@ -16,6 +20,18 @@
  * en TTBR1 no puede tocar una direccion fisica directamente: los 0x3F...
  * de los manuales de Broadcom caen en el espacio del proceso. */
 #define PERIPHERAL_BASE   (KERNEL_VA_BASE + PERIPHERAL_PA)
+
+/* Registros de la PL011. Se los concedemos al driver de consola para que
+ * pueda hacer su trabajo desde EL0 sin pasar por el kernel. Aqui hace falta
+ * la direccion FISICA (es la que se va a meter en una tabla de paginas),
+ * no la virtual por la que los ve el kernel. */
+#define UART0_PHYS  (PERIPHERAL_PA + 0x201000)
+
+/* Registros del controlador EMMC. Se los concedemos al servidor de
+ * ficheros por el mismo camino: una pagina de MMIO en su espacio, y a
+ * partir de ahi habla con la tarjeta sin pasar por el kernel. */
+#define EMMC_PHYS   (PERIPHERAL_PA + 0x300000)
+
 
 /* Los "ARM local peripherals" (timers y mailboxes por nucleo) viven fuera
  * del bloque anterior, en 0x40000000. */

@@ -105,6 +105,22 @@ static int copiar_args(struct args *a, uint64_t uargv)
     return 0;
 }
 
+/* Una cadena corta del espacio del proceso, con tope propio. */
+static int copiar_cadena(char *dst, uint64_t uva, uint64_t max)
+{
+    if (!user_readable(uva, 1)) return -1;
+
+    uint64_t i = 0;
+    for (; i < max - 1; i++) {
+        if (!vmm_translate_user(uva + i)) break;
+        char c = ((const char *)uva)[i];
+        if (!c) break;
+        dst[i] = c;
+    }
+    dst[i] = 0;
+    return i ? 0 : -1;
+}
+
 static int copiar_ruta(char *dst, uint64_t uva)
 {
     if (!user_readable(uva, 1)) return -1;
@@ -423,6 +439,39 @@ void syscall_dispatch(struct trap_frame *f)
         ret = base;
         break;
     }
+
+    /* --- Las dos que solo puede pedir init --------------------------
+     *
+     * La comprobacion es una linea, y es toda la frontera de privilegio
+     * que hay entre procesos en este sistema. No hay usuarios, ni grupos,
+     * ni capacidades: hay el primero y hay los demas.
+     *
+     * Es poco, y es honesto decir cuanto es: basta porque init es el
+     * unico que puede existir antes de que exista nadie mas. En cuanto
+     * hiciera falta un segundo proceso de confianza, esto se quedaria
+     * corto y habria que inventar algo de verdad. */
+    case SYS_bootstrap: {
+        if (!current || current->pid != task_init_pid()) { ret = -1; break; }
+
+        char nombre[16];
+        if (copiar_cadena(nombre, f->x[0], sizeof(nombre)) < 0) { ret = -1; break; }
+
+        struct args args, entorno;
+        if (copiar_args(&args, f->x[1]) < 0)    { ret = -1; break; }
+        if (copiar_args(&entorno, f->x[2]) < 0) { ret = -1; break; }
+
+        /* argv vacio: que el programa se llame como pidio init. */
+        if (args.n == 0) args_de_cadena(&args, nombre);
+
+        ret = task_bootstrap(nombre, &args, &entorno, f->x[3]);
+        break;
+    }
+
+    case SYS_consola:
+        if (!current || current->pid != task_init_pid()) { ret = -1; break; }
+        task_set_console(f->x[0]);
+        ret = 0;
+        break;
 
     case SYS_munmap:
         ret = task_munmap(f->x[0]);

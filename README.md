@@ -96,6 +96,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 39   | Escribir nombres largos, y el ~1            | hecho  |
 | 40   | Variables de entorno, y el PATH fuera       | hecho  |
 | 41   | El kernel aprende a fallar y recuperarse    | hecho  |
+| 42   | init: el kernel deja de saber que es un shell| hecho |
 
 ## Estructura
 
@@ -125,6 +126,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  wc.c        cuenta lo que le pasa por delante
                  mkdir.c     crea un directorio
                  map.c       mapea un fichero y mide cuando se lee
+                 init.c      el primer proceso: arranca todo lo demas
                  env.c       ensenya el entorno   echo.c  repite lo que le den
                  rmdir.c     borra un directorio vacio
                  mv.c        mueve y renombra: la misma operacion
@@ -2821,8 +2823,114 @@ Es la cuarta vez en este proyecto que hace falta romper algo a proposito
 para saber si la prueba mide lo que dice. Sigue mereciendo la pena todas
 las veces.
 
+## init, o el kernel dejando de saber que es un shell
+
+Hasta aqui el arranque estaba en un `switch` del menu del kernel: `f` para
+el servidor de ficheros, `s` para la consola, `z` para el interprete. Y el
+entorno inicial era una cadena literal dentro de `sched.c`. O sea que el
+kernel sabia **que es un shell**, en que orden van los drivers y que
+variables hereda un proceso. Nada de eso es asunto suyo.
+
+Ahora el kernel arranca **uno** y se olvida:
+
+```c
+    int pid = task_bootstrap("init", &a, &e, DEV_NINGUNO);
+    task_set_init_pid((uint64_t)pid);
+```
+
+Y el sistema arranca solo, sin tocar una tecla.
+
+**El problema del huevo y la gallina.** El servidor de ficheros es un
+programa, y para leer un programa de la tarjeta hace falta el servidor de
+ficheros. Alguien tiene que traer los primeros dentro, y ese alguien es el
+kernel: lleva empotrados el `conserver`, el `fs`, el `sh` y el propio
+`init`. Es lo mismo que hace un initramfs, con cuatro entradas en vez de
+un sistema de ficheros entero.
+
+`init` los pide por nombre con `SYS_bootstrap`, y a partir del shell todo
+lo demas se lee de `/usr/bin`.
+
+**Pedir el dispositivo por nombre, no por direccion.** Los drivers
+necesitan MMIO, y dejar que un proceso diga "mapeame la pagina
+0x3F201000" seria regalar la maquina. Asi que dice `DEV_UART`, y el kernel
+decide si eso significa algo y que direccion es:
+
+```c
+    case DEV_UART: return UART0_PHYS;
+    case DEV_EMMC: return EMMC_PHYS;
+    default:       return 0;
+```
+
+La lista de lo concedible esta en el kernel y no la elige quien pregunta.
+Esa es toda la diferencia entre conceder y obedecer.
+
+**Y una frontera de privilegio, una sola.** `SYS_bootstrap` y
+`SYS_consola` solo las atiende el kernel si quien llama es init:
+
+```c
+    if (current->pid != task_init_pid()) { ret = -1; break; }
+```
+
+Es una linea, y conviene decir cuanto es: no hay usuarios, ni grupos, ni
+capacidades. Hay **el primero** y hay los demas. Basta porque init es el
+unico que puede existir antes de que exista nadie mas; en cuanto hiciera
+falta un segundo proceso de confianza, esto se quedaria corto y habria que
+inventar algo de verdad.
+
+**El entorno sale de un fichero.** `/etc/rc` son lineas `NOMBRE=valor` que
+init lee con `mmap` y mete en su entorno, de donde se heredan hacia abajo.
+La prueba de que ya no esta en el codigo es una variable que el kernel no
+ha visto nunca:
+
+```
+    / $ echo soy $SISTEMA
+    soy TinyOS
+```
+
+Cambiar el `PATH` ha dejado de ser recompilar el sistema operativo.
+
+**Y el interprete vuelve si se va.** `init` lo arranca en un bucle: cuando
+escribes `salir`, sale otro. Eso es lo que hace que un shell que se muere
+no deje la maquina muda, y es literalmente el motivo por el que init
+existe en cualquier Unix.
+
+## Dos fallos, y los dos de compartir
+
+**Un puerto reservado que no estaba reservado.** `init` pide un puerto con
+`port_create(-1)` -"el que sea"- y se llevo el **1**, que es el del
+servidor de ficheros, porque lo pidio antes de que el servidor arrancara.
+El servidor se encontro su sitio ocupado y se murio:
+
+```
+    [fs] servidor de ficheros vivo en EL0
+    [fs] ya hay un servidor de ficheros: me voy
+```
+
+Es la **segunda vez** que pasa: en el paso 28 el kernel se quedo sin su
+propio puerto por lo mismo. Entonces se parcheo saltando uno; ahora se
+arregla de verdad, con `PORT_PRIMERO_LIBRE`. Un numero reservado que se
+puede repartir por sorteo no es un numero reservado.
+
+**Dos lectores para un teclado.** El menu del kernel seguia leyendo del
+anillo de teclas mientras el shell leia tambien. No salia desordenado:
+salia **repartido**. Escribir `env` daba `nvs` en el shell y una `e` en el
+menu, cada uno convencido de haber leido bien:
+
+```
+    / $ slir
+      SLIR.ELF: no lo encuentro. PATH=.:/usr/bin
+```
+
+Ahora el menu se aparta mientras la consola sea de otro. Es la diferencia
+entre ser el camino y ser una herramienta: el menu sigue ahi para depurar,
+pero manda quien tenga la consola.
+
 ## Limitaciones conocidas
 
+- La unica frontera de privilegio entre procesos es "eres init o no eres
+  init". Sin usuarios, sin grupos y sin capacidades.
+- `/etc/rc` solo entiende `NOMBRE=valor` y comentarios: no hay ordenes ni
+  condiciones. Un init de verdad ejecuta un guion.
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
   de espera y los puertos IPC a la vez. Partirlo seria mas rapido, no mas
   correcto. (Lo que si se saco de el es la carga de un proceso, que son

@@ -20,6 +20,7 @@
 #include "sync.h"
 #include "ipc.h"
 #include "fs_abi.h"
+#include "mmio.h"
 #include "elf.h"
 #include "smp.h"
 #include "spinlock.h"
@@ -899,6 +900,76 @@ int task_set_handler(int sig, uint64_t manejador, uint64_t trampolin)
 }
 
 void task_set_console(uint64_t pid) { consola_pid = pid; }
+uint64_t task_console_pid(void)      { return consola_pid; }
+
+/* --- El primer proceso ------------------------------------------------
+ *
+ * El kernel arranca UNO, y a partir de ahi todo lo demas lo arranca ese.
+ * No es una regla de estilo: es que no hay otra forma de llegar a EL0, y
+ * en cuanto hay una forma conviene que sea una sola.
+ *
+ * A init se le conceden dos cosas que a nadie mas: arrancar los programas
+ * que el kernel lleva dentro -con el dispositivo que necesiten- y decir
+ * quien manda en la consola. Ese "a nadie mas" es la unica frontera de
+ * privilegio que hay entre procesos en este sistema. */
+static uint64_t init_pid;
+
+uint64_t task_init_pid(void)            { return init_pid; }
+void     task_set_init_pid(uint64_t p)  { init_pid = p; }
+
+/* Los programas que viajan dentro del kernel. Son los justos para
+ * arrancar: los dos drivers y el interprete. Lo demas ya se lee de la
+ * tarjeta, que para eso esta el servidor de ficheros. */
+extern const uint8_t  user_conserver[];  extern const uint64_t user_conserver_size;
+extern const uint8_t  user_fs[];         extern const uint64_t user_fs_size;
+extern const uint8_t  user_sh[];         extern const uint64_t user_sh_size;
+extern const uint8_t  user_init[];       extern const uint64_t user_init_size;
+
+struct empotrado {
+    const char     *nombre;
+    const uint8_t  *imagen;
+    const uint64_t *tam;
+};
+
+static const struct empotrado empotrados[] = {
+    { "conserver", user_conserver, &user_conserver_size },
+    { "fs",        user_fs,        &user_fs_size        },
+    { "sh",        user_sh,        &user_sh_size        },
+    { "init",      user_init,      &user_init_size      },
+    { 0, 0, 0 }
+};
+
+/* De un numero de dispositivo a una direccion fisica.
+ *
+ * Aqui esta la lista entera de lo que se puede conceder, y esta EN EL
+ * KERNEL. Un proceso pide "la UART", no una direccion: no puede inventarse
+ * uno que no este en esta tabla ni pedir la pagina de al lado. */
+static uint64_t dispositivo_a_fisica(uint64_t dev)
+{
+    switch (dev) {
+    case DEV_UART: return UART0_PHYS;
+    case DEV_EMMC: return EMMC_PHYS;
+    default:       return 0;
+    }
+}
+
+int task_bootstrap(const char *nombre, const struct args *args,
+                   const struct args *entorno, uint64_t dispositivo)
+{
+    for (const struct empotrado *e = empotrados; e->nombre; e++) {
+        int igual = 1;
+        for (int i = 0; ; i++) {
+            if (e->nombre[i] != nombre[i]) { igual = 0; break; }
+            if (!nombre[i]) break;
+        }
+        if (!igual) continue;
+
+        return task_create_user(e->nombre, e->imagen, *e->tam,
+                                dispositivo_a_fisica(dispositivo),
+                                args, entorno);
+    }
+    return -1;
+}
 
 /* Ctrl-C. Va al proceso de primer plano, que aqui se define de la forma
  * mas simple que funciona: el duenyo de la consola, o el hijo al que este

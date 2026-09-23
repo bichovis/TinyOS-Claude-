@@ -104,6 +104,33 @@ struct message {
 
 #define SYS_munmap       34   /* (direccion) -> 0 | -1                      */
 
+/* --- El arranque ------------------------------------------------------
+ *
+ * Arrancar uno de los programas que el kernel lleva dentro, por NOMBRE.
+ * Solo puede llamarla init, que es el primer proceso y el unico en el que
+ * el kernel confia para esto.
+ *
+ * Existe porque hay un problema del huevo y la gallina: el servidor de
+ * ficheros es un programa, y para leer un programa de la tarjeta hace
+ * falta el servidor de ficheros. Alguien tiene que traer los primeros
+ * dentro, y ese alguien es el kernel. Es lo mismo que hace un initramfs,
+ * con tres entradas en vez de un sistema de ficheros entero.
+ *
+ * Se pide el DISPOSITIVO por nombre, no por direccion. Un proceso no
+ * puede decir "mapeame la pagina 0x3F201000": dice "necesito la UART", y
+ * el kernel decide si eso significa algo y que direccion es. La
+ * diferencia es que la lista de lo concedible esta escrita en el kernel y
+ * no la elige quien pregunta. */
+#define SYS_bootstrap    35   /* (nombre, argv, envp, dispositivo) -> pid   */
+
+#define DEV_NINGUNO       0
+#define DEV_UART          1
+#define DEV_EMMC          2
+
+/* Ceder la consola a un proceso: quien la tenga recibe el Ctrl-C y lee del
+ * teclado. Solo init, que es quien decide que hay en primer plano. */
+#define SYS_consola      36   /* (pid) -> 0 | -1                            */
+
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */
 

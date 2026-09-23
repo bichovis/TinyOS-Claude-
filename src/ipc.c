@@ -73,8 +73,7 @@ int port_create(uint64_t owner_pid, int64_t want)
         return id;
     }
 
-    for (int i = 0; i < MAX_PORTS; i++) {
-        if (i == PORT_KERNEL) continue;       /* reservado, ver ipc.h */
+    for (int i = PORT_PRIMERO_LIBRE; i < MAX_PORTS; i++) {
         if (!ports[i].in_use) {
             struct port *p = &ports[i];
             p->q      = cola;

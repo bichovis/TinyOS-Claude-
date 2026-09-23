@@ -213,6 +213,15 @@ int  user_touch_w(uint64_t va);
 /* --- Descriptores ----------------------------------------------------- */
 uint64_t task_creados(void);                  /* hilos que han existido     */
 
+/* El primer proceso de usuario. El kernel solo le concede a el las cosas
+ * que no se le conceden a nadie: arrancar drivers y repartir la consola. */
+uint64_t task_init_pid(void);
+void     task_set_init_pid(uint64_t pid);
+
+/* Arrancar uno de los programas empotrados, por nombre. */
+int  task_bootstrap(const char *nombre, const struct args *args,
+                    const struct args *entorno, uint64_t dispositivo);
+
 /* Mapear un fichero. Devuelve la direccion o -1; el tamanyo va en *tam. */
 int64_t task_mmap(const char *ruta, uint64_t *tam);
 int     task_mmap_fault(uint64_t direccion);  /* 1 si lo ha resuelto        */
@@ -227,6 +236,7 @@ int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
 int  task_signal(uint64_t pid, int sig);       /* apuntarsela a un proceso  */
 int  task_set_handler(int sig, uint64_t manejador, uint64_t trampolin);
 void task_set_console(uint64_t pid);           /* quien manda en la consola */
+uint64_t task_console_pid(void);               /* ...y quien la tiene ahora */
 void task_console_interrupt(void);             /* lo llama uart.c con Ctrl-C*/
 
 /* Se llama justo antes de volver a EL0: es el unico momento en que un
