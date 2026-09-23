@@ -16,12 +16,16 @@
 #include "timer.h"
 #include "uart.h"
 #include "exception.h"
+#include "sync.h"
 #include "ipc.h"
 
 /* Definidos en switch.S */
 void cpu_switch_to(struct task *prev, struct task *next);
 void ret_from_fork(void);
 void ret_to_user(void);
+
+/* El recolector esta mas abajo; sched_init() lo necesita aqui arriba. */
+static void thread_reaper(void *arg);
 
 /* switch.S accede al contexto con offsets desde el principio del struct */
 _Static_assert(__builtin_offsetof(struct task, ctx) == 0, "ctx debe ir primero");
@@ -43,6 +47,11 @@ void sched_init(void)
     tasks[0].counter   = TASK_QUANTUM;
     tasks[0].stack     = 0;            /* usa la pila del arranque */
     current            = &tasks[0];
+
+    /* El primer hilo del sistema es el que recoge a los muertos. Si no
+     * existiera, cada proceso que termina se llevaria su ranura, su pila,
+     * sus paginas y su ASID a la tumba. */
+    task_create("reaper", thread_reaper, 0);
 }
 
 int task_create(const char *name, void (*fn)(void *), void *arg)
@@ -183,6 +192,82 @@ void task_sleep(uint64_t ticks)
     schedule();                 /* no volvera hasta que alguien nos despierte */
 }
 
+/* ====================== EL RECOLECTOR ==============================
+ *
+ * Un hilo que termina no puede limpiar lo suyo, porque esta corriendo
+ * ENCIMA de ello: su pila de kernel es la que tiene bajo los pies y su
+ * tabla de traduccion es la que hay puesta en TTBR0 en ese mismo instante.
+ * No se puede tirar de la alfombra estando de pie sobre ella.
+ *
+ * Asi que task_exit() solo hace dos cosas: marcarse zombi y avisar. El
+ * entierro lo hace otro hilo, con su propia pila y con la tabla vacia en
+ * TTBR0, cuando el muerto ya no se esta ejecutando.
+ *
+ * Que eso sea seguro descansa en un detalle del planificador: para que el
+ * recolector llegue a ejecutarse, el zombi ha tenido que dejar la CPU, y
+ * pick_next() no vuelve a elegirlo nunca. Desde ese momento su pila es
+ * papel mojado y se puede devolver. (Con varios nucleos no bastaria: el
+ * zombi podria seguir corriendo en otro. Ese dia habra que revisarlo.)
+ */
+static struct waitqueue reaper_wq;
+static uint64_t         reaped;
+
+static void reap(struct task *t)
+{
+    /* Su espacio de direcciones entero: tablas, paginas y el ASID, que
+     * ademas limpia de la TLB lo que quedara con esa etiqueta. */
+    if (t->pgd)
+        vmm_destroy_pgd(t->pgd, t->asid);
+
+    /* Y su pila. t->stack guarda la direccion del mapa lineal, asi que hay
+     * que bajarla a fisico para devolversela al gestor de paginas. */
+    if (t->stack)
+        pmm_free(virt_to_phys((void *)t->stack));
+
+    t->pgd     = 0;
+    t->asid    = 0;
+    t->stack   = 0;
+    t->mmio_va = 0;
+    t->name    = "(libre)";
+    reaped++;
+
+    /* ESTO, EL ULTIMO. En cuanto la ranura vuelve a UNUSED, task_create()
+     * puede darsela a otro; para entonces ya no queda nada por devolver. */
+    t->state = TASK_UNUSED;
+}
+
+static void thread_reaper(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        uint64_t flags = irq_save();
+
+        struct task *dead = 0;
+        for (int i = 1; i < MAX_TASKS; i++)
+            if (tasks[i].state == TASK_ZOMBIE) { dead = &tasks[i]; break; }
+
+        if (!dead) {
+            /* Buscar y dormirse, sin soltar las IRQ entre una cosa y otra:
+             * si las soltaramos, un hilo podria morir justo en medio y su
+             * aviso llegaria antes de que estuvieramos en la cola. Nos
+             * dormiriamos despues del despertador. */
+            wq_wait(&reaper_wq);
+            irq_restore(flags);
+            continue;
+        }
+        irq_restore(flags);
+
+        /* Fuera de la seccion critica: destruir un espacio de direcciones
+         * recorre miles de entradas y no es plan de hacerlo con las
+         * interrupciones tapadas. Nadie mas va a tocar a este muerto: el
+         * planificador no elige zombis y recolector no hay mas que uno. */
+        reap(dead);
+    }
+}
+
+uint64_t sched_reaped(void) { return reaped; }
+
 void task_exit(void)
 {
     uint64_t flags = irq_save();
@@ -191,6 +276,10 @@ void task_exit(void)
      * quien estuviera esperando o se quedaria bloqueado para siempre
      * esperando a alguien que ya no existe. */
     ipc_release_ports(current->pid);
+
+    /* Avisar a quien nos tiene que enterrar. Lo unico que hace es ponerlo
+     * listo; no corre hasta que soltemos la CPU en el schedule() de abajo. */
+    wq_wake_one(&reaper_wq);
     irq_restore(flags);
 
     schedule();
@@ -321,6 +410,8 @@ void sched_dump(void)
 
     uart_puts("\n  cambios de contexto: ");
     uart_dec(switches);
+    uart_puts("   tareas recogidas: ");
+    uart_dec(reaped);
     uart_puts("\n  pid  nombre    estado   ticks CPU  pila\n");
     for (int i = 0; i < MAX_TASKS; i++) {
         struct task *t = &tasks[i];

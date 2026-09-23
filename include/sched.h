@@ -54,4 +54,5 @@ void task_sleep(uint64_t ticks);
 void task_exit(void);
 void sched_preempt(void);        /* lo llama irq_handle()                   */
 uint64_t sched_switches(void);   /* cambios de contexto totales             */
+uint64_t sched_reaped(void);     /* tareas cuyos recursos se han devuelto   */
 void sched_dump(void);

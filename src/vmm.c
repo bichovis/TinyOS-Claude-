@@ -188,9 +188,18 @@ void vmm_destroy_pgd(uint64_t *pgd, uint64_t asid)
             if (!(l2[j] & PTE_VALID) || !(l2[j] & PTE_TABLE)) continue;
             uint64_t *l3 = phys_to_virt(l2[j] & PTE_ADDR_MASK);
 
-            for (uint64_t k = 0; k < 512; k++)
-                if (l3[k] & PTE_VALID)
-                    pmm_free(l3[k] & PTE_ADDR_MASK);   /* la pagina de datos */
+            for (uint64_t k = 0; k < 512; k++) {
+                if (!(l3[k] & PTE_VALID)) continue;
+
+                /* Ojo: no toda pagina mapeada es RAM nuestra. A un driver
+                 * de EL0 le hemos mapeado los registros de un periferico;
+                 * devolver eso al PMM seria repartir la UART como si fuera
+                 * memoria libre. Se distingue por el indice de MAIR que
+                 * lleva el propio descriptor. */
+                if (((l3[k] >> 2) & 7) != MT_NORMAL) continue;
+
+                pmm_free(l3[k] & PTE_ADDR_MASK);       /* la pagina de datos */
+            }
 
             pmm_free(virt_to_phys(l3));
         }

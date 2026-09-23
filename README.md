@@ -62,6 +62,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 9    | Arranque en hardware real: buzon, caches, SD | hecho  |
 | 10a  | Kernel en alto: split TTBR0 / TTBR1         | hecho  |
 | 10b  | ASIDs: dejar de tirar la TLB entera         | hecho  |
+| 11   | Recolector: devolver lo que deja un muerto  | hecho  |
 
 ## Estructura
 
@@ -140,17 +141,41 @@ Asi que `vmm_switch_to()` es ahora una escritura y un `isb`, sin ninguna
 invalidacion. La unica que queda en la vida de un proceso es un
 `tlbi aside1is` cuando muere y su etiqueta se recicla, en `vmm_destroy_pgd()`.
 
+## El recolector
+
+Un hilo que termina no puede limpiar lo suyo: esta corriendo **encima** de
+ello. Su pila de kernel es la que tiene bajo los pies y su tabla de
+traduccion es la que hay puesta en TTBR0 en ese instante. No se puede tirar
+de la alfombra estando de pie sobre ella.
+
+Por eso `task_exit()` solo se marca zombi y avisa a una cola de espera. El
+entierro lo hace `reaper`, el primer hilo que crea el sistema (pid 1), que
+tiene su propia pila y la tabla vacia en TTBR0:
+
+    vmm_destroy_pgd(t->pgd, t->asid)   tablas, paginas y el ASID
+    pmm_free(...)                      su pila
+    t->state = TASK_UNUSED             y la ranura, la ultima
+
+Que sea seguro descansa en un detalle del planificador: para que el
+recolector llegue a ejecutarse, el zombi ha tenido que dejar la CPU, y
+`pick_next()` no vuelve a elegirlo jamas. Desde ese momento su pila es papel
+mojado.
+
+Un detalle que casi muerde: `vmm_destroy_pgd()` recorre el espacio del
+proceso devolviendo paginas al gestor de memoria, pero **no toda pagina
+mapeada es RAM nuestra** — a un driver de EL0 le hemos mapeado los registros
+de un periferico. Devolver eso al PMM seria repartir la UART como si fuera
+memoria libre. Se distingue por el indice de MAIR del propio descriptor.
+
 ## Limitaciones conocidas
 
-- Los ASIDs se agotan: hay 255 utiles y solo se devuelven en
-  `vmm_destroy_pgd()`, al que todavia no llama nadie porque los procesos
-  muertos quedan zombis. Tras 255 procesos, `task_create_user()` falla
-  limpiamente. Se arregla solo en cuanto haya recolector.
 - El cargador de procesos mapea toda la imagen como codigo de solo lectura,
   asi que un programa de usuario no puede tener variables globales
   escribibles; solo pila.
-- Un proceso que muere queda zombi y no se liberan ni su pgd ni sus paginas:
-  falta un recolector.
+- El recolector es un solo hilo y da por hecho un solo nucleo: puede
+  liberar la pila de un zombi porque, para que el llegue a ejecutarse, el
+  zombi ha tenido que dejar la CPU. Con varios nucleos eso deja de ser
+  cierto.
 - El kernel conserva su propio driver de UART para depuracion, asi que
   cuando el servidor de consola esta activo hay dos escritores sobre el
   mismo hardware y el texto puede entremezclarse. Un microkernel estricto
