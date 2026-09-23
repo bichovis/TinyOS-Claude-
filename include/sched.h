@@ -186,7 +186,8 @@ void     schedule_locked(void);
 void     sched_unlock_new_task(void);
 int  task_create(const char *name, void (*fn)(void *), void *arg);
 int  task_create_user(const char *name, const uint8_t *image, uint64_t size,
-                      uint64_t mmio_pa, const struct args *args);
+                      uint64_t mmio_pa, const struct args *args,
+                      const struct args *entorno);
 void schedule(void);
 void scheduler_tick(void);       /* lo llama el timer                       */
 void task_yield(void);           /* ceder la CPU voluntariamente            */
@@ -197,6 +198,7 @@ int  task_wait(uint64_t pid, int64_t *codigo);  /* espera y recoge su salida */
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
 int  task_exec(const uint8_t *image, uint64_t size, const struct args *args,
+               const struct args *entorno,
                struct trap_frame *f);   /* y lo sustituye por otro programa  */
 
 /* Un fallo de traduccion en EL0 puede no ser un error: si cae justo debajo

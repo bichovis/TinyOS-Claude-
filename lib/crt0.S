@@ -27,7 +27,19 @@ _start:
     mov     x29, xzr
     mov     x30, xzr
 
-    bl      main                /* argc y argv ya estan en x0 y x1 */
+    /* El kernel deja argc en x0, argv en x1 y el ENTORNO en x2, que es
+     * donde el convenio espera el tercer argumento de main.
+     *
+     * Pero casi nadie escribe main(argc, argv, envp): lo normal es
+     * pedirle una variable suelta a getenv(), y para eso hace falta que
+     * el entorno este en algun sitio fijo. De ahi 'environ', que es una
+     * variable global y no un parametro, y que en todos los Unix se
+     * rellena exactamente aqui: en el trozo que corre antes de main. */
+    adrp    x9, environ
+    add     x9, x9, :lo12:environ
+    str     x2, [x9]
+
+    bl      main                /* argc, argv y envp ya estan en su sitio */
 
     /* main devolvio en w0, que es justo donde exit() quiere su argumento.
      * No hay nada que mover. */

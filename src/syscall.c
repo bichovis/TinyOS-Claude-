@@ -216,10 +216,11 @@ void syscall_dispatch(struct trap_frame *f)
         if (len == 0 || len > 256 * 1024) { ret = -1; break; }
         if (!user_readable(buf, len))     { ret = -1; break; }
 
-        struct args args;
-        if (copiar_args(&args, uargs) < 0) { ret = -1; break; }
+        struct args args, entorno;
+        if (copiar_args(&args, uargs) < 0)            { ret = -1; break; }
+        if (copiar_args(&entorno, f->x[3]) < 0)       { ret = -1; break; }
 
-        ret = task_create_user(0, (const uint8_t *)buf, len, 0, &args);
+        ret = task_create_user(0, (const uint8_t *)buf, len, 0, &args, &entorno);
         break;
     }
 
@@ -284,10 +285,19 @@ void syscall_dispatch(struct trap_frame *f)
         /* Los argumentos se copian ANTES de tocar nada del proceso, que
          * es lo unico que hace segura esta llamada: exec destruye el
          * espacio de direcciones de donde salen. */
-        struct args args;
-        if (copiar_args(&args, uargs) < 0) { ret = -1; break; }
+        /* Los dos lotes se copian ANTES de tocar nada del proceso, que es
+         * lo unico que hace segura esta llamada: exec destruye el espacio
+         * de direcciones de donde salen.
+         *
+         * Y el entorno se copia igual que los argumentos, no se hereda
+         * solo: exec lo REEMPLAZA. Que en la practica casi siempre sea el
+         * mismo es cosa del shell, que le pasa el suyo; el kernel no da
+         * nada por hecho. */
+        struct args args, entorno;
+        if (copiar_args(&args, uargs) < 0)      { ret = -1; break; }
+        if (copiar_args(&entorno, f->x[3]) < 0) { ret = -1; break; }
 
-        ret = task_exec((const uint8_t *)buf, len, &args, f);
+        ret = task_exec((const uint8_t *)buf, len, &args, &entorno, f);
         break;
     }
 

@@ -20,6 +20,19 @@ static inline int64_t syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
     return (int64_t)x0;
 }
 
+static inline int64_t syscall4(uint64_t nr, uint64_t a0, uint64_t a1,
+                               uint64_t a2, uint64_t a3)
+{
+    register uint64_t x8 __asm__("x8") = nr;
+    register uint64_t x0 __asm__("x0") = a0;
+    register uint64_t x1 __asm__("x1") = a1;
+    register uint64_t x2 __asm__("x2") = a2;
+    register uint64_t x3 __asm__("x3") = a3;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                     : "memory", "cc");
+    return (int64_t)x0;
+}
+
 static inline int64_t syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2)
 {
     register uint64_t x8 __asm__("x8") = nr;
@@ -71,8 +84,10 @@ static inline int64_t kill(uint64_t pid, int sig)
  * argv es un array de punteros terminado en cero, como el que recibe
  * main(). El kernel lo COPIA; no lo parte. Quien trocea la linea es el
  * shell, que es su trabajo. */
-static inline int64_t exec(const void *imagen, uint64_t bytes, char *const argv[])
-{ return syscall3(SYS_exec, (uint64_t)imagen, bytes, (uint64_t)argv); }
+static inline int64_t exec(const void *imagen, uint64_t bytes,
+                           char *const argv[], char *const envp[])
+{ return syscall4(SYS_exec, (uint64_t)imagen, bytes,
+                  (uint64_t)argv, (uint64_t)envp); }
 
 /* Duplicarse. Devuelve el pid del hijo al padre, y 0 al hijo. */
 static inline int64_t fork(void)          { return syscall2(SYS_fork, 0, 0); }
@@ -152,6 +167,8 @@ static inline int64_t console_int(void)   { return syscall2(SYS_console_int, 0, 
 static inline uint64_t clock_rate(uint64_t id)
 { int64_t r = syscall2(SYS_clock_rate, id, 0); return r < 0 ? 0 : (uint64_t)r; }
 
-static inline int64_t spawn(const void *imagen, uint64_t bytes, char *const argv[])
-{ return syscall3(SYS_spawn, (uint64_t)imagen, bytes, (uint64_t)argv); }
+static inline int64_t spawn(const void *imagen, uint64_t bytes,
+                            char *const argv[], char *const envp[])
+{ return syscall4(SYS_spawn, (uint64_t)imagen, bytes,
+                  (uint64_t)argv, (uint64_t)envp); }
 

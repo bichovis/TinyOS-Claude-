@@ -127,58 +127,74 @@ static uint64_t tamano_de(const char *fichero)
  *
  * Donde buscar un programa cuando lo que has escrito no lleva barras.
  *
- * Primero el directorio actual, y luego /usr/bin, que es donde viven los
- * ejecutables del sistema. Hace falta desde que hay subdirectorios: sin
- * esto, "cd docs" te dejaria sin ordenes, porque "ls" ya no estaria donde
- * estas.
+ * Sale del ENTORNO, no del codigo: "PATH=.:/usr/bin" es una cadena que
+ * viene heredada y que se puede cambiar con export. Hasta el paso 40
+ * estaba escrita aqui dentro, y cambiarla queria decir recompilar el
+ * sistema operativo.
  *
- * Es una lista escrita aqui y no una variable de entorno, porque este
- * sistema todavia no tiene entorno. La idea es la misma: un programa se
- * llama por su nombre y alguien decide donde se busca.
- *
- * Que el directorio actual vaya PRIMERO es comodo y en Unix no se hace:
+ * Que el directorio actual vaya primero es comodo y en Unix no se hace:
  * ahi "." no esta en el PATH por defecto, porque entrar en un directorio
- * ajeno y escribir "ls" podria ejecutar el "ls" que haya dejado el duenyo
- * del directorio. Aqui no hay varios usuarios, asi que no hay a quien
- * enganyar. */
-static const char *PATH[] = { 0, "/usr/bin" };   /* el 0 es "donde estoy" */
+ * ajeno y escribir "ls" podria ejecutar el "ls" que haya dejado su
+ * duenyo. Aqui no hay varios usuarios, asi que no hay a quien enganyar.
+ */
+static const char *el_path(void)
+{
+    const char *p = getenv("PATH");
+    return (p && *p) ? p : ".:/usr/bin";
+}
+
+/* El trozo numero 'n' del PATH, separando por ':'. Devuelve 0 al final. */
+static int path_trozo(int n, char *dst, uint64_t max)
+{
+    const char *p = el_path();
+
+    for (int i = 0; i < n; i++) {
+        while (*p && *p != ':') p++;
+        if (!*p) return 0;
+        p++;
+    }
+    if (!*p) return 0;
+
+    uint64_t o = 0;
+    while (*p && *p != ':' && o < max - 1) dst[o++] = *p++;
+    dst[o] = 0;
+    return 1;
+}
 
 /* Deja en 'ruta' la absoluta que si existe, o devuelve 0. */
 static int buscar_programa(const char *nom, char *ruta)
 {
-    for (uint64_t i = 0; i < sizeof(PATH) / sizeof(PATH[0]); i++) {
-        if (!PATH[i]) {
-            /* El directorio actual: de eso ya se encarga realpath. */
-            if (realpath(nom, ruta) == 0 && tamano_de(ruta)) return 1;
-            continue;
-        }
+    char dir[FS_PATH_MAX];
 
-        uint64_t d = strlen(PATH[i]), n = strlen(nom);
+    for (int i = 0; path_trozo(i, dir, sizeof(dir)); i++) {
+        if (!dir[0]) continue;
+
+        /* Un trozo relativo -"." o "bin"- se resuelve contra donde
+         * estamos, igual que cualquier otra ruta. */
+        char completa[FS_PATH_MAX];
+        uint64_t d = strlen(dir), n = strlen(nom);
         if (d + 1 + n + 1 > FS_PATH_MAX) continue;
 
-        memcpy(ruta, PATH[i], d);
-        ruta[d] = '/';
-        memcpy(ruta + d + 1, nom, n + 1);
+        memcpy(completa, dir, d);
+        completa[d] = '/';
+        memcpy(completa + d + 1, nom, n + 1);
 
-        if (tamano_de(ruta)) return 1;
+        if (realpath(completa, ruta) == 0 && tamano_de(ruta)) return 1;
     }
     return 0;
 }
 
 /* Decir DONDE se ha buscado. Un "no encuentro ls" a secas manda a pensar
- * que el fichero no esta; enseñar la lista dice que quiza esta, pero en
+ * que el fichero no esta; ensenyar la lista dice que quiza esta, pero en
  * otro sitio. */
 static void no_esta(const char *nom)
 {
-    printf("  %s: no lo encuentro. He mirado en:\n", nom);
-    for (uint64_t i = 0; i < sizeof(PATH) / sizeof(PATH[0]); i++) {
-        if (PATH[i]) printf("    %s\n", PATH[i]);
-        else {
-            char aqui[FS_PATH_MAX];
-            if (getcwd(aqui, sizeof(aqui)) == 0) printf("    %s\n", aqui);
-        }
-    }
+    printf("  %s: no lo encuentro. PATH=%s\n", nom, el_path());
 }
+
+/* Decir DONDE se ha buscado. Un "no encuentro ls" a secas manda a pensar
+ * que el fichero no esta; enseñar la lista dice que quiza esta, pero en
+ * otro sitio. */
 
 /* Cargar un programa es ahora MAPEARLO.
  *
@@ -327,6 +343,28 @@ static int trocear(const char *s, char **argv, char *texto, uint64_t max)
                 if (*s == ' ' || *s == '<' || *s == '>') break;
                 if (*s == '"' || *s == '\'') { comilla = *s++; continue; }
             }
+
+            /* $NOMBRE se sustituye por lo que valga, salvo entre comillas
+             * simples. Esa distincion entre ' y " es de las cosas de los
+             * shells que parecen caprichosas y no lo son: una manera de
+             * decir "esto tal cual" y otra de decir "esto, pero
+             * mirandolo". */
+            if (*s == '$' && comilla != '\'') {
+                s++;
+                char nombre[64];
+                uint64_t n = 0;
+                while ((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z') ||
+                       (*s >= '0' && *s <= '9') || *s == '_') {
+                    if (n < sizeof(nombre) - 1) nombre[n++] = *s;
+                    s++;
+                }
+                nombre[n] = 0;
+
+                const char *v = n ? getenv(nombre) : 0;
+                if (v) while (*v && escribe < max - 1) texto[escribe++] = *v++;
+                continue;
+            }
+
             if (escribe < max - 1) texto[escribe++] = *s;
             s++;
         }
@@ -398,6 +436,33 @@ static int interna(char *orden, const char *der)
         return 1;
     }
 
+    /* export, y por el mismo motivo que cd: setenv cambia el entorno del
+     * proceso que llama, y nada mas. Si export fuera un programa, el
+     * shell se bifurcaria, el hijo cambiaria SU entorno y al morir se lo
+     * llevaria consigo. El entorno se hereda hacia abajo, nunca hacia
+     * arriba. */
+    if (orden[0] == 'e' && orden[1] == 'x' && orden[2] == 'p' &&
+        orden[3] == 'o' && orden[4] == 'r' && orden[5] == 't' &&
+        (orden[6] == 0 || orden[6] == ' ')) {
+
+        const char *a = orden + 6;
+        while (*a == ' ') a++;
+
+        char nombre[64];
+        uint64_t n = 0;
+        while (*a && *a != '=' && n < sizeof(nombre) - 1) nombre[n++] = *a++;
+        nombre[n] = 0;
+
+        if (!n || *a != '=') {
+            printf("  uso: export NOMBRE=valor\n");
+            return 1;
+        }
+
+        if (setenv(nombre, a + 1) < 0)
+            printf("  no cabe una variable mas\n");
+        return 1;
+    }
+
     if (orden[0] == 'p' && orden[1] == 'w' && orden[2] == 'd' && !orden[3]) {
         char aqui[FS_PATH_MAX];
         getcwd(aqui, sizeof(aqui));
@@ -427,7 +492,7 @@ static void una(char *orden)
     int64_t pid = fork();
     if (pid == 0) {
         if (aplicar(o.hay, o.ent, o.sal) < 0) exit(1);
-        exec(img, bytes, o.argv);
+        exec(img, bytes, o.argv, environ);
         printf("  no he podido convertirme en el programa\n");
         exit(1);
     }
@@ -500,7 +565,7 @@ static void tuberia(char *izq, char *der)
          * Es lo que hace cualquier shell, y sale solo de respetar el
          * orden en que se escribieron las dos cosas. */
         if (aplicar(o1.hay, o1.ent, o1.sal) < 0) exit(1);
-        exec(img1, b1, o1.argv);
+        exec(img1, b1, o1.argv, environ);
         exit(1);
     }
 
@@ -510,7 +575,7 @@ static void tuberia(char *izq, char *der)
         closefd(fds[0]);
         closefd(fds[1]);
         if (aplicar(o2.hay, o2.ent, o2.sal) < 0) exit(1);
-        exec(img2, b2, o2.argv);
+        exec(img2, b2, o2.argv, environ);
         exit(1);
     }
 
@@ -535,7 +600,7 @@ int main(int argc, char **argv)
     printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
     printf("  se arrancan con fork + exec, se encadenan con | y se\n");
     printf("  redirigen con < y >\n");
-    printf("  Hay directorios: cd, pwd y mkdir. Las ordenes viven en /usr/bin\n");
+    printf("  Hay directorios (cd, pwd, mkdir) y entorno (export, env, $VAR)\n");
     printf("  Prueba: ls / mkdir docs / cd docs / cat /hola.txt > copia.txt\n");
     printf("          cd .. / ls docs / wc < hola.txt / salir\n");
 

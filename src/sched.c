@@ -1310,8 +1310,8 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
  * ahora, 'cat' llevaba el nombre del fichero escrito dentro; con esto se
  * le puede decir al arrancarlo.
  *
- * El convenio es el de siempre: x0 = argc, x1 = argv, y argv apunta a un
- * array de punteros terminado en cero. Todo eso vive en la pila del
+ * El convenio es el de siempre: x0 = argc, x1 = argv, x2 = envp, y los
+ * dos arrays terminan en cero. Todo eso vive en la pila del
  * proceso, que es el unico sitio que ya es suyo y donde se puede escribir
  * antes de que exista.
  *
@@ -1319,49 +1319,63 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
  * usuario: esa pagina todavia no esta en ningun TTBR0 activo.
  */
 
+/* Copiar un lote de cadenas a la pila del proceso nuevo y dejar su array
+ * de punteros. Sirve igual para los argumentos y para el entorno, porque
+ * los dos son lo mismo: un array de cadenas terminado en cero.
+ *
+ * 'tope' es por donde va el texto (se llena hacia abajo) y se actualiza.
+ * Devuelve la direccion de USUARIO del array. */
+static uint64_t poner_lote(char *k, uint64_t base, const struct args *a,
+                           uint64_t *tope)
+{
+    uint64_t off[MAX_ARGS];
+
+    for (int i = a->n - 1; i >= 0; i--) {
+        const char *s = a->buf + a->off[i];
+        uint64_t len = 0;
+        while (s[len]) len++;
+
+        *tope -= len + 1;
+        off[i] = *tope;
+        for (uint64_t j = 0; j <= len; j++) k[*tope + j] = s[j];
+    }
+
+    uint64_t n      = (uint64_t)a->n;
+    uint64_t o_argv = (*tope - (n + 1) * 8) & ~15UL;
+    uint64_t *argv  = (uint64_t *)(k + o_argv);
+
+    for (uint64_t i = 0; i < n; i++) argv[i] = base + off[i];
+    argv[n] = 0;
+
+    *tope = o_argv;
+    return base + o_argv;
+}
+
 static void build_args(uint64_t ustack_pa, const struct args *a,
-                       uint64_t *argc_out, uint64_t *argv_out, uint64_t *sp_out)
+                       const struct args *e,
+                       uint64_t *argc_out, uint64_t *argv_out,
+                       uint64_t *envp_out, uint64_t *sp_out)
 {
     char    *k    = (char *)phys_to_virt(ustack_pa);   /* la pagina, en kernel */
     uint64_t base = USER_STACK_TOP - PAGE_SIZE;        /* la misma, en usuario */
 
     /* Aqui ya no se parte nada: los argumentos vienen troceados. Esta
-     * funcion solo los COPIA a la pila del proceso nuevo y monta el array
-     * de punteros. Lo que antes eran treinta lineas de comillas y estados
-     * son ahora dos bucles.
+     * funcion solo los COPIA a la pila del proceso nuevo y monta los dos
+     * arrays de punteros. Quien trocea es el shell, que es su trabajo.
      *
-     * Quien trocea es el shell, que es su trabajo. El kernel no tiene por
-     * que saber lo que es una comilla. */
-    uint64_t total = 0;
-    for (int i = 0; i < a->n; i++) {
-        const char *s = a->buf + a->off[i];
-        while (*s++) total++;
-        total++;                              /* el cero de cada uno */
-    }
+     * El ENTORNO va primero, mas arriba en la pila, y los argumentos
+     * debajo. El orden da igual para el programa -recibe dos punteros-
+     * pero el sp final tiene que quedar en el array de argumentos, que es
+     * lo que espera el convenio. */
+    uint64_t tope = PAGE_SIZE;
 
-    uint64_t o_str = PAGE_SIZE - total;
-    uint64_t off[MAX_ARGS];
-    uint64_t escribe = 0;
+    uint64_t envp = poner_lote(k, base, e, &tope);
+    uint64_t argv = poner_lote(k, base, a, &tope);
 
-    for (int i = 0; i < a->n; i++) {
-        off[i] = o_str + escribe;
-        const char *s = a->buf + a->off[i];
-        do { k[o_str + escribe++] = *s; } while (*s++);
-    }
-
-    /* El array de punteros, debajo, y alineado a 16 porque el ABI de
-     * AArch64 exige que la pila lo este. */
-    uint64_t argc   = (uint64_t)a->n;
-    uint64_t o_argv = (o_str - (argc + 1) * 8) & ~15UL;
-    uint64_t *argv  = (uint64_t *)(k + o_argv);
-
-    for (uint64_t i = 0; i < argc; i++)
-        argv[i] = base + off[i];
-    argv[argc] = 0;                       /* el cero final del convenio */
-
-    *argc_out = argc;
-    *argv_out = base + o_argv;
-    *sp_out   = base + o_argv;
+    *argc_out = (uint64_t)a->n;
+    *argv_out = argv;
+    *envp_out = envp;
+    *sp_out   = argv;
 }
 
 /* Comodidad para el menu del kernel, que arranca programas con
@@ -1369,9 +1383,19 @@ static void build_args(uint64_t ustack_pa, const struct args *a,
 int task_create_user_str(const char *name, const uint8_t *image, uint64_t size,
                          uint64_t mmio_pa, const char *cadena)
 {
-    struct args a;
+    struct args a, e;
     args_de_cadena(&a, cadena);
-    return task_create_user(name, image, size, mmio_pa, &a);
+
+    /* El entorno con el que nace un proceso arrancado desde el menu del
+     * kernel. Alguien tiene que poner el primero: el entorno se HEREDA, y
+     * una herencia necesita un antepasado.
+     *
+     * En un Unix de verdad lo pone init leyendo ficheros de
+     * configuracion. Aqui son dos lineas escritas a mano, y eso basta
+     * para que el shell deje de llevar el PATH dentro del codigo. */
+    args_de_cadena(&e, "PATH=.:/usr/bin HOME=/ TERM=serie");
+
+    return task_create_user(name, image, size, mmio_pa, &a, &e);
 }
 
 /* Partir una cadena por espacios. Sin comillas: esto es para los caminos
@@ -1439,6 +1463,7 @@ static void nombre_de_args(struct task *t, const struct args *a)
  * espera encontrar su argc.
  */
 int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
+              const struct args *entorno,
               struct trap_frame *f)
 {
     struct task *t = current;
@@ -1454,8 +1479,8 @@ int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
     uint64_t ustack = pmm_alloc();
     if (!ustack) goto fail;
 
-    uint64_t argc = 0, argv = 0, sp = USER_STACK_TOP;
-    build_args(ustack, args, &argc, &argv, &sp);
+    uint64_t argc = 0, argv = 0, envp = 0, sp = USER_STACK_TOP;
+    build_args(ustack, args, entorno, &argc, &argv, &envp, &sp);
 
     if (vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA) < 0)
         goto fail;
@@ -1517,6 +1542,7 @@ int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
     f->spsr   = 0;                  /* EL0t, con las IRQ abiertas */
     f->sp_el0 = sp;
     f->x[1]   = argv;               /* x0 lo pone el despachador con argc */
+    f->x[2]   = envp;               /* y crt0 lo guarda en 'environ'      */
 
     return (int)argc;
 
@@ -1671,7 +1697,8 @@ fail:
 }
 
 int task_create_user(const char *name, const uint8_t *image, uint64_t size,
-                     uint64_t mmio_pa, const struct args *args)
+                     uint64_t mmio_pa, const struct args *args,
+                     const struct args *entorno)
 {
     /* Coger una ranura y soltar el cerrojo enseguida.
      *
@@ -1717,8 +1744,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     uint64_t ustack = pmm_alloc();
     if (!ustack) goto fail;
 
-    uint64_t argc = 0, argv = 0, sp = USER_STACK_TOP;
-    build_args(ustack, args, &argc, &argv, &sp);
+    uint64_t argc = 0, argv = 0, envp = 0, sp = USER_STACK_TOP;
+    build_args(ustack, args, entorno, &argc, &argv, &envp, &sp);
 
     if (vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA) < 0)
         goto fail;
@@ -1793,6 +1820,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     tf->sp_el0 = sp;                 /* su pila, con argv ya puesto encima  */
     tf->x[0]   = argc;
     tf->x[1]   = argv;
+    tf->x[2]   = envp;               /* el entorno, que crt0 guardara       */
 
     kzero(&t->ctx, sizeof(t->ctx));
     t->ctx.pc = (uint64_t)ret_to_user;

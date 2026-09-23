@@ -49,7 +49,9 @@ int main(int argc, char **argv)
      * asi que saltarse el nombre de "run" deja exactamente los argumentos
      * del hijo. Aqui habia una funcion que los juntaba todos en una
      * cadena con espacios para que el kernel los volviera a separar. */
-    int64_t pid = spawn(imagen, total, argv + 1);
+    /* Y el entorno, que se hereda: el hijo se lleva una copia del
+     * nuestro, que a su vez era copia del shell. */
+    int64_t pid = spawn(imagen, total, argv + 1, environ);
     if (pid < 0) printf("  [run] el kernel no lo ha querido\n");
     else         printf("  [run] arrancado como pid %lu\n", (uint64_t)pid);
 

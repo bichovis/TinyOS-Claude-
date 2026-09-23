@@ -94,6 +94,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 37   | Las senyales guardan la coma flotante       | hecho  |
 | 38   | rmdir y mv, o deshacer lo que se hizo       | hecho  |
 | 39   | Escribir nombres largos, y el ~1            | hecho  |
+| 40   | Variables de entorno, y el PATH fuera       | hecho  |
 
 ## Estructura
 
@@ -123,6 +124,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  wc.c        cuenta lo que le pasa por delante
                  mkdir.c     crea un directorio
                  map.c       mapea un fichero y mide cuando se lee
+                 env.c       ensenya el entorno   echo.c  repite lo que le den
                  rmdir.c     borra un directorio vacio
                  mv.c        mueve y renombra: la misma operacion
                  fp.c        coma flotante: cuentas y supervivencia
@@ -2616,6 +2618,95 @@ corto, de corto a largo, mover a otro directorio y borrar.
 Y se cae un aviso que llevaba desde el paso 35: ya no hay que explicarle a
 nadie que los nombres nuevos tienen que caber en 8.3.
 
+## Variables de entorno, y sacar el PATH del codigo
+
+El `PATH` estaba escrito dentro del shell:
+
+```c
+    static const char *PATH[] = { 0, "/usr/bin" };
+```
+
+Cambiarlo queria decir **recompilar el sistema operativo**. Eso no es una
+limitacion de un shell pequenyo: es que faltaba una idea.
+
+**El entorno es un segundo array de cadenas, igual que argv.** La forma es
+identica: `"NOMBRE=valor"`, terminado en cero. La diferencia no esta en la
+forma, esta en como viaja:
+
+| |argv|entorno|
+|-|-|-|
+|quien lo pone|quien te arranca, una vez|se hereda, sin que nadie lo reescriba|
+|donde llega|`main(argc, argv)`|`environ`, una variable global|
+
+Que el entorno acabe en una global y no en un parametro tiene su motivo:
+casi nadie escribe `main(argc, argv, envp)`. Lo normal es pedirle una
+variable suelta a `getenv()` desde cualquier sitio, y para eso tiene que
+estar en un sitio fijo. Lo rellena **crt0**, antes de `main`, con lo que
+dejo el kernel en `x2`:
+
+```asm
+    adrp    x9, environ
+    add     x9, x9, :lo12:environ
+    str     x2, [x9]
+    bl      main
+```
+
+**Y alguien tiene que poner el primero.** Una herencia necesita un
+antepasado. En un Unix de verdad lo pone `init` leyendo ficheros de
+configuracion; aqui es una linea en `task_create_user_str`:
+
+```c
+    args_de_cadena(&e, "PATH=.:/usr/bin HOME=/ TERM=serie");
+```
+
+**export tiene que ser interna, por lo mismo que cd.** `setenv` cambia el
+entorno del proceso que llama, y de nadie mas. Si `export` fuera un
+programa, el shell se bifurcaria, el hijo cambiaria SU entorno y al morir
+se lo llevaria consigo. El entorno se hereda hacia abajo, nunca hacia
+arriba.
+
+**Y `env` es un programa, tambien a proposito.** Siendo un programa,
+demuestra lo que ensenya: si imprime `PATH` es porque el shell se bifurco,
+el hijo heredo, hizo `exec`, y el kernel se lo volvio a entregar al
+programa nuevo. Una orden interna no probaria nada.
+
+```
+    / $ export SALUDO=hola
+    / $ env
+      PATH=.:/usr/bin
+      HOME=/
+      TERM=serie
+      SALUDO=hola          <- puesto por el shell, leido por su hijo
+```
+
+**La expansion, y por que ' y " no son lo mismo.** `$NOMBRE` se sustituye
+en el mismo troceador que ya sabia de comillas, asi que no hay una cuarta
+copia de nada. Y entre comillas **simples** no se expande:
+
+```
+    / $ echo 'sin expandir: $HOME'
+    sin expandir: $HOME
+    / $ echo "con comillas: $HOME"
+    con comillas: /
+```
+
+Esa distincion parece caprichosa hasta que se dice en voz alta: una es
+"esto tal cual" y la otra "esto, pero mirandolo".
+
+**La prueba de que el PATH se usa de verdad** no es que `ls` funcione:
+funcionaba antes. Es que deje de funcionar cuando no debe.
+
+```
+    / $ export PATH=/noexiste
+    / $ ls
+      LS.ELF: no lo encuentro. PATH=/noexiste
+```
+
+(Y un aviso sobre mirar los registros de una prueba: esa linea no aparecia
+en mi primera lectura porque el filtro con el que estaba leyendo el log
+descartaba todo lo que llevara `.ELF`. La prueba estaba bien; el que
+miraba, no.)
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -2647,8 +2738,12 @@ nadie que los nombres nuevos tienen que caber en 8.3.
   sistema serio la sacaria de un arbol de dispositivos.
 - El servidor entiende FAT16 y FAT32, pero nada de FAT12 ni exFAT, y
   escribe los nombres en 8.3.
-- El PATH es una lista en el codigo del shell (`.` y `/usr/bin`): no hay
-  variables de entorno que heredar en el `fork`.
+- El entorno son 16 variables y 512 bytes de texto por proceso, en un
+  array fijo: un entorno que crece sin limite necesita un asignador
+  detras, y el asignador necesita el entorno para saber donde esta el
+  monton.
+- No hay `unset`, ni variables locales del shell (todo lo que se pone se
+  exporta), ni `${VAR}` con llaves.
 - Los montajes estan escritos a mano: la particion FAT32 es `/` y la
   FAT16 es `/boot`, y no hay `mount` ni `/etc/fstab`. Con dos particiones
   y una placa concreta, una tabla de dos entradas dice mas que un
@@ -2685,9 +2780,7 @@ nadie que los nombres nuevos tienen que caber en 8.3.
 - De los nombres largos solo se entiende el ASCII. Lo de fuera sale como
   '?', a proposito: un byte truncado al azar daria un nombre que parece
   bueno y no abre nada.
-- No hay escapes (`\ `), ni comillas dentro de comillas, ni variables de
-  entorno. El `PATH` sigue escrito en el codigo del shell porque no hay
-  entorno que heredar en el `fork`.
+- No hay escapes (`\ `) ni comillas dentro de comillas.
 - Un programa puede recibir 16 argumentos y 256 bytes de texto entre
   todos.
 - No hay diario ni nada que se le parezca: un corte de corriente a mitad de
