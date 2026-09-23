@@ -100,6 +100,143 @@ int setenv(const char *nombre, const char *valor)
     return 0;
 }
 
+/* --- Ordenar ----------------------------------------------------------
+ *
+ * Quicksort con la mediana de tres. Elegir el pivote asi no es un adorno:
+ * el quicksort de libro -pivote el primero- se vuelve CUADRATICO justo
+ * con lo que mas aparece en la vida real, que son datos ya ordenados o
+ * casi. Mirar tres y quedarse con el de en medio cuesta dos comparaciones
+ * y quita ese caso.
+ *
+ * Los elementos se mueven byte a byte porque aqui no se sabe lo que son.
+ * Esa es toda la diferencia entre un qsort de libreria y uno escrito para
+ * un tipo concreto: el de libreria no puede usar el asignador de
+ * estructuras del compilador, tiene que copiar a mano.
+ */
+static void intercambiar(char *a, char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++) { char t = a[i]; a[i] = b[i]; b[i] = t; }
+}
+
+void qsort(void *base, size_t n, size_t tam,
+           int (*comparar)(const void *, const void *))
+{
+    if (n < 2 || !tam) return;
+
+    char *v = base;
+
+    /* Tramos pequenyos: insercion. Es O(n^2) y es MAS RAPIDA aqui, porque
+     * no tiene la ceremonia de la recursion y los datos ya estan en
+     * cache. El umbral clasico anda por ocho. */
+    if (n <= 8) {
+        for (size_t i = 1; i < n; i++)
+            for (size_t j = i; j > 0 && comparar(v + (j - 1) * tam,
+                                                 v + j * tam) > 0; j--)
+                intercambiar(v + (j - 1) * tam, v + j * tam, tam);
+        return;
+    }
+
+    /* Mediana de tres: primero, medio y ultimo. El elegido se pone al
+     * final para que el bucle de particion no tenga que esquivarlo. */
+    size_t medio = n / 2;
+    char *a = v, *b = v + medio * tam, *c = v + (n - 1) * tam;
+
+    if (comparar(a, b) > 0) intercambiar(a, b, tam);
+    if (comparar(b, c) > 0) {
+        intercambiar(b, c, tam);
+        if (comparar(a, b) > 0) intercambiar(a, b, tam);
+    }
+    intercambiar(b, c, tam);                  /* el pivote, al final */
+
+    char *pivote = v + (n - 1) * tam;
+    size_t frontera = 0;
+
+    for (size_t i = 0; i < n - 1; i++)
+        if (comparar(v + i * tam, pivote) < 0)
+            intercambiar(v + i * tam, v + frontera++ * tam, tam);
+
+    intercambiar(v + frontera * tam, pivote, tam);
+
+    qsort(v, frontera, tam, comparar);
+    qsort(v + (frontera + 1) * tam, n - frontera - 1, tam, comparar);
+}
+
+void *bsearch(const void *clave, const void *base, size_t n, size_t tam,
+              int (*comparar)(const void *, const void *))
+{
+    const char *v = base;
+    size_t bajo = 0, alto = n;
+
+    while (bajo < alto) {
+        /* bajo + (alto-bajo)/2 y no (bajo+alto)/2: la suma puede
+         * desbordar con arrays enormes. Es el fallo que estuvo veinte
+         * anyos en la busqueda binaria de la biblioteca de Java. */
+        size_t medio = bajo + (alto - bajo) / 2;
+
+        int r = comparar(clave, v + medio * tam);
+        if (r == 0) return (void *)(v + medio * tam);
+        if (r < 0)  alto = medio;
+        else        bajo = medio + 1;
+    }
+    return 0;
+}
+
+/* --- De texto a numero ------------------------------------------------
+ *
+ * strtol es lo que atoi deberia haber sido: dice donde se paro, entiende
+ * bases, y se puede saber si leyo algo. atoi no puede distinguir "0" de
+ * "hola", y por eso sigue habiendo programas que tratan una entrada mala
+ * como un cero.
+ */
+static int digito_de(char c, int base)
+{
+    int v;
+    if (c >= '0' && c <= '9')      v = c - '0';
+    else if (c >= 'a' && c <= 'z') v = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'Z') v = c - 'A' + 10;
+    else return -1;
+
+    return v < base ? v : -1;
+}
+
+unsigned long strtoul(const char *s, char **fin, int base)
+{
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+
+    int negativo = 0;
+    if (*p == '+') p++;
+    else if (*p == '-') { negativo = 1; p++; }
+
+    /* "0x" para hexadecimal y "0" para octal, pero solo si la base lo
+     * permite o no se dijo ninguna. Con base 16 el "0x" es opcional. */
+    if ((base == 0 || base == 16) && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')
+        && digito_de(p[2], 16) >= 0) {
+        p += 2;
+        base = 16;
+    } else if (base == 0) {
+        base = (p[0] == '0' && digito_de(p[1], 8) >= 0) ? 8 : 10;
+    }
+
+    unsigned long v = 0;
+    const char *primero = p;
+
+    for (int d; (d = digito_de(*p, base)) >= 0; p++)
+        v = v * (unsigned long)base + (unsigned long)d;
+
+    /* Si no se leyo ni un digito, 'fin' vuelve al principio DE TODO, no a
+     * donde se quedo el analisis. Asi el que llama puede comprobar
+     * fin == s y saber que no habia numero. */
+    if (fin) *fin = (char *)(p == primero ? s : p);
+
+    return negativo ? (unsigned long)(-(long)v) : v;
+}
+
+long strtol(const char *s, char **fin, int base)
+{
+    return (long)strtoul(s, fin, base);
+}
+
 /* Sin errno, sin detectar desbordamiento y parando en el primer caracter
  * que no sea un digito. Es la de toda la vida: comoda y traicionera. */
 long atol(const char *s)

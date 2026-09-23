@@ -39,7 +39,7 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc
 
 # Programas de usuario con mas de un fichero fuente
 EXTRA_fs := user/sd.c
@@ -62,8 +62,10 @@ ULDFLAGS := -nostdlib -nostartfiles -T user/user.ld \
 # Una biblioteca de verdad: se archiva con ar y se enlaza al final. El
 # enlazador saca de ella SOLO los objetos que hagan falta, asi que un
 # programa que no use printf no lo lleva dentro.
+LIBCASM := lib/setjmp.S
 LIBCSRC := lib/string.c lib/stdio.c lib/stdlib.c lib/malloc.c lib/signal.c
-LIBCOBJ := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIBCSRC))
+LIBCOBJ := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIBCSRC)) \
+           $(patsubst lib/%.S,$(BUILD)/lib/%.S.o,$(LIBCASM))
 CRT0    := $(BUILD)/lib/crt0.o
 LIBC    := $(BUILD)/libc.a
 
@@ -105,6 +107,10 @@ $(BUILD)/lib/%.o: lib/%.c lib/stdio.h lib/string.h lib/stdlib.h | $(BUILD)/lib
 $(BUILD)/lib/string.o: lib/string.c lib/string.h | $(BUILD)/lib
 	@echo "  CC-L  $< (sin reconocimiento de patrones)"
 	@$(CC) $(UCFLAGS) -fno-tree-loop-distribute-patterns -c $< -o $@
+
+$(BUILD)/lib/%.S.o: lib/%.S | $(BUILD)/lib
+	@echo "  AS-L  $<"
+	@$(CC) $(UCFLAGS) -c $< -o $@
 
 $(CRT0): lib/crt0.S | $(BUILD)/lib
 	@echo "  AS-L  $<"
@@ -190,7 +196,7 @@ sdtest: all | $(BUILD)
 	 mkdir -p "$$D/ETC"; \
 	 printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > "$$D/ETC/RC"; \
 	 mkdir -p "$$D/USR/BIN"; \
-	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha malo; do \
+	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha libc malo; do \
 	   cp $(BUILD)/$$p.elf "$$D/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF"; \
 	 done;                         \
 	 sync; diskutil eject $$DEV >/dev/null
@@ -235,7 +241,7 @@ sdcard: all firmware
 	@mkdir -p $(BUILD)/sddata/ETC
 	@printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > $(BUILD)/sddata/ETC/RC
 	@mkdir -p $(BUILD)/sddata/USR/BIN
-	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha malo; do \
+	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo fecha libc malo; do \
 	   cp $(BUILD)/$$p.elf $(BUILD)/sddata/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done
 	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de datos de la Pi.\n' > $(BUILD)/sddata/HOLA.TXT

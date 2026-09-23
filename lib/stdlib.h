@@ -5,6 +5,31 @@
 void *malloc(size_t n);
 void  free(void *p);
 
+/* Reservar n elementos de tam bytes, a cero. La multiplicacion se
+ * comprueba: calloc(2, SIZE_MAX) no puede devolver un bloque de dos
+ * bytes, que es lo que pasaria si se desbordara en silencio. */
+void *calloc(size_t n, size_t tam);
+
+/* Cambiar de tamanyo conservando el contenido. Puede mover el bloque, y
+ * por eso devuelve la direccion nueva: usar la vieja despues es de los
+ * errores mas viejos que hay. */
+void *realloc(void *p, size_t n);
+
+/* Ordenar. Es quicksort con la mediana de tres, que es lo que hace todo
+ * el mundo y por una razon: el quicksort de libro se vuelve cuadratico
+ * justo con lo que mas aparece en la vida real, que son datos ya
+ * ordenados. */
+void  qsort(void *base, size_t n, size_t tam,
+            int (*comparar)(const void *, const void *));
+
+void *bsearch(const void *clave, const void *base, size_t n, size_t tam,
+              int (*comparar)(const void *, const void *));
+
+/* De texto a numero, en la base que sea. 'fin' recibe donde se paro, que
+ * es lo que permite leer varios numeros seguidos de una cadena. */
+long          strtol(const char *s, char **fin, int base);
+unsigned long strtoul(const char *s, char **fin, int base);
+
 /* noreturn no es cosmetica: sin ella GCC cree que exit() puede volver, y
  * se queja de que un main que termina con exit() "llega al final de una
  * funcion que no es void". */

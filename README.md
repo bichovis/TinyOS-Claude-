@@ -101,6 +101,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 44   | Rutas largas y un reloj inventado           | hecho  |
 | 45   | La superficie de fichero que espera una libc| hecho  |
 | 46   | Memoria anonima, y el ultimo programa sin IPC| hecho |
+| 47   | La libc crece: setjmp, qsort, strtol        | hecho  |
 
 ## Estructura
 
@@ -146,7 +147,8 @@ Tres cosas que QEMU perdona y el silicio no:
                  crt0.S      _start: lo que corre ANTES de main()
                  stdio.c     printf, snprintf, putchar, puts, getchar
                  string.c    memcpy, memset, strlen, strcmp... las de siempre
-                 stdlib.c    exit, atoi, abs
+                 stdlib.c    exit, atoi, qsort, bsearch, strtol
+                 setjmp.S    volver a un punto de antes
                  malloc.c    malloc/free de usuario, encima de sbrk
                  signal.c    el trampolin por donde vuelve un manejador
     tools/       bin2c.py           binario de usuario -> array de C
@@ -3282,6 +3284,108 @@ no se entera. Eso no es que se haya anyadido: es lo que aparece cuando
 dejas de hablar con un servidor concreto y empiezas a hablar con un
 descriptor.
 
+## Una funcion que devuelve dos veces
+
+`setjmp` es lo mas raro que hay en una libc: devuelve **dos veces**. La
+primera cuando la llamas, con cero; la segunda cuando alguien hace
+`longjmp`, con lo que le pasaran.
+
+No es magia. Se guarda los registros que el ABI obliga a conservar entre
+llamadas -x19-x28, el marco, la direccion de retorno, el puntero de pila y
+d8-d15- y `longjmp` los vuelve a poner. Al restaurar x30 y sp, el `ret` de
+`longjmp` **aterriza dentro de setjmp**, justo detras de su propio `ret`, y
+setjmp vuelve por segunda vez.
+
+Y por eso no se puede escribir en C: en C no hay forma de decir *"el
+puntero de pila vale esto otro"*.
+
+Es la misma lista que salva `switch.S` al cambiar de hilo, mas los ocho
+registros de coma flotante. No es casualidad: las dos cosas son lo mismo
+-congelar un punto de ejecucion para volver a el- con la diferencia de que
+un cambio de contexto vuelve **una** vez y esto puede volver muchas.
+
+**Una linea que parece un capricho del estandar.** `longjmp(buf, 0)` tiene
+que hacer que setjmp devuelva **1**, no 0:
+
+```asm
+    cmp     w1, #0
+    csinc   w0, w1, wzr, ne
+```
+
+Quitandola, el programa de prueba entra en un bucle infinito:
+
+```
+    primera vez: setjmp devuelve 0
+    tras el salto: setjmp devuelve 7, desde tres niveles
+    primera vez: setjmp devuelve 0          <- otra vez
+    tras el salto: setjmp devuelve 7...
+```
+
+Si `longjmp(buf, 0)` devolviera cero, el que llamo a setjmp no podria
+distinguir la vuelta de verdad de la primera, y un bucle de reintentos no
+terminaria nunca. El estandar lo exige por eso.
+
+**Y los d8-d15**, que en este sistema tienen gracia: guardarlos toca la
+FPU, y la FPU esta apagada hasta que alguien la usa (paso 30). O sea que
+el primer `setjmp` de un proceso provoca una excepcion, le reserva sus 528
+bytes y sigue. Cuesta una trampa y es correcto.
+
+## Una prueba que no medía nada
+
+La primera version de la prueba de `d8-d15` era esta:
+
+```c
+    volatile double antes = 0.0;
+    ...
+    antes = sumar(1.0, 8);
+```
+
+Y pasaba. Tambien pasaba **quitando el guardado de d8-d15 de setjmp**, o
+sea que no medía nada.
+
+La culpa es de ese `volatile`. Se puso por un motivo correcto -tras un
+longjmp, lo que no este en memoria vuelve atras- y tiene un efecto
+secundario que arruina esta prueba en concreto: obliga a la variable a
+vivir **en memoria**, que es justo donde no le pasa nada a un registro que
+no se guarda.
+
+En C no hay forma de decir "esto tiene que vivir en d8". Asi que se dice
+en ensamblador:
+
+```c
+    static inline void poner_d8(double v) { asm volatile("fmov d8, %d0" :: "w"(v)); }
+```
+
+Se pone 3.25 antes de `setjmp`, se cambia a 99.5 despues, se salta, y se
+mira. Con el guardado: `3.25 ok, restaurado`. Sin el: `0.00 MAL`.
+
+Es la quinta vez en este proyecto que romper el codigo a proposito cambia
+lo que sabiamos, y la primera en que descubre que **la prueba** estaba mal
+en vez del codigo.
+
+## Lo demas que ha crecido
+
+`qsort` con mediana de tres, y no por elegancia: el quicksort de libro
+-pivote el primero- se vuelve **cuadratico** justo con lo que mas aparece
+en la vida real, que son datos ya ordenados o casi. Mirar tres y quedarse
+con el de en medio cuesta dos comparaciones y quita ese caso. Por debajo
+de ocho elementos usa insercion, que es O(n²) y **mas rapida** ahi: sin
+ceremonia de recursion y con los datos en cache.
+
+`bsearch` con `bajo + (alto-bajo)/2` y no `(bajo+alto)/2`, porque la suma
+se desborda con arrays enormes. Es el fallo que estuvo veinte anyos en la
+busqueda binaria de la biblioteca de Java.
+
+`strtol` es lo que `atoi` deberia haber sido: dice donde se paro, entiende
+bases, y permite saber **si leyo algo**. `atoi` no puede distinguir `"0"`
+de `"hola"`, y por eso sigue habiendo programas que tratan una entrada
+mala como un cero.
+
+`calloc` comprueba la multiplicacion antes de hacerla: `calloc(2, enorme)`
+tiene que negarse, no dar un bloque de dos bytes al que desborda.
+`realloc` devuelve la direccion nueva porque puede mover el bloque, y si
+no puede, **el viejo sigue valiendo** -perderlo ahi es un fallo clasico-.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -3312,7 +3416,9 @@ descriptor.
 - El shell no tiene historial, ni segundo plano, ni tuberias de mas de dos,
   ni `>>`: lee, carga, arranca y espera.
 - La libc no tiene `errno` ni ficheros con buffer (`FILE`, `fopen`): se
-  trabaja con descriptores. `printf` entiende banderas, anchura, precision
+  trabaja con descriptores. Es lo siguiente que hace falta.
+- `strtol` no detecta desbordamiento: `strtol("99999999999999999999", ...)`
+  da lo que salga. Hacerlo bien necesita `errno`. `printf` entiende banderas, anchura, precision
   y `l`, pero no notacion exponencial (`%e`, `%g`) ni `long double`.
 - El cambio de contexto de FP es perezoso solo al restaurar. Al salir se
   salva siempre, porque con cuatro nucleos dejar el estado vivo en los

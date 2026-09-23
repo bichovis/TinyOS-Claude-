@@ -89,6 +89,54 @@ void *malloc(size_t n)
     return 0;
 }
 
+/* Cuanto sitio UTIL tiene un bloque ya reservado. La cabecera guarda el
+ * tamanyo total, asi que es una resta. */
+static uint64_t sitio_de(void *p)
+{
+    struct bloque *b = (struct bloque *)((char *)p - CABECERA);
+    return b->tam - CABECERA;
+}
+
+void *calloc(size_t n, size_t tam)
+{
+    if (!n || !tam) return 0;
+
+    /* La multiplicacion se comprueba ANTES. Sin esto, calloc(2, SIZE_MAX)
+     * daria un bloque de dos bytes y el que llama escribiria en toda la
+     * memoria creyendo que es suya. Es un fallo clasico y sigue
+     * apareciendo. */
+    if (n > (uint64_t)-1 / tam) return 0;
+
+    uint64_t total = (uint64_t)n * tam;
+    char *p = malloc(total);
+    if (!p) return 0;
+
+    for (uint64_t i = 0; i < total; i++) p[i] = 0;
+    return p;
+}
+
+void *realloc(void *p, size_t n)
+{
+    if (!p) return malloc(n);
+    if (!n) { free(p); return 0; }
+
+    uint64_t tenia = sitio_de(p);
+
+    /* Si ya cabe, se queda donde esta. No se encoge el bloque: partirlo
+     * complicaria el asignador para ahorrar unos bytes que casi siempre
+     * se vuelven a pedir. */
+    if (tenia >= n) return p;
+
+    char *nuevo = malloc(n);
+    if (!nuevo) return 0;                 /* y el viejo SIGUE VALIENDO */
+
+    const char *viejo = p;
+    for (uint64_t i = 0; i < tenia; i++) nuevo[i] = viejo[i];
+
+    free(p);
+    return nuevo;
+}
+
 void free(void *p)
 {
     if (!p) return;
