@@ -45,8 +45,10 @@ void wq_wake_one(struct waitqueue *wq)
         wq->head = t->wait_next;
         if (!wq->head) wq->tail = 0;
         t->wait_next = 0;
-        if (t->state == TASK_BLOCKED)
+        if (t->state == TASK_BLOCKED) {
             t->state = TASK_READY;
+            sched_kick_idle();
+        }
     }
 }
 
@@ -56,8 +58,10 @@ void wq_wake_all(struct waitqueue *wq)
     while (t) {
         struct task *next = t->wait_next;
         t->wait_next = 0;
-        if (t->state == TASK_BLOCKED)
+        if (t->state == TASK_BLOCKED) {
             t->state = TASK_READY;
+            sched_kick_idle();
+        }
         t = next;
     }
     wq->head = wq->tail = 0;

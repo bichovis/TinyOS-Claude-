@@ -273,7 +273,23 @@ void dcache_invalidate_all(void);          /* cache.S */
 void dcache_clean_invalidate_all(void);    /* cache.S */
 
 /* Apagar y encender las caches en caliente. Sirve para una sola cosa:
- * medir cuanto valen. No es una operacion inocente.
+ * medir cuanto valen. No es una operacion inocente, y tiene una
+ * consecuencia que no se ve venir:
+ *
+ *   MIENTRAS LAS CACHES ESTAN APAGADAS NO SE PUEDE COGER UN SPINLOCK.
+ *
+ * Con SCTLR_EL1.C a 0, toda la memoria normal pasa a tratarse como NO
+ * cacheable. Y las instrucciones exclusivas -ldaxr/stlxr, de las que vive
+ * spin_lock()- necesitan un monitor que en un Cortex-A53 va con la cache:
+ * sobre memoria no cacheable el store-exclusive falla SIEMPRE, y el bucle
+ * de spin_lock gira hasta el fin de los tiempos.
+ *
+ * Por eso quien llame a esto tiene que tapar las interrupciones durante
+ * todo el tramo sin caches: una IRQ ahi acaba en scheduler_tick(), que
+ * coge el cerrojo del planificador, y ahi se acabo la maquina.
+ *
+ * QEMU no lo reproduce: sus exclusivas siempre funcionan. El silicio no
+ * perdona, y esto se paga con un cuelgue mudo.
  *
  * Al APAGAR hay que vaciar antes lo sucio a la RAM (clean+invalidate): si
  * no, esas escrituras se quedarian en una cache que ya nadie mira y se

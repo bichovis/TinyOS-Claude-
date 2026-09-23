@@ -4,6 +4,7 @@
 
 void     irq_init(void);        /* lo llama el nucleo 0: los dos controladores */
 void     irq_init_core(void);   /* y esto, CADA nucleo: lo suyo propio         */
+void     irq_send_resched(uint64_t core);  /* "mirate el turno" a otro nucleo */
 void     irq_handle(void);      /* lo llama el vector IRQ desde vectors.S */
 uint64_t irq_count(void);              /* atendidas entre los cuatro nucleos */
 uint64_t irq_count_core(uint64_t core); /* y las de uno solo                 */

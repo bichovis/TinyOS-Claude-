@@ -35,12 +35,23 @@
  * lo que hacia este fichero cuando solo habia un nucleo despierto. */
 #define CORE_TIMER_IRQCNTL(c) (LOCAL_BASE + 0x40 + 4 * (c))  /* que timers  */
                                                              /* avisan      */
+#define CORE_MBOX_IRQCNTL(c)  (LOCAL_BASE + 0x50 + 4 * (c))  /* que buzones */
 #define CORE_IRQ_SOURCE(c)    (LOCAL_BASE + 0x60 + 4 * (c))  /* quien fue   */
+
+/* Los buzones entre nucleos: cuatro por nucleo, de 32 bits. Escribir en el
+ * de otro nucleo le enciende una interrupcion, y eso es todo lo que hace
+ * falta para avisarle de algo. El "write-high-to-clear" es literal: se
+ * reconoce escribiendo de vuelta los bits que se leyeron. */
+#define CORE_MBOX_SET(c, m)   (LOCAL_BASE + 0x80 + 0x10 * (c) + 4 * (m))
+#define CORE_MBOX_CLR(c, m)   (LOCAL_BASE + 0xC0 + 0x10 * (c) + 4 * (m))
+
+#define MBOX_RESCHED          0           /* el buzon 0 es "mirate el turno" */
 
 #define SRC_CNTPSIRQ          (1u << 0)   /* timer fisico seguro           */
 #define SRC_CNTPNSIRQ         (1u << 1)   /* timer fisico NO seguro <- ese */
 #define SRC_CNTHPIRQ          (1u << 2)   /* timer del hipervisor          */
 #define SRC_CNTVIRQ           (1u << 3)   /* timer virtual                 */
+#define SRC_MBOX0             (1u << 4)   /* buzon 0: un IPI de otro nucleo*/
 #define SRC_GPU               (1u << 8)   /* algo del controlador [1]      */
 
 /* --- [1] GPU interrupt controller -------------------------------------- */
@@ -83,7 +94,25 @@ void irq_init(void)
  *     bit correcto sea CNTPNSIRQ y no CNTPSIRQ. */
 void irq_init_core(void)
 {
-    mmio_write(CORE_TIMER_IRQCNTL(this_core()), SRC_CNTPNSIRQ);
+    uint64_t core = this_core();
+
+    mmio_write(CORE_TIMER_IRQCNTL(core), SRC_CNTPNSIRQ);
+
+    /* Y que el buzon 0 tambien pueda interrumpirnos: es por donde los otros
+     * nucleos nos diran que hay trabajo. */
+    mmio_write(CORE_MBOX_IRQCNTL(core), 1u << MBOX_RESCHED);
+}
+
+/* Darle un toque a otro nucleo. No lleva informacion: el mensaje es "mirate
+ * el turno", y lo que haya que mirar ya esta en la tabla de tareas.
+ *
+ * Esto sustituye al 'sev' a los cuatro vientos que usabamos antes, que
+ * despertaba a los cuatro nucleos cada vez que alguien soltaba el cerrojo
+ * del planificador, tuvieran o no algo que hacer. */
+void irq_send_resched(uint64_t core)
+{
+    if (core < CORES)
+        mmio_write(CORE_MBOX_SET(core, MBOX_RESCHED), 1);
 }
 
 void irq_handle(void)
@@ -97,6 +126,15 @@ void irq_handle(void)
 
     if (src & SRC_CNTPNSIRQ)
         timer_irq();
+
+    /* Un toque de otro nucleo. Reconocerlo es escribir de vuelta lo que se
+     * lee; no hay mas que hacer, porque el aviso no lleva contenido: el
+     * sched_preempt() del final de esta funcion es la respuesta. */
+    if (src & SRC_MBOX0) {
+        uint32_t v = mmio_read(CORE_MBOX_CLR(core, MBOX_RESCHED));
+        mmio_write(CORE_MBOX_CLR(core, MBOX_RESCHED), v);
+        sched_wake_core();
+    }
 
     /* Las IRQ de perifericos van todas al nucleo 0 (GPU_INT_ROUTING), asi
      * que este bit solo se enciende alli. */

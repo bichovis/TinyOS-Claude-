@@ -28,3 +28,6 @@ void secondary_main(uint64_t core);
  * exactamente 4*iters, y sin el, menos. Es la demostracion de que
  * irq_save() no bastaba. */
 uint64_t smp_hammer(uint64_t iters, int con_cerrojo);
+
+/* En que nucleo corrio cada martillo de la ultima tanda. */
+void smp_print_cores(void);

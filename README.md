@@ -68,6 +68,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 13b  | Cerrojos de verdad y `current` por nucleo   | hecho  |
 | 13c-1| Temporizador e interrupciones por nucleo    | hecho  |
 | 13c-2| Que los cuatro nucleos ejecuten hilos       | hecho  |
+| 14   | Pulido: IPIs, cerrojos mas finos            | hecho  |
 
 ## Estructura
 
@@ -92,7 +93,7 @@ Tres cosas que QEMU perdona y el silicio no:
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
     vmm.c        tablas de traduccion de 3 niveles y espacios de usuario
-    smp.c        despierta los nucleos 1-3 y les manda trabajo
+    smp.c        despierta los nucleos 1-3 y el demo del contador
     spinlock.c   exclusion mutua entre nucleos (ldaxr/stlxr)
     irq.c        los dos controladores de interrupcion del BCM2837
     mbox.c       buzon de la VideoCore: le pregunta a la GPU cuanta RAM hay
@@ -370,52 +371,84 @@ rato que no la pisa nadie.
 **Orden de cerrojos**, y hay que respetarlo: `sched_lock` se coge ANTES que
 el de la UART y el del PMM, nunca despues.
 
-## `wfe` y no `wfi`
+## Como se entera un nucleo ocioso de que hay trabajo
 
-Un detalle de una linea que resulto ser todo el reparto de trabajo.
-
-La tarea idle de cada nucleo esperaba con `wfi`, que solo despierta con una
-interrupcion: un nucleo ocioso tardaba hasta un tick entero en enterarse de
-que habia una tarea lista. Con `wfe` despierta ademas con `sev` — y
-`spin_unlock()` ya hace `sev`. Asi que cada vez que alguien suelta el
-cerrojo del planificador, y eso incluye cada vez que una tarea pasa a lista,
-los nucleos ociosos se despiertan solos y van a buscar trabajo.
-
-Un `sev` de mas cuesta una vuelta del bucle idle sin encontrar nada. Un
-`sev` de menos cuesta 10 ms de un nucleo parado.
-
-Lo encontro el comando `w`, que empezo a dar el resultado exacto sin
-cerrojo — imposible si hubiera carrera. Ahora imprime en que nucleo corrio
-cada martillo, que es lo que delato el problema:
+Esta pregunta tuvo dos respuestas, y la primera la encontro el propio
+comando `w` al empezar a dar el resultado exacto sin cerrojo — imposible si
+hubiera carrera. Los cuatro hilos martillo corrian en el mismo nucleo:
 
     sin cerrojo : (nucleos: 3 3 3 3 ) 800000     <- los cuatro en el mismo
-    sin cerrojo : (nucleos: 3 0 1 2 ) 289604     <- ya repartidos
+    sin cerrojo : (nucleos: 0 2 1 1 ) 403172     <- ya repartidos
 
 Un dato compartido no se corrompe por compartirlo: se corrompe por
-compartirlo AL MISMO TIEMPO. De ahi tambien la barrera de salida de los
+compartirlo AL MISMO TIEMPO. (De ahi tambien la barrera de salida de los
 hilos martillo, sin la cual cada uno terminaba antes de que arrancara el
-siguiente.
+siguiente.)
 
-(Esos 289604 son de una Pi 3B: se pierde el 64% de los incrementos. QEMU
-deja unos 403000, porque solapa menos. El hardware siempre es mas duro con
-este error.)
+**Primera respuesta: `wfe` en vez de `wfi`.** La tarea idle esperaba con
+`wfi`, que solo despierta con una interrupcion, asi que un nucleo ocioso
+tardaba hasta un tick — 10 ms — en enterarse. `wfe` despierta ademas con
+`sev`, y `spin_unlock()` ya hacia `sev`: el mecanismo llevaba ahi desde el
+paso 13b sin usar. Funcionaba, pero era un martillazo — despertaba a los
+cuatro nucleos cada vez que alguien soltaba cualquier cerrojo.
+
+**Segunda respuesta, la buena: un IPI.** El BCM2837 da cuatro buzones por
+nucleo; escribir en el de otro le enciende una interrupcion. El buzon 0 es
+"mirate el turno": no lleva contenido, porque lo que hay que mirar ya esta
+en la tabla de tareas. `sched_kick_idle()` busca un nucleo ocioso y le da
+un toque, y solo a el.
+
+Saber quien esta ocioso no necesita leer el `TPIDR_EL1` de los demas: la
+tarea idle del nucleo N solo la ejecuta el nucleo N, asi que verla en
+`RUNNING` es verlo a el sin nada que hacer.
+
+Se nota en el comando `j`: antes las cuatro cuentas de interrupciones iban
+al unisono, porque solo las daba el temporizador. Ahora van desiguales, y
+esa diferencia son los toques.
+
+La busqueda del nucleo ocioso empieza cada vez por uno distinto. Mirando
+siempre desde el 0 se veia en la placa que el nucleo 1 se llevaba casi
+todos los avisos (el 0 suele estar ocupado), lo cual reparte el trabajo
+pero no el coste de interrumpirse por los demas.
+
+## Tres cosas que QEMU hace funcionar y el silicio no
+
+Las tres se manifestaron igual, con un cuelgue mudo, y las tres estan
+comentadas en el sitio donde importan:
+
+  - **`CPUECTLR_EL1.SMPEN`** (`boot.S`). Es un registro *implementation
+    defined*, y que EL1 pueda tocarlo depende de lo que hayan dejado
+    `ACTLR_EL2`/`ACTLR_EL3`, o sea del firmware. En la Pi el acceso se
+    atrapa; con `VBAR_EL1` aun sin poner, eso es la muerte.
+  - **`TPIDR_EL1`** (`boot.S`). Al sacar `current` de `.bss` y meterlo en un
+    registro se pierde el cero gratis que da el enlazador. El registro
+    arranca con basura del firmware, y el `if (!current)` de
+    `scheduler_tick()` pasaba de largo sobre un puntero inventado.
+  - **`ldaxr`/`stlxr` sin cache** (`vmm.c`). Con `SCTLR_EL1.C` a 0 toda la
+    memoria normal pasa a no cacheable, y en un Cortex-A53 las exclusivas
+    necesitan la cache: el store-exclusive falla siempre y `spin_lock()`
+    gira para siempre. Un spinlock necesita la cache encendida.
 
 ## Limitaciones conocidas
 
-- Despertar a los nucleos ociosos con `sev` es un martillazo: lo reciben los
-  cuatro cada vez que alguien suelta el cerrojo del planificador, tengan o
-  no algo que hacer. Lo fino seria un IPI por los mailboxes locales del
-  BCM2837 (`0x4000008C + 0x10*core`), dirigido a UN nucleo ocioso.
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
-  de espera y los puertos IPC a la vez, y se mantiene cogido durante la
-  carga entera de un proceso. Partirlo seria mas rapido, no mas correcto.
+  de espera y los puertos IPC a la vez. Partirlo seria mas rapido, no mas
+  correcto. (Lo que si se saco de el es la carga de un proceso, que son
+  milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
+  sin el y publica con el otra vez.)
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
-  en el primer nucleo que la mire.
-- El cerrojo de la UART hace indivisible cada LLAMADA, no cada linea: dos
-  `uart_puts` no se entrelazan, pero un `uart_puts` seguido de un
-  `uart_dec` si puede partirse. Con cuatro nucleos escribiendo se nota. Para
-  lineas enteras habria que sostener el cerrojo desde fuera.
-- El kernel conserva su propio driver de UART para depuracion, asi que
-  cuando el servidor de consola esta activo hay dos escritores sobre el
-  mismo hardware y el texto puede entremezclarse. Un microkernel estricto
-  dejaria en el kernel, como mucho, una salida de panico.
+  en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
+  carga no hay nada que priorizar.
+- El kernel conserva su propio driver de UART, asi que cuando el servidor de
+  consola esta activo hay DOS drivers sobre el mismo hardware y el texto se
+  entremezcla. Y esto no es un problema de cerrojos: el `conserver` vive en
+  EL0 con la PL011 mapeada en su espacio y escribe en ella directamente, sin
+  pasar por nada del kernel — que es justamente lo que demuestra el paso 8.
+  Ponerle un cerrojo compartido significaria que el kernel se quedaria
+  girando cuando un proceso de usuario fuera desalojado teniendolo.
+
+  La respuesta de un microkernel estricto es otra: que el kernel no tenga
+  driver. Solo una salida de panico que escriba a pelo, y todo lo demas por
+  mensajes al servidor. Eso implica que el menu y las demos de `kernel.c`
+  dejen de ser codigo de kernel y pasen a ser un proceso de usuario, que es
+  una reforma del proyecto entero y no un arreglo.

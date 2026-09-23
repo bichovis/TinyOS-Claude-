@@ -10,6 +10,7 @@
 #include "uart.h"
 #include "sync.h"
 #include "sched.h"
+#include "smp.h"
 #include "irq.h"
 #include "spinlock.h"
 
@@ -93,7 +94,42 @@ void uart_init(void)
  * El cerrojo se coge en las funciones publicas y no aqui dentro: asi lo
  * que queda indivisible es la LINEA, que es la unidad que tiene sentido
  * leer, y no el caracter suelto. */
-static struct spinlock uart_lock = SPINLOCK("uart");
+static struct spinlock   uart_lock = SPINLOCK("uart");
+static volatile uint64_t uart_owner = (uint64_t)-1;  /* que nucleo lo tiene */
+static volatile uint32_t uart_depth;                 /* cuantas veces       */
+
+/* Coger el cerrojo, o apuntar una vuelta mas si ya era nuestro.
+ *
+ * Las IRQ se tapan ANTES de mirar nada: eso garantiza que, mientras
+ * decidimos, este nucleo no va a saltar a un manejador que quiera escribir
+ * tambien. Y 'owner' solo lo escribe quien tiene el cerrojo, asi que
+ * leerlo sin el es seguro: si dice que es nuestro, es que lo es. */
+static uint64_t uart_acquire(void)
+{
+    uint64_t f = irq_save();
+
+    if (uart_owner == this_core() && uart_depth) {
+        uart_depth++;
+        return f;
+    }
+
+    spin_lock(&uart_lock);
+    uart_owner = this_core();
+    uart_depth = 1;
+    return f;
+}
+
+static void uart_release(uint64_t f)
+{
+    if (--uart_depth == 0) {
+        uart_owner = (uint64_t)-1;
+        spin_unlock(&uart_lock);
+    }
+    irq_restore(f);
+}
+
+uint64_t uart_begin(void)        { return uart_acquire(); }
+void     uart_end(uint64_t f)    { uart_release(f); }
 
 static void putc_raw(char c)
 {
@@ -104,9 +140,9 @@ static void putc_raw(char c)
 
 void uart_putc(char c)
 {
-    uint64_t f = spin_lock_irqsave(&uart_lock);
+    uint64_t f = uart_acquire();
     putc_raw(c);
-    spin_unlock_irqrestore(&uart_lock, f);
+    uart_release(f);
 }
 
 char uart_getc(void)
@@ -118,22 +154,22 @@ char uart_getc(void)
 
 void uart_puts(const char *s)
 {
-    uint64_t f = spin_lock_irqsave(&uart_lock);
+    uint64_t f = uart_acquire();
     for (; *s; s++) {
         if (*s == '\n') putc_raw('\r');   /* los terminales quieren CRLF */
         putc_raw(*s);
     }
-    spin_unlock_irqrestore(&uart_lock, f);
+    uart_release(f);
 }
 
 static void uart_hex(uint64_t value, int nibbles)
 {
-    uint64_t f = spin_lock_irqsave(&uart_lock);
+    uint64_t f = uart_acquire();
     for (int i = nibbles - 1; i >= 0; i--) {
         uint32_t d = (value >> (i * 4)) & 0xF;
         putc_raw(d < 10 ? (char)('0' + d) : (char)('A' + d - 10));
     }
-    spin_unlock_irqrestore(&uart_lock, f);
+    uart_release(f);
 }
 
 void uart_hex32(uint32_t v) { uart_hex(v, 8);  }
@@ -148,9 +184,9 @@ void uart_dec(uint64_t v)
     if (v == 0) { uart_putc('0'); return; }
     while (v) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
 
-    uint64_t f = spin_lock_irqsave(&uart_lock);
+    uint64_t f = uart_acquire();
     while (n--) putc_raw(tmp[n]);
-    spin_unlock_irqrestore(&uart_lock, f);
+    uart_release(f);
 }
 
 /* --- Recepcion por interrupcion ---------------------------------------

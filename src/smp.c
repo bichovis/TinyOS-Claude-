@@ -176,12 +176,6 @@ uint64_t smp_hammer(uint64_t iters, int con_cerrojo)
     while (hechos < creados && timer_now() < limite)
         task_yield();
 
-    uart_puts("(nucleos: ");
-    for (uint64_t i = 0; i < CORES; i++) {
-        uart_dec(nucleo_de[i]);
-        uart_puts(" ");
-    }
-    uart_puts(") ");
     return contador;
 }
 
@@ -230,12 +224,14 @@ void smp_dump(void)
 {
     uart_puts("\n  nucleo  MPIDR_EL1           EL  SP (su pila)        IRQ atendidas\n");
     for (uint64_t c = 0; c < CORES; c++) {
+        uint64_t lf = uart_begin();     /* la fila entera, de una pieza */
         uart_puts("    ");
         uart_putc((char)('0' + c));
         uart_puts("     ");
 
         if (!cores[c].alive) {
             uart_puts("-- no ha contestado --\n");
+            uart_end(lf);
             continue;
         }
 
@@ -248,5 +244,19 @@ void smp_dump(void)
         uart_puts("  ");
         uart_dec(irq_count_core(c));
         uart_puts("\n");
+        uart_end(lf);
     }
+}
+
+/* En que nucleo acabo corriendo cada martillo. Si salen repetidos es que no
+ * hubo concurrencia de verdad, y entonces el contador sale exacto aunque no
+ * haya cerrojo: no porque este bien, sino porque no se solaparon. */
+void smp_print_cores(void)
+{
+    uart_puts("(nucleos: ");
+    for (uint64_t i = 0; i < CORES; i++) {
+        uart_dec(nucleo_de[i]);
+        uart_puts(" ");
+    }
+    uart_puts(") ");
 }

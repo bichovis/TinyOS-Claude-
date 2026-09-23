@@ -64,22 +64,53 @@ void sched_unlock_new_task(void)
     spin_unlock(&sched_lock);
 }
 
-/* Lo que hace un nucleo cuando no tiene nada que hacer.
+/* Avisar a UN nucleo ocioso de que hay trabajo.
  *
- * 'wfe' y no 'wfi', y la diferencia es todo el reparto de trabajo: wfi solo
- * despierta con una interrupcion, o sea que un nucleo ocioso tardaria hasta
- * un tick entero en enterarse de que hay una tarea lista. wfe despierta
- * ademas con 'sev', y resulta que spin_unlock() ya hace 'sev' — asi que
- * cada vez que alguien suelta el cerrojo del planificador, y eso incluye
- * cada vez que una tarea pasa a lista, los nucleos ociosos se despiertan
- * solos y van a buscar trabajo.
+ * "Ocioso" se sabe sin poder leer el TPIDR_EL1 de los demas: la tarea idle
+ * del nucleo N solo la ejecuta el nucleo N, asi que verla en RUNNING es
+ * verlo a el sin nada que hacer.
  *
- * Un 'sev' de mas solo cuesta una vuelta de este bucle sin encontrar nada.
- * Un 'sev' de menos cuesta 10 ms de un nucleo parado. */
+ * Se llama con sched_lock cogido, justo despues de dejar alguna tarea
+ * lista. Antes esto lo hacia un 'sev', que despertaba a los cuatro nucleos
+ * cada vez que alguien soltaba un cerrojo; un toque dirigido cuesta una
+ * escritura y no molesta a quien esta trabajando. */
+static uint64_t kick_next;          /* por donde empezar a buscar */
+
+void sched_kick_idle(void)
+{
+    uint64_t yo = this_core();
+
+    /* Empezando cada vez por uno distinto. Buscando siempre desde el 0, el
+     * nucleo 1 se llevaba casi todos los avisos -el 0 suele estar
+     * ocupado-, y eso es cargarle a uno el trabajo de interrumpirse por
+     * los demas. Se ve en la columna de IRQ del comando 'j'. */
+    for (uint64_t i = 0; i < CORES; i++) {
+        uint64_t c = (kick_next + i) % CORES;
+        if (c == yo) continue;
+        if (tasks[c].state == TASK_RUNNING) {   /* su idle esta en la CPU */
+            kick_next = (c + 1) % CORES;
+            irq_send_resched(c);
+            return;
+        }
+    }
+}
+
+/* La respuesta al toque: el aviso no lleva contenido, asi que solo hay que
+ * apuntar que toca mirar. El sched_preempt() del final de irq_handle() hace
+ * el resto. */
+void sched_wake_core(void)
+{
+    need_resched[this_core()] = 1;
+}
+
+/* Lo que hace un nucleo cuando no tiene nada que hacer: pararse del todo
+ * hasta que alguien le interrumpa. Lo despiertan su propio temporizador
+ * (cada 10 ms, como red de seguridad) y el toque de otro nucleo que le haya
+ * encontrado trabajo (al instante, que es lo normal). */
 void idle_loop(void)
 {
     for (;;) {
-        __asm__ volatile("wfe");
+        __asm__ volatile("wfi");
         schedule();
     }
 }
@@ -161,6 +192,7 @@ int task_create(const char *name, void (*fn)(void *), void *arg)
     t->ctx.sp  = stack + PAGE_SIZE;     /* la pila crece hacia abajo */
 
     t->state = TASK_READY;              /* ultimo: ya es elegible */
+    sched_kick_idle();                  /* y que alguien la coja ya */
 
     sched_unlock_irqrestore(flags);
     return (int)t->pid;
@@ -258,13 +290,21 @@ void scheduler_tick(void)
      * Que lo recorrieran los cuatro seria hacer cuatro veces el mismo
      * trabajo, y sobre una tabla que aun no tiene cerrojo. */
     if (this_core() == 0) {
-        /* Recorrer el array entero en cada tick es ineficiente; con muchos
-         * hilos se usaria una cola ordenada. */
-        uint64_t now = timer_ticks();
+        /* Con el cerrojo: los otros tres nucleos estan cambiando estados en
+         * esta misma tabla. Recorrerla entera en cada tick es ineficiente;
+         * con muchos hilos se usaria una cola ordenada. */
+        uint64_t flags = sched_lock_irqsave();
+        uint64_t now   = timer_ticks();
+        int      algun = 0;
+
         for (int i = 0; i < MAX_TASKS; i++) {
-            if (tasks[i].state == TASK_SLEEPING && now >= tasks[i].wake_tick)
+            if (tasks[i].state == TASK_SLEEPING && now >= tasks[i].wake_tick) {
                 tasks[i].state = TASK_READY;
+                algun = 1;
+            }
         }
+        if (algun) sched_kick_idle();
+        sched_unlock_irqrestore(flags);
     }
 
     /* Esto si es de cada nucleo: la contabilidad de SU hilo y SU turno. */
@@ -517,6 +557,17 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     const struct user_header *h = (const struct user_header *)image;
     if (!header_ok(h, size)) return -1;
 
+    /* Coger una ranura y soltar el cerrojo enseguida.
+     *
+     * Cargar un proceso es copiar paginas y construir tablas: milisegundos.
+     * Hacerlo con sched_lock cogido dejaria a los otros tres nucleos
+     * parados todo ese rato, y no hace falta: en cuanto la ranura esta
+     * reservada, nadie mas la va a tocar.
+     *
+     * TASK_BLOCKED es la reserva. No es UNUSED, asi que no se la lleva otro
+     * task_create; no es READY ni RUNNING, asi que el planificador no la
+     * elige; y no es ZOMBIE, asi que el recolector la ignora. El nombre se
+     * pone ya para que un sched_dump a destiempo no lea un puntero nulo. */
     uint64_t flags = sched_lock_irqsave();
     struct task *t = 0;
 
@@ -524,9 +575,21 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
         if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
     if (!t) { sched_unlock_irqrestore(flags); return -1; }
 
+    t->state     = TASK_BLOCKED;
+    t->name      = "(cargando)";
+    t->stack     = 0;
+    t->pgd       = 0;
+    t->ticks_run = 0;
+    sched_unlock_irqrestore(flags);
+
     uint64_t asid = 0;
     uint64_t *pgd = vmm_create_pgd(&asid);
-    if (!pgd) { sched_unlock_irqrestore(flags); return -1; }
+    if (!pgd) {
+        flags = sched_lock_irqsave();
+        t->state = TASK_UNUSED;          /* devolver la ranura */
+        sched_unlock_irqrestore(flags);
+        return -1;
+    }
 
     uint64_t kstack_pa = 0;
 
@@ -571,6 +634,10 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     uint64_t kstack = (uint64_t)phys_to_virt(kstack_pa);
     *(uint64_t *)kstack = STACK_MAGIC;
 
+    /* Y ahora si, publicar: el cerrojo vuelve solo para el momento en que
+     * esta tarea pasa a existir para los demas. */
+    flags = sched_lock_irqsave();
+
     t->stack     = kstack;
     t->pgd       = pgd;
     t->asid      = asid;
@@ -592,6 +659,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->ctx.sp = (uint64_t)tf;
 
     t->state = TASK_READY;
+    sched_kick_idle();
 
     sched_unlock_irqrestore(flags);
     return (int)t->pid;
@@ -601,6 +669,9 @@ fail:
      * de que existiera el recolector esto no se podia ni escribir. */
     if (kstack_pa) pmm_free(kstack_pa);
     vmm_destroy_pgd(pgd, asid);
+
+    flags = sched_lock_irqsave();
+    t->state = TASK_UNUSED;              /* y la ranura reservada */
     sched_unlock_irqrestore(flags);
     return -1;
 }
@@ -632,6 +703,7 @@ void sched_dump(void)
         struct task *t = &tasks[i];
         if (t->state == TASK_UNUSED) continue;
 
+        uint64_t lf = uart_begin();     /* la fila entera, de una pieza */
         uart_puts("  ");
         uart_dec(t->pid);
         uart_puts(t->pid < 10 ? "    " : "   ");
@@ -651,6 +723,7 @@ void sched_dump(void)
             uart_dec(t->asid);
         }
         uart_puts("\n");
+        uart_end(lf);
     }
     sched_unlock_irqrestore(flags);
 }

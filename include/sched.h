@@ -67,6 +67,13 @@ void sched_adopt_core(uint64_t core);   /* lo llama cada nucleo secundario */
 void sched_start_smp(void);             /* y esto abre el planificador a todos */
 void idle_loop(void);                   /* lo que hace un nucleo sin trabajo   */
 
+/* Avisar a un nucleo ocioso de que hay trabajo. Se llama con sched_lock
+ * cogido, justo despues de dejar alguna tarea lista. */
+void sched_kick_idle(void);
+
+/* Lo llama irq.c cuando llega el toque de otro nucleo. */
+void sched_wake_core(void);
+
 /* --- El cerrojo del planificador --------------------------------------
  * Uno solo, y grande: protege la tabla de tareas, sus estados, las colas de
  * espera de sync.c y los puertos de ipc.c. Partirlo en varios seria mas

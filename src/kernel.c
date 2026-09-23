@@ -81,6 +81,7 @@ static uint64_t bench_memory(void)
 
 static void show_translation(const char *what, uint64_t va)
 {
+    uint64_t lf = uart_begin();
     uart_puts("   ");
     uart_puts(what);
     uart_puts("  VA 0x");
@@ -90,6 +91,7 @@ static void show_translation(const char *what, uint64_t va)
     if (pa) uart_hex64(pa);
     else    uart_puts("(sin traduccion)");
     uart_puts("\n");
+    uart_end(lf);
 }
 
 static void mem_stats(void)
@@ -171,9 +173,15 @@ static struct mutex console;
 /* syscall.c tambien imprime, y tiene que compartir el mismo mutex. */
 struct mutex *console_mutex(void) { return &console; }
 
+/* El mutex serializa los HILOS; el uart_begin/end serializa los NUCLEOS.
+ * No es lo mismo ni sobra ninguno: dos hilos nunca entran a la vez aqui
+ * gracias al mutex, pero el kernel tambien escribe desde sitios que no son
+ * hilos -un manejador de interrupcion, por ejemplo- y contra eso el mutex
+ * no puede hacer nada. */
 static void say(const char *who, const char *what, uint64_t n)
 {
     mutex_lock(&console);
+    uint64_t f = uart_begin();
     uart_puts("    [");
     uart_puts(who);
     uart_puts("] ");
@@ -182,6 +190,7 @@ static void say(const char *who, const char *what, uint64_t n)
     uart_puts("   (tick ");
     uart_dec(timer_ticks());
     uart_puts(")\n");
+    uart_end(f);
     mutex_unlock(&console);
 }
 
@@ -454,11 +463,21 @@ static void command(char c)
         uart_dec(N * CORES);
         uart_puts("\n");
 
+        uint64_t r0 = smp_hammer(N, 0);
+        uint64_t lf = uart_begin();
         uart_puts("\n    sin cerrojo : ");
-        uart_dec(smp_hammer(N, 0));
-        uart_puts("\n    con cerrojo : ");
-        uart_dec(smp_hammer(N, 1));
+        smp_print_cores();
+        uart_dec(r0);
         uart_puts("\n");
+        uart_end(lf);
+
+        uint64_t r1 = smp_hammer(N, 1);
+        lf = uart_begin();
+        uart_puts("    con cerrojo : ");
+        smp_print_cores();
+        uart_dec(r1);
+        uart_puts("\n");
+        uart_end(lf);
         break;
     }
 
@@ -558,9 +577,17 @@ void kernel_main(uint64_t dtb_ptr)
      * traduccion en si no acelera nada, las caches lo son todo.
      * (En QEMU los dos numeros salen iguales porque no emula caches.) */
     uart_puts("\n  Midiendo la memoria con las caches APAGADAS...\n    ");
+
+    /* Las IRQ, tapadas durante TODO el tramo sin caches, y no solo durante
+     * la medida. Sin cache no hay instrucciones exclusivas, y sin ellas no
+     * hay spinlock: una interrupcion aqui acabaria en scheduler_tick()
+     * pidiendo el cerrojo del planificador, y ahi se quedaria. */
+    uint64_t bf = irq_save();
     caches_disable();
     uint64_t before = bench_memory();
     caches_enable();
+    irq_restore(bf);
+
     uart_dec(before);
     uart_puts(" us\n");
 
