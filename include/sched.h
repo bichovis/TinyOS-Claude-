@@ -38,6 +38,7 @@ struct task {
     uint64_t   *pgd;          /* tabla TTBR0 propia; 0 = hilo de kernel      */
     uint64_t    asid;         /* etiqueta de su TLB; 0 = hilo de kernel      */
     uint64_t    mmio_va;      /* MMIO concedido a un driver de EL0; 0 si no  */
+    uint64_t    stack_low;    /* la pagina de pila mas baja que ya existe    */
     uint64_t    brk_base;     /* donde acaba el ELF: el suelo del monton     */
     uint64_t    brk;          /* y hasta donde ha crecido                    */
     const char *name;
@@ -107,6 +108,11 @@ void task_sleep(uint64_t ticks);
 void task_exit(void);
 int  task_wait(uint64_t pid);    /* espera a que ese pid termine            */
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
+
+/* Un fallo de traduccion en EL0 puede no ser un error: si cae justo debajo
+ * de la pila, es que hace falta mas. Devuelve 1 si lo ha resuelto. */
+int  task_grow_stack(uint64_t direccion, uint64_t sp);
+uint64_t task_stack_pages(struct task *t);
 int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
 void sched_preempt(void);        /* lo llama irq_handle()                   */
 uint64_t sched_switches(void);   /* cambios de contexto totales             */

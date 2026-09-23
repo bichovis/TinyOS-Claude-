@@ -105,6 +105,7 @@
 #define USER_HEAP_MAX    0x0F000000UL      /* hasta donde puede crecer     */
 #define USER_MMIO_BASE   0x10000000UL      /* MMIO concedido a un driver   */
 #define USER_STACK_TOP   0x20000000UL      /* pila (crece hacia abajo)     */
+#define USER_STACK_MIN   0x1FF00000UL      /* ...hasta aqui: 1 MB de pila  */
 #define USER_LIMIT       0x40000000UL      /* nada de usuario por encima   */
 
 /* --- Gestor de memoria fisica (pmm.c) --------------------------------- */

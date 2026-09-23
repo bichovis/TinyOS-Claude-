@@ -452,6 +452,60 @@ static struct task *by_pid(uint64_t pid)
     return 0;
 }
 
+/* --- La pila que crece sola -------------------------------------------
+ *
+ * Hasta aqui, TODO fallo de traduccion en un proceso significaba lo mismo:
+ * "ha tocado donde no debia, se muere". Esto cambia esa lectura. Un fallo
+ * justo debajo de la pila no es un error, es una PETICION: el proceso
+ * necesita mas sitio y la forma de pedirlo es usarlo.
+ *
+ * Ese cambio de interpretacion es el corazon de la memoria virtual
+ * moderna. De aqui salen el mmap, el copy-on-write y el fork: en los tres,
+ * el fallo de pagina deja de ser un accidente y pasa a ser el mecanismo.
+ *
+ * La comprobacion clave es la del puntero de pila. Una pagina se da si la
+ * direccion tocada esta POR ENCIMA del SP del proceso: asi es como se ve
+ * una pila que crece de verdad, porque el compilador baja SP primero y
+ * escribe despues. Un puntero salvaje que apunte mucho mas abajo sigue
+ * siendo mortal, que es lo que tiene que ser.
+ */
+int task_grow_stack(uint64_t direccion, uint64_t sp)
+{
+    struct task *t = current;
+    if (!t || !t->pgd) return 0;
+
+    uint64_t pag = direccion & ~(uint64_t)(PAGE_SIZE - 1);
+
+    /* ¿Cae en la ventana donde la pila puede crecer? */
+    if (pag >= t->stack_low)        return 0;   /* ya estaba mapeada */
+    if (pag < USER_STACK_MIN)       return 0;   /* se ha pasado del limite */
+    if (direccion >= USER_STACK_TOP) return 0;
+
+    /* ¿Y parece una pila, o es un puntero perdido? Se deja un margen
+     * pequeño por si el compilador escribe algo antes de terminar de bajar
+     * el SP, pero nada de barra libre. */
+    if (direccion + 128 < sp) return 0;
+
+    /* Mapear desde donde ya habia hasta donde hace falta. */
+    for (uint64_t va = t->stack_low - PAGE_SIZE; va >= pag; va -= PAGE_SIZE) {
+        uint64_t pa = pmm_alloc();
+        if (!pa) return 0;
+        if (vmm_map_in(t->pgd, va, pa, MM_USER_DATA) < 0) {
+            pmm_free(pa);
+            return 0;
+        }
+        t->stack_low = va;
+        if (va == pag) break;
+    }
+    return 1;
+}
+
+/* Cuantas paginas de pila tiene ahora mismo. */
+uint64_t task_stack_pages(struct task *t)
+{
+    return (USER_STACK_TOP - t->stack_low) / PAGE_SIZE;
+}
+
 /* --- El monton de un proceso -----------------------------------------
  *
  * 'brk' es el tope: la primera direccion que el proceso todavia NO tiene.
@@ -859,6 +913,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->asid      = asid;
     t->brk_base  = tope;
     t->brk       = tope;
+    t->stack_low = USER_STACK_TOP - PAGE_SIZE;
     if (name) t->name = name;
     else      nombre_de_args(t, args);
     t->pid       = next_pid++;
@@ -941,6 +996,9 @@ void sched_dump(void)
         if (t->pgd) {
             uart_puts("   EL0 asid ");
             uart_dec(t->asid);
+            uart_puts("  pila ");
+            uart_dec(task_stack_pages(t));
+            uart_puts("p");
         }
         uart_puts("\n");
         uart_end(lf);

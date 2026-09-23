@@ -75,6 +75,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 18   | Escritura en FAT16                          | hecho  |
 | 19   | kmalloc: el monton del kernel               | hecho  |
 | 20   | Memoria para los procesos: sbrk y malloc    | hecho  |
+| 21   | Paginacion bajo demanda: la pila crece sola | hecho  |
 
 ## Estructura
 
@@ -98,6 +99,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  write.c     escribe un fichero      rm.c  lo borra
                  cp.c        copia uno en otro       mem.c  ensenya el monton
                  umalloc.c   malloc/free de usuario, encima de sbrk
+                 deep.c      recursion honda: se come la pila a proposito
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -735,6 +737,61 @@ chocaba con ella en seguida. Ahora:
 Los 256 MB de abismo entre el monton y la pila son a proposito: que crezcan
 el uno contra el otro y se toquen es un error clasico.
 
+## El fallo de pagina deja de ser un error
+
+Hasta aqui, TODO fallo de traduccion en un proceso significaba lo mismo:
+*ha tocado donde no debia, se muere*. La pila era una pagina fija de 4 KB y
+cualquier recursion decente la desbordaba en silencio, escribiendo encima
+de lo que hubiera debajo.
+
+Esto cambia esa lectura. Un fallo justo debajo de la pila no es un error,
+es una **peticion**: el proceso necesita mas sitio y la forma de pedirlo es
+usarlo. El kernel le da una pagina y **reintenta la instruccion**; el
+proceso no se entera de nada.
+
+Ese cambio de interpretacion es el corazon de la memoria virtual moderna.
+De aqui salen `mmap`, el copy-on-write y el `fork`: en los tres, el fallo
+de pagina deja de ser un accidente y pasa a ser el mecanismo.
+
+    $ deep 300
+      pila al empezar : 536870864
+      [kernel] la pila de deep crece a 2 paginas
+      ...
+      se ha comido    : 155 KB
+      y he vuelto entero
+
+La comprobacion clave es la del **puntero de pila**. Se da una pagina si la
+direccion tocada esta por encima del SP del proceso, que es como se ve una
+pila creciendo de verdad: el compilador baja SP primero y escribe despues.
+Un puntero perdido que apunte mucho mas abajo sigue siendo mortal, y eso es
+lo que tiene que ser:
+
+    $ deep 5000
+      Detalle : Fallo de traduccion (pagina no mapeada) (escritura)
+      Direccion (FAR_EL1) : 0x000000001FEFFFA0
+      [kernel] el proceso deep ha violado la ley. Lo mato y sigo.
+
+Esa direccion cae justo por debajo de `USER_STACK_MIN`. El limite es de
+1 MB, se respeta, y pasarse sigue siendo fatal — solo que ahora el limite
+es de un megabyte y no de cuatro kilobytes.
+
+Tampoco entra aqui un fallo de **permisos**: escribir en el propio codigo
+sigue siendo una violacion y no una peticion. Lo distingue el ISS de
+`ESR_EL1`, donde los fallos de traduccion son `0b0001xx`.
+
+### El compilador casi arruina la prueba
+
+La primera version de `deep.c` no gastaba pila: escribia su buffer local,
+llamaba, y no volvia a mirarlo. Al compilador le basto con eso para ver que
+el buffer estaba muerto durante la llamada, reaprovechar el mismo sitio en
+todos los niveles y **convertir la recursion en un bucle**. Cuarenta
+niveles, medio kilobyte de pila en total, y una prueba que decia que todo
+iba bien sin haber probado nada.
+
+Para que un nivel conserve su marco, el marco tiene que seguir haciendo
+falta cuando vuelve la llamada. Es un recordatorio util: una prueba que no
+falla cuando deberia no esta midiendo lo que crees.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -768,6 +825,13 @@ el uno contra el otro y se toquen es un error clasico.
 - `pmm_alloc_contig()` busca n paginas seguidas recorriendo el bitmap, asi
   que se vuelve lenta si la memoria se fragmenta. Cuando duela, lo que hay
   que traer es un asignador por compañeros ("buddy").
+- La pila de KERNEL de cada proceso sigue siendo una pagina fija, y ahi un
+  desbordamiento no es un fallo de pagina limpio sino corrupcion silenciosa
+  de la tarea de al lado. El `STACK_MAGIC` del paso 5 lo detecta DESPUES.
+  Una pagina de guarda sin mapear debajo lo convertiria en un fallo
+  inmediato y localizado.
+- El monton de un proceso se mapea entero al pedirlo: `sbrk` es ansioso.
+  Podria ser perezoso como la pila, y dar las paginas segun se tocaran.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
   en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
   carga no hay nada que priorizar.

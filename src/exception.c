@@ -185,6 +185,37 @@ void exception_dispatch(struct trap_frame *f, uint64_t index)
         return;
     }
 
+    /* Fallo de traduccion en un proceso, justo debajo de su pila: no es un
+     * error, es que necesita mas sitio. Se le da y se REINTENTA la
+     * instruccion, sin que el proceso llegue a enterarse de nada.
+     *
+     * EC 0x24 es un data abort desde EL0, y los codigos 0b0001xx del ISS
+     * son "fallo de traduccion" (el nivel va en los dos bits de abajo).
+     * Un fallo de PERMISOS no entra aqui: ese si es una violacion. */
+    if (index == 8) {
+        uint64_t ec  = (f->esr >> 26) & 0x3F;
+        uint64_t iss = f->esr & 0x3F;
+
+        if (ec == 0x24 && (iss & 0x3C) == 0x04) {
+            if (task_grow_stack(read_far(), f->sp_el0)) {
+                /* Solo se cuentan las primeras. Un programa que se come un
+                 * megabyte de pila no necesita doscientas cincuenta lineas
+                 * diciendoselo: necesita ver el fallo del final. */
+                uint64_t pags = task_stack_pages(current);
+                if (pags <= 8) {
+                    uint64_t lf = uart_begin();
+                    uart_puts("  [kernel] la pila de ");
+                    uart_puts(current->name);
+                    uart_puts(" crece a ");
+                    uart_dec(pags);
+                    uart_puts(" paginas\n");
+                    uart_end(lf);
+                }
+                return;                      /* a reintentar la instruccion */
+            }
+        }
+    }
+
     /* Fallo dentro de un proceso de usuario: culpa suya, no nuestra. */
     if (index == 8 || index == 12) {
         dump(f, index);
