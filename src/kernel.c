@@ -365,6 +365,22 @@ static void prueba_monton(void)
     uart_puts(huecos <= 2 ? "   <- fundidos\n" : "   <- picado\n");
 }
 
+/* Que cada nivel conserve su marco: si el buffer muriera antes de la
+ * llamada, el compilador reutilizaria el sitio y esto seria un bucle. Es
+ * la misma trampa que casi arruina user/deep.c. */
+__attribute__((noinline))
+static uint64_t hundirse(uint64_t n)
+{
+    volatile char relleno[256];
+    relleno[0]   = (char)n;
+    relleno[255] = (char)(n + 1);
+
+    if (n == 0) return (uint64_t)relleno[0];
+
+    uint64_t r = hundirse(n - 1);
+    return r + (uint64_t)relleno[255];
+}
+
 static void say(const char *who, const char *what, uint64_t n)
 {
     if (!verboso) return;
@@ -577,6 +593,7 @@ static void menu(void)
     uart_puts("  t - tiempo e interrupciones\n");
     uart_puts("  h - ayuda\n");
     uart_puts("  4 - direccion invalida (FATAL: data abort)\n");
+    uart_puts("  5 - desbordar la pila del kernel (FATAL: pagina de guarda)\n");
     uart_puts("  resto: eco\n");
 }
 
@@ -776,6 +793,15 @@ static void command(char c)
 
     case 'h':
         menu();
+        break;
+
+    /* Hundirse a proposito en la pila del kernel, para ver que la pagina
+     * de guarda lo caza. Sin ella esto seria una escritura silenciosa
+     * encima de la tarea de al lado. */
+    case '5':
+        uart_puts("\n  Bajando por la pila del kernel hasta pasarme...\n");
+        hundirse(10000);
+        uart_puts("  (no deberia llegar aqui)\n");
         break;
 
     case '4': {

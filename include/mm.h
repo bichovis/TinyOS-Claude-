@@ -38,6 +38,25 @@
  *   - TTBR0 queda entero para el usuario, que ya no empieza en 2 GB      */
 #define KERNEL_VA_BASE   0xFFFFFF8000000000UL
 
+/* --- Zona de pilas de kernel ------------------------------------------
+ *
+ * Las pilas de kernel NO pueden vivir en el mapa lineal, y el motivo es
+ * geometrico: ese mapa esta hecho de bloques de 2 MB, y dentro de un
+ * bloque no se puede dejar un hueco de 4 KB. Y un hueco es justo lo que
+ * hace falta.
+ *
+ * Aqui cada tarea tiene dos paginas de espacio virtual: la de abajo se
+ * queda SIN MAPEAR -es la pagina de guarda- y la de arriba es la pila de
+ * verdad. Desbordar la pila deja de ser escribir en silencio encima de la
+ * tarea de al lado y pasa a ser un fallo de traduccion inmediato, en la
+ * instruccion exacta que se paso.
+ *
+ * Esta en el indice L1 numero 4, muy lejos del mapa lineal (que ocupa el
+ * 0 y el 1) y de la ventana de pruebas de kernel.c (el 3).
+ */
+#define KSTACK_AREA      (KERNEL_VA_BASE + 0x100000000UL)
+#define KSTACK_SLOT      (2 * PAGE_SIZE)   /* guarda + pila */
+
 /* --- Indices dentro de MAIR_EL1 ---------------------------------------
  * MAIR es una tabla de 8 "tipos de memoria". Cada descriptor de pagina no
  * lleva los atributos, lleva un INDICE de 3 bits a esta tabla. */
@@ -135,6 +154,7 @@ void  kheap_stats(uint64_t *total, uint64_t *usado,
 void     caches_disable(void);        /* apaga D+I (para medir)             */
 void     caches_enable(void);         /* y las vuelve a encender            */
 int      vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags);
+int      vmm_unmap_page(uint64_t va);   /* en el espacio del kernel        */
 uint64_t vmm_translate(uint64_t va);  /* pregunta al hardware: VA -> PA      */
 
 /* --- Espacios de direcciones por proceso ------------------------------- */

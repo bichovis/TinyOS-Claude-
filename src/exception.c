@@ -13,6 +13,7 @@
 #include "irq.h"
 #include "syscall.h"
 #include "sched.h"
+#include "mm.h"
 
 extern char vector_table[];   /* definido en vectors.S */
 
@@ -224,6 +225,32 @@ void exception_dispatch(struct trap_frame *f, uint64_t index)
         uart_puts(" ha violado la ley. Lo mato y sigo.\n");
         task_exit();
         return;
+    }
+
+    /* ¿Ha muerto el kernel pisando una pagina de guarda? Entonces no es
+     * "una excepcion cualquiera": es que una pila de kernel se ha
+     * desbordado, y decirlo cambia por completo el tiempo que cuesta
+     * arreglarlo. Sin la guarda, esto mismo habria sido una escritura
+     * silenciosa encima de la tarea de al lado, y el sistema habria
+     * fallado mucho despues y en otro sitio. */
+    uint64_t far = read_far();
+    if (far >= KSTACK_AREA && far < KSTACK_AREA + MAX_TASKS * KSTACK_SLOT &&
+        (far - KSTACK_AREA) % KSTACK_SLOT < PAGE_SIZE) {
+
+        uint64_t ranura = (far - KSTACK_AREA) / KSTACK_SLOT;
+
+        uart_puts("\n  ############  PILA DE KERNEL DESBORDADA  ############\n");
+        uart_puts("  La tarea de la ranura ");
+        uart_dec(ranura);
+        uart_puts(" (");
+        uart_puts(current ? current->name : "?");
+        uart_puts(") se ha salido de su pila\n");
+        uart_puts("  y ha tocado su pagina de guarda, en 0x");
+        uart_hex64(far);
+        uart_puts(".\n  Sin esa pagina, esto habria sido una escritura"
+                  " silenciosa encima de\n  otra tarea.\n");
+        dump(f, index);
+        panic("desbordamiento de pila de kernel");
     }
 
     dump(f, index);

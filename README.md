@@ -76,6 +76,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 19   | kmalloc: el monton del kernel               | hecho  |
 | 20   | Memoria para los procesos: sbrk y malloc    | hecho  |
 | 21   | Paginacion bajo demanda: la pila crece sola | hecho  |
+| 22   | Pagina de guarda en las pilas de kernel     | hecho  |
 
 ## Estructura
 
@@ -792,6 +793,43 @@ Para que un nivel conserve su marco, el marco tiene que seguir haciendo
 falta cuando vuelve la llamada. Es un recordatorio util: una prueba que no
 falla cuando deberia no esta midiendo lo que crees.
 
+## La pagina de guarda
+
+La pila de usuario ya crece sola. La de KERNEL no podia: es una pagina
+fija, y desbordarla no daba ningun fallo — daba una escritura silenciosa
+encima de la tarea de al lado, que reventaba mucho despues y en otro sitio.
+El `STACK_MAGIC` del paso 5 lo detectaba, pero *a posteriori* y solo si a
+alguien se le ocurria mirar.
+
+La solucion es dejar un hueco debajo. Y ahi aparece un problema geometrico
+que no se ve venir: **las pilas de kernel vivian en el mapa lineal, que
+esta hecho de bloques de 2 MB**, y dentro de un bloque no se puede dejar un
+hueco de 4 KB.
+
+Asi que se mudan a su propia zona del espacio del kernel, mapeada pagina a
+pagina, con dos paginas de espacio virtual por tarea:
+
+    KSTACK_AREA + ranura*8K        la pagina de guarda, SIN MAPEAR
+    KSTACK_AREA + ranura*8K + 4K   la pila de verdad
+
+La ranura de la tarea decide donde cae la suya, asi que no hay nada que
+apuntar: la tarea 7 siempre tiene la suya en el mismo sitio.
+
+El resultado, con el comando `5`:
+
+    ############  PILA DE KERNEL DESBORDADA  ############
+    La tarea de la ranura 8 (shell) se ha salido de su pila
+    y ha tocado su pagina de guarda, en 0xFFFFFF8100010000.
+
+Con el nombre de la tarea, la direccion exacta, y el `ELR_EL1` apuntando a
+la instruccion que se paso. La diferencia con antes no es que ahora falle:
+es que antes **no** fallaba, y el sistema seguia andando con una tarea
+corrompida.
+
+El `STACK_MAGIC` sigue ahi, pero ha cambiado de papel: era el unico aviso y
+ahora es la segunda red, para el caso de que alguien salte por encima de la
+guarda de un brinco largo.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -825,11 +863,10 @@ falla cuando deberia no esta midiendo lo que crees.
 - `pmm_alloc_contig()` busca n paginas seguidas recorriendo el bitmap, asi
   que se vuelve lenta si la memoria se fragmenta. Cuando duela, lo que hay
   que traer es un asignador por compañeros ("buddy").
-- La pila de KERNEL de cada proceso sigue siendo una pagina fija, y ahi un
-  desbordamiento no es un fallo de pagina limpio sino corrupcion silenciosa
-  de la tarea de al lado. El `STACK_MAGIC` del paso 5 lo detecta DESPUES.
-  Una pagina de guarda sin mapear debajo lo convertiria en un fallo
-  inmediato y localizado.
+- La pila de kernel sigue siendo de una pagina: ahora un desbordamiento se
+  caza al instante, pero se caza. Darle mas de una pagina es cambiar un
+  numero; darle paginacion bajo demanda como a la de usuario es mas
+  delicado, porque el fallo llegaria estando ya dentro del kernel.
 - El monton de un proceso se mapea entero al pedirlo: `sbrk` es ansioso.
   Podria ser perezoso como la pila, y dar las paginas segun se tocaran.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta

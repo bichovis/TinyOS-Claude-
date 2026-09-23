@@ -122,6 +122,35 @@ void sched_start_smp(void)
 }
 static uint64_t switches;        /* cambios de contexto totales */
 
+/* --- Pilas de kernel con pagina de guarda ----------------------------
+ *
+ * La ranura de la tarea decide donde cae su pila, asi que no hace falta
+ * llevar ninguna cuenta: la tarea 7 siempre tiene la suya en el mismo
+ * sitio, con su guarda debajo.
+ *
+ * Devuelve la BASE de la pila (la direccion mas baja utilizable). El tope,
+ * que es lo que va en SP, es base + PAGE_SIZE. */
+static uint64_t kstack_alloc(int ranura)
+{
+    uint64_t guarda = KSTACK_AREA + (uint64_t)ranura * KSTACK_SLOT;
+    uint64_t base   = guarda + PAGE_SIZE;
+
+    uint64_t pa = pmm_alloc();
+    if (!pa) return 0;
+
+    if (vmm_map_page(base, pa, MM_RAM_RW) < 0) {
+        pmm_free(pa);
+        return 0;
+    }
+    return base;
+}
+
+static void kstack_free(int ranura)
+{
+    uint64_t base = KSTACK_AREA + (uint64_t)ranura * KSTACK_SLOT + PAGE_SIZE;
+    vmm_unmap_page(base);            /* y devuelve la pagina fisica */
+}
+
 static const char *idle_names[CORES] = { "idle0", "idle1", "idle2", "idle3" };
 
 /* Adoptar el contexto en el que ya esta este nucleo como su tarea idle. No
@@ -163,12 +192,8 @@ int task_create(const char *name, void (*fn)(void *), void *arg)
     }
     if (!t) { sched_unlock_irqrestore(flags); return -1; }
 
-    uint64_t stack_pa = pmm_alloc();    /* 4 KB de pila por hilo */
-    if (!stack_pa) { sched_unlock_irqrestore(flags); return -1; }
-
-    /* pmm_alloc habla en fisico; el hilo va a usar la pila de verdad, asi
-     * que lo que se guarda es la direccion por la que el kernel la ve. */
-    uint64_t stack = (uint64_t)phys_to_virt(stack_pa);
+    uint64_t stack = kstack_alloc((int)(t - tasks));   /* con su guarda */
+    if (!stack) { sched_unlock_irqrestore(flags); return -1; }
 
     /* Marca al fondo de la pila para detectar desbordamientos. Un hilo que
      * se pasa de pila no da ningun error: pisa silenciosamente lo que haya
@@ -394,10 +419,10 @@ static void reap(struct task *t)
     if (t->pgd)
         vmm_destroy_pgd(t->pgd, t->asid);
 
-    /* Y su pila. t->stack guarda la direccion del mapa lineal, asi que hay
-     * que bajarla a fisico para devolversela al gestor de paginas. */
+    /* Y su pila, que vive en la zona de pilas y no en el mapa lineal: se
+     * quita del mapa del kernel y la pagina fisica vuelve sola. */
     if (t->stack)
-        pmm_free(virt_to_phys((void *)t->stack));
+        kstack_free((int)(t - tasks));
 
     t->pgd     = 0;
     t->asid    = 0;
@@ -869,7 +894,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
         return -1;
     }
 
-    uint64_t kstack_pa = 0;
+    uint64_t kstack    = 0;
     uint64_t entry     = 0;
     uint64_t tope      = USER_BASE;
 
@@ -899,9 +924,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     }
 
     /* --- Pila de kernel: donde se guardara su contexto en cada syscall --- */
-    kstack_pa = pmm_alloc();
-    if (!kstack_pa) goto fail;
-    uint64_t kstack = (uint64_t)phys_to_virt(kstack_pa);
+    kstack = kstack_alloc((int)(t - tasks));
+    if (!kstack) goto fail;
     *(uint64_t *)kstack = STACK_MAGIC;
 
     /* Y ahora si, publicar: el cerrojo vuelve solo para el momento en que
@@ -942,7 +966,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
 
 fail:
     /* Media carga es peor que ninguna: se devuelve todo lo repartido. */
-    if (kstack_pa) pmm_free(kstack_pa);
+    if (kstack) kstack_free((int)(t - tasks));
     vmm_destroy_pgd(pgd, asid);
 
     flags = sched_lock_irqsave();

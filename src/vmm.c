@@ -124,6 +124,11 @@ int vmm_map_page(uint64_t va, uint64_t pa, uint64_t flags)
     return vmm_map_in(l1_table, va, pa, flags);
 }
 
+int vmm_unmap_page(uint64_t va)
+{
+    return vmm_unmap_in(l1_table, va);
+}
+
 uint64_t *vmm_empty_pgd(void) { return empty_pgd; }
 
 /* --- ASIDs: etiquetar la TLB -------------------------------------------
