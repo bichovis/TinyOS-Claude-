@@ -103,6 +103,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 46   | Memoria anonima, y el ultimo programa sin IPC| hecho |
 | 47   | La libc crece: setjmp, qsort, strtol        | hecho  |
 | 48   | errno, o hacer que el kernel diga por que   | hecho  |
+| 49   | Ficheros con buffer: FILE, fopen, fprintf   | hecho  |
 
 ## Estructura
 
@@ -3615,13 +3616,12 @@ caracter contesta 512.
   sin el y publica con el otra vez.)
 - El shell no tiene historial, ni segundo plano, ni tuberias de mas de dos,
   ni `>>`: lee, carga, arranca y espera.
-- La libc no tiene ficheros con buffer (`FILE`, `fopen`): se trabaja con
-  descriptores. Es lo siguiente que hace falta.
 - `strtol` sigue sin detectar desbordamiento, aunque ya hay `ERANGE` donde
   ponerlo.
 - `errno` es una variable global y no una por hilo. Con un solo hilo por
-  proceso da igual; el dia que haya hilos dentro de un proceso, no. `printf` entiende banderas, anchura, precision
-  y `l`, pero no notacion exponencial (`%e`, `%g`) ni `long double`.
+  proceso da igual; el dia que haya hilos dentro de un proceso, no.
+- `printf` entiende banderas, anchura, precision y `l`, pero no notacion
+  exponencial (`%e`, `%g`) ni `long double`.
 - El cambio de contexto de FP es perezoso solo al restaurar. Al salir se
   salva siempre, porque con cuatro nucleos dejar el estado vivo en los
   registros de otro nucleo exigiria IPIs (ver "Coma flotante").
@@ -3629,10 +3629,16 @@ caracter contesta 512.
   de respuesta y las respuestas no dicen a quien pertenecen, asi que un
   mutex las serializa. La tarjeta es un solo dispositivo de todas formas,
   pero el limite es del mecanismo, no del hardware.
-- Un descriptor de fichero no comparte el desplazamiento entre padre e
-  hijo. En Unix `fork` duplica el descriptor y los dos avanzan el MISMO
-  offset; aqui `file_dup` solo sube el contador y el offset es de la
-  estructura, asi que dos procesos que escriban en el mismo fd se pisan.
+- Padre e hijo si comparten el desplazamiento -`fork` comparte la propia
+  `struct fichero`, que es la descripcion de fichero abierta de Unix-, pero
+  avanzarlo no es indivisible: `fichero_write` lee `f->off`, manda la
+  peticion al servidor y luego lo suma. Dos procesos escribiendo a la vez
+  en el mismo descriptor desde dos nucleos pueden colarse en medio y caer
+  encima de los mismos bytes. Un Unix de verdad tiene un cerrojo por
+  fichero abierto alrededor de los tres pasos.
+- No hay `O_APPEND`, que es lo que hace que dos escritores a la vez no se
+  pisen aunque no se hablen: el desplazamiento se coloca al final DENTRO de
+  la operacion, no antes. Sin el no hay `>>` que valga.
 - El buffer de teclas se queda en el kernel aunque el driver este fuera.
   Es deliberado (ver "El teclado, tambien en EL0"), pero significa que el
   kernel sigue sabiendo que es una consola.
