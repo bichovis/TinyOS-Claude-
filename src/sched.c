@@ -20,6 +20,7 @@
 #include "ipc.h"
 #include "user_abi.h"
 #include "smp.h"
+#include "spinlock.h"
 
 /* Definidos en switch.S */
 void cpu_switch_to(struct task *prev, struct task *next);
@@ -41,11 +42,53 @@ static uint64_t    next_pid = CORES;
  * nada de lo que esta haciendo el 3. */
 static volatile int need_resched[CORES];
 
-/* Los nucleos 1-3 ya reciben su tick y llevan su contabilidad, pero
- * todavia NO planifican: el planificador no es seguro entre nucleos hasta
- * que tenga su cerrojo, y eso es el paso siguiente. Mientras tanto, cada
- * uno se queda en su tarea idle. */
+/* Los cuatro nucleos planifican en cuanto esto vale 1, que es cuando el
+ * nucleo 0 ha terminado de montar el sistema. */
 static volatile int smp_sched_ready;
+
+/* El cerrojo de todo lo de aqui, y tambien de sync.c y de ipc.c. */
+static struct spinlock sched_lock = SPINLOCK("sched");
+
+uint64_t sched_lock_irqsave(void)
+{
+    return spin_lock_irqsave(&sched_lock);
+}
+
+void sched_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock_irqrestore(&sched_lock, flags);
+}
+
+void sched_unlock_new_task(void)
+{
+    spin_unlock(&sched_lock);
+}
+
+/* Lo que hace un nucleo cuando no tiene nada que hacer.
+ *
+ * 'wfe' y no 'wfi', y la diferencia es todo el reparto de trabajo: wfi solo
+ * despierta con una interrupcion, o sea que un nucleo ocioso tardaria hasta
+ * un tick entero en enterarse de que hay una tarea lista. wfe despierta
+ * ademas con 'sev', y resulta que spin_unlock() ya hace 'sev' — asi que
+ * cada vez que alguien suelta el cerrojo del planificador, y eso incluye
+ * cada vez que una tarea pasa a lista, los nucleos ociosos se despiertan
+ * solos y van a buscar trabajo.
+ *
+ * Un 'sev' de mas solo cuesta una vuelta de este bucle sin encontrar nada.
+ * Un 'sev' de menos cuesta 10 ms de un nucleo parado. */
+void idle_loop(void)
+{
+    for (;;) {
+        __asm__ volatile("wfe");
+        schedule();
+    }
+}
+
+void sched_start_smp(void)
+{
+    smp_sched_ready = 1;
+    __asm__ volatile("dsb sy\n sev" ::: "memory");
+}
 static uint64_t switches;        /* cambios de contexto totales */
 
 static const char *idle_names[CORES] = { "idle0", "idle1", "idle2", "idle3" };
@@ -81,16 +124,16 @@ void sched_init(void)
 
 int task_create(const char *name, void (*fn)(void *), void *arg)
 {
-    uint64_t flags = irq_save();
+    uint64_t flags = sched_lock_irqsave();
     struct task *t = 0;
 
     for (int i = CORES; i < MAX_TASKS; i++) {
         if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
     }
-    if (!t) { irq_restore(flags); return -1; }
+    if (!t) { sched_unlock_irqrestore(flags); return -1; }
 
     uint64_t stack_pa = pmm_alloc();    /* 4 KB de pila por hilo */
-    if (!stack_pa) { irq_restore(flags); return -1; }
+    if (!stack_pa) { sched_unlock_irqrestore(flags); return -1; }
 
     /* pmm_alloc habla en fisico; el hilo va a usar la pila de verdad, asi
      * que lo que se guarda es la direccion por la que el kernel la ve. */
@@ -119,7 +162,7 @@ int task_create(const char *name, void (*fn)(void *), void *arg)
 
     t->state = TASK_READY;              /* ultimo: ya es elegible */
 
-    irq_restore(flags);
+    sched_unlock_irqrestore(flags);
     return (int)t->pid;
 }
 
@@ -153,11 +196,30 @@ static struct task *pick_next(void)
     return &tasks[this_core()];
 }
 
-void schedule(void)
+/* El nucleo del planificador. Se entra CON el cerrojo cogido y se sale con
+ * el cogido... pero no necesariamente en manos del mismo hilo.
+ *
+ * Eso es lo mas raro de este fichero, asi que despacio: el cerrojo NO se
+ * suelta al cambiar de contexto, SE PASA DE MANO. Lo cierra el hilo que
+ * sale y lo abre el hilo que entra, cuando llegue a su propio
+ * sched_unlock_irqrestore() -el de la llamada a schedule() en la que a el
+ * lo desalojaron, hace quiza mucho rato-. Durante todo el cambio nadie mas
+ * puede mirar la tabla de tareas, que es exactamente lo que hace falta:
+ * mientras se cambia, el estado esta a medias.
+ *
+ * Un cerrojo que cierra uno y abre otro suena a error. Es al reves: es lo
+ * unico que funciona. Soltarlo antes del cambio dejaria la tabla a medias a
+ * la vista de los otros tres nucleos, y soltarlo despues es imposible,
+ * porque despues ya no somos nosotros.
+ *
+ * El unico que no tiene marco donde soltarlo es un hilo recien nacido, que
+ * nunca ha pasado por aqui. De ese se encargan ret_from_fork (switch.S) y
+ * ret_to_user (vectors.S) llamando a sched_unlock_new_task().
+ */
+void schedule_locked(void)
 {
-    uint64_t flags = irq_save();
-
     need_resched[this_core()] = 0;
+
     struct task *prev = current;
     struct task *next = pick_next();
 
@@ -172,17 +234,22 @@ void schedule(void)
         /* Cambiar de espacio de direcciones: una escritura a TTBR0 con la
          * tabla y el ASID juntos, sin tocar la TLB. Un hilo de kernel no
          * tiene espacio de usuario, asi que recibe la tabla vacia y el
-         * ASID 0: cualquier acceso suyo a direcciones bajas sera una
-         * excepcion y no un desastre silencioso. */
+         * ASID 0. */
         vmm_switch_to(next->pgd ? next->pgd : vmm_empty_pgd(), next->asid);
 
         cpu_switch_to(prev, next);
-        /* --- Cuando la ejecucion vuelve a esta linea, han podido pasar
-         * horas y haber corrido veinte hilos. Estamos otra vez en 'prev',
-         * y 'flags' se lee de SU pila, no de la de nadie mas. --- */
+        /* --- Cuando la ejecucion vuelve a esta linea han podido pasar
+         * horas y haber corrido veinte hilos en cuatro nucleos. Somos otra
+         * vez 'prev', y el cerrojo nos lo ha dejado cogido quien nos acaba
+         * de devolver la CPU. --- */
     }
+}
 
-    irq_restore(flags);
+void schedule(void)
+{
+    uint64_t flags = sched_lock_irqsave();
+    schedule_locked();
+    sched_unlock_irqrestore(flags);
 }
 
 void scheduler_tick(void)
@@ -203,6 +270,16 @@ void scheduler_tick(void)
     /* Esto si es de cada nucleo: la contabilidad de SU hilo y SU turno. */
     if (!current) return;
     current->ticks_run++;
+
+    /* Una tarea idle no tiene turno que agotar: en cuanto llega un tick,
+     * mira si hay trabajo. Un nucleo ocioso que esperase su quantum entero
+     * tardaria 50 ms en enterarse de que hay algo que hacer, con los otros
+     * tres a tope. (Lo instantaneo seria un IPI: avisar al nucleo ocioso en
+     * el momento en que aparece una tarea lista. Eso es el paso siguiente.) */
+    if (current->pid < CORES) {
+        need_resched[this_core()] = 1;
+        return;
+    }
 
     if (current->counter > 0)
         current->counter--;
@@ -234,11 +311,14 @@ void task_yield(void)
 
 void task_sleep(uint64_t ticks)
 {
-    uint64_t flags = irq_save();
+    /* Marcarse dormido y dormirse de verdad, sin soltar el cerrojo entre
+     * una cosa y otra: si lo soltaramos, otro nucleo podria despertarnos en
+     * ese hueco y nos dormiriamos despues del despertador. */
+    uint64_t flags = sched_lock_irqsave();
     current->wake_tick = timer_ticks() + ticks;
     current->state     = TASK_SLEEPING;
-    irq_restore(flags);
-    schedule();                 /* no volvera hasta que alguien nos despierte */
+    schedule_locked();
+    sched_unlock_irqrestore(flags);
 }
 
 /* ====================== EL RECOLECTOR ==============================
@@ -290,7 +370,7 @@ static void thread_reaper(void *arg)
     (void)arg;
 
     for (;;) {
-        uint64_t flags = irq_save();
+        uint64_t flags = sched_lock_irqsave();
 
         struct task *dead = 0;
         for (int i = CORES; i < MAX_TASKS; i++)
@@ -302,10 +382,10 @@ static void thread_reaper(void *arg)
              * aviso llegaria antes de que estuvieramos en la cola. Nos
              * dormiriamos despues del despertador. */
             wq_wait(&reaper_wq);
-            irq_restore(flags);
+            sched_unlock_irqrestore(flags);
             continue;
         }
-        irq_restore(flags);
+        sched_unlock_irqrestore(flags);
 
         /* Fuera de la seccion critica: destruir un espacio de direcciones
          * recorre miles de entradas y no es plan de hacerlo con las
@@ -319,7 +399,8 @@ uint64_t sched_reaped(void) { return reaped; }
 
 void task_exit(void)
 {
-    uint64_t flags = irq_save();
+    uint64_t flags = sched_lock_irqsave();
+    (void)flags;                 /* este cerrojo no lo soltamos nosotros */
     current->state = TASK_ZOMBIE;
     /* Si era un servidor, sus puertos mueren con el. Hay que despertar a
      * quien estuviera esperando o se quedaria bloqueado para siempre
@@ -329,10 +410,13 @@ void task_exit(void)
     /* Avisar a quien nos tiene que enterrar. Lo unico que hace es ponerlo
      * listo; no corre hasta que soltemos la CPU en el schedule() de abajo. */
     wq_wake_one(&reaper_wq);
-    irq_restore(flags);
 
-    schedule();
-    for (;;) { }                /* schedule() no vuelve a elegirnos nunca */
+    /* Y sin soltar el cerrojo: se lo lleva el hilo que entre. Que siga
+     * cogido durante todo el cambio es lo que hace seguro al recolector,
+     * porque no podra ni mirar la tabla hasta que hayamos dejado la CPU
+     * de verdad. Sin eso liberaria la pila que aun tenemos bajo los pies. */
+    schedule_locked();
+    for (;;) { }                /* schedule no vuelve a elegirnos nunca */
 }
 
 /* No hay libc: cualquier cosa que parezca de <string.h> hay que escribirla. */
@@ -433,16 +517,16 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     const struct user_header *h = (const struct user_header *)image;
     if (!header_ok(h, size)) return -1;
 
-    uint64_t flags = irq_save();
+    uint64_t flags = sched_lock_irqsave();
     struct task *t = 0;
 
     for (int i = CORES; i < MAX_TASKS; i++)
         if (tasks[i].state == TASK_UNUSED) { t = &tasks[i]; break; }
-    if (!t) { irq_restore(flags); return -1; }
+    if (!t) { sched_unlock_irqrestore(flags); return -1; }
 
     uint64_t asid = 0;
     uint64_t *pgd = vmm_create_pgd(&asid);
-    if (!pgd) { irq_restore(flags); return -1; }
+    if (!pgd) { sched_unlock_irqrestore(flags); return -1; }
 
     uint64_t kstack_pa = 0;
 
@@ -509,7 +593,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
 
     t->state = TASK_READY;
 
-    irq_restore(flags);
+    sched_unlock_irqrestore(flags);
     return (int)t->pid;
 
 fail:
@@ -517,7 +601,7 @@ fail:
      * de que existiera el recolector esto no se podia ni escribir. */
     if (kstack_pa) pmm_free(kstack_pa);
     vmm_destroy_pgd(pgd, asid);
-    irq_restore(flags);
+    sched_unlock_irqrestore(flags);
     return -1;
 }
 
@@ -537,7 +621,7 @@ uint64_t sched_switches(void) { return switches; }
 
 void sched_dump(void)
 {
-    uint64_t flags = irq_save();
+    uint64_t flags = sched_lock_irqsave();
 
     uart_puts("\n  cambios de contexto: ");
     uart_dec(switches);
@@ -568,5 +652,5 @@ void sched_dump(void)
         }
         uart_puts("\n");
     }
-    irq_restore(flags);
+    sched_unlock_irqrestore(flags);
 }

@@ -67,7 +67,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 13a  | Despertar los nucleos 1, 2 y 3              | hecho  |
 | 13b  | Cerrojos de verdad y `current` por nucleo   | hecho  |
 | 13c-1| Temporizador e interrupciones por nucleo    | hecho  |
-| 13c-2| Que los cuatro nucleos ejecuten hilos       | —      |
+| 13c-2| Que los cuatro nucleos ejecuten hilos       | hecho  |
 
 ## Estructura
 
@@ -337,26 +337,84 @@ RUNNING solo podia significar "la de esta CPU"; con cuatro nucleos significa
 "corriendo en alguno", y elegirla seria ponerla a ejecutar en dos sitios a
 la vez sobre la misma pila.
 
+## El cerrojo que cierra uno y abre otro
+
+Para que cuatro nucleos planifiquen hace falta un cerrojo sobre la tabla de
+tareas. Y ahi aparece el problema que no se resuelve poniendo un cerrojo:
+`wq_wait()` llama a `schedule()` desde DENTRO de su seccion critica, porque
+"apuntarse en la cola" y "dormirse" tienen que ser indivisibles.
+
+Un spinlock no se puede llevar a traves de un cambio de contexto. Soltarlo
+antes dejaria la tabla a medias a la vista de los otros tres nucleos;
+soltarlo despues es imposible, porque despues ya no somos nosotros.
+
+La salida es que el cerrojo no se suelte: **se pasa de mano**. Lo cierra el
+hilo que sale y lo abre el hilo que entra, cuando llegue a su propio
+`sched_unlock_irqrestore()` — el de la llamada a `schedule()` en la que a el
+lo desalojaron, hace quiza mucho rato. Durante todo el cambio nadie mas
+puede mirar la tabla, que es exactamente lo que hace falta.
+
+El unico que no tiene marco donde soltarlo es un hilo recien nacido, que
+nunca ha pasado por `schedule()`. De ese se encargan `ret_from_fork`
+(`switch.S`) y `ret_to_user` (`vectors.S`) llamando a
+`sched_unlock_new_task()`. Es el mismo sitio donde `ret_from_fork` ya
+destapaba las IRQ a mano desde el paso 5, y por la misma razon: ese camino
+no es como los demas.
+
+Con eso, el recolector sale gratis. No hace falta ninguna marca de "ya he
+dejado la CPU": el zombi se marca y cambia de contexto sin soltar el
+cerrojo, asi que el recolector no puede ni mirar la tabla hasta que el
+cambio ha terminado. Cuando lo encuentra, la pila que va a liberar hace
+rato que no la pisa nadie.
+
+**Orden de cerrojos**, y hay que respetarlo: `sched_lock` se coge ANTES que
+el de la UART y el del PMM, nunca despues.
+
+## `wfe` y no `wfi`
+
+Un detalle de una linea que resulto ser todo el reparto de trabajo.
+
+La tarea idle de cada nucleo esperaba con `wfi`, que solo despierta con una
+interrupcion: un nucleo ocioso tardaba hasta un tick entero en enterarse de
+que habia una tarea lista. Con `wfe` despierta ademas con `sev` — y
+`spin_unlock()` ya hace `sev`. Asi que cada vez que alguien suelta el
+cerrojo del planificador, y eso incluye cada vez que una tarea pasa a lista,
+los nucleos ociosos se despiertan solos y van a buscar trabajo.
+
+Un `sev` de mas cuesta una vuelta del bucle idle sin encontrar nada. Un
+`sev` de menos cuesta 10 ms de un nucleo parado.
+
+Lo encontro el comando `w`, que empezo a dar el resultado exacto sin
+cerrojo — imposible si hubiera carrera. Ahora imprime en que nucleo corrio
+cada martillo, que es lo que delato el problema:
+
+    sin cerrojo : (nucleos: 3 3 3 3 ) 800000     <- los cuatro en el mismo
+    sin cerrojo : (nucleos: 3 0 1 2 ) 289604     <- ya repartidos
+
+Un dato compartido no se corrompe por compartirlo: se corrompe por
+compartirlo AL MISMO TIEMPO. De ahi tambien la barrera de salida de los
+hilos martillo, sin la cual cada uno terminaba antes de que arrancara el
+siguiente.
+
+(Esos 289604 son de una Pi 3B: se pierde el 64% de los incrementos. QEMU
+deja unos 403000, porque solapa menos. El hardware siempre es mas duro con
+este error.)
+
 ## Limitaciones conocidas
 
-- Los nucleos 1-3 reciben su tick y llevan su contabilidad, pero todavia no
-  cambian de hilo: `sched_preempt()` les da la vuelta mientras
-  `smp_sched_ready` valga 0. Lo que falta para encenderlo es el paso 13c-2:
-    - el planificador, las colas de espera y los puertos IPC siguen
-      protegidos solo con `irq_save()`. Hoy basta, porque solo el nucleo 0
-      planifica; en cuanto planifiquen cuatro, no.
-    - y ahi aparece el problema de verdad: `wq_wait()` llama a `schedule()`
-      desde dentro de su seccion critica. Un spinlock no se puede llevar a
-      traves de un cambio de contexto, porque quien lo soltaria ya no es
-      quien lo cogio. Hay que soltarlo DESPUES del cambio, desde el hilo
-      que entra.
-    - el recolector puede liberar la pila de un zombi porque, para que el
-      llegue a ejecutarse, el zombi ha tenido que dejar la CPU. Con cuatro
-      nucleos el zombi puede seguir corriendo en otro.
+- Despertar a los nucleos ociosos con `sev` es un martillazo: lo reciben los
+  cuatro cada vez que alguien suelta el cerrojo del planificador, tengan o
+  no algo que hacer. Lo fino seria un IPI por los mailboxes locales del
+  BCM2837 (`0x4000008C + 0x10*core`), dirigido a UN nucleo ocioso.
+- `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
+  de espera y los puertos IPC a la vez, y se mantiene cogido durante la
+  carga entera de un proceso. Partirlo seria mas rapido, no mas correcto.
+- El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
+  en el primer nucleo que la mire.
 - El cerrojo de la UART hace indivisible cada LLAMADA, no cada linea: dos
   `uart_puts` no se entrelazan, pero un `uart_puts` seguido de un
-  `uart_dec` si puede partirse. Para lineas enteras hay que sostener el
-  cerrojo desde fuera.
+  `uart_dec` si puede partirse. Con cuatro nucleos escribiendo se nota. Para
+  lineas enteras habria que sostener el cerrojo desde fuera.
 - El kernel conserva su propio driver de UART para depuracion, asi que
   cuando el servidor de consola esta activo hay dos escritores sobre el
   mismo hardware y el texto puede entremezclarse. Un microkernel estricto

@@ -9,6 +9,7 @@
 #include "mmio.h"
 #include "uart.h"
 #include "sync.h"
+#include "sched.h"
 #include "irq.h"
 #include "spinlock.h"
 
@@ -182,9 +183,13 @@ void uart_irq(void)
     }
     mmio_write(UART0_ICR, INT_RX | INT_RT);   /* reconocer la interrupcion */
 
-    /* Despertar a quien estuviera esperando. Se puede llamar desde aqui
-     * porque wq_wake_one solo cambia estados; no planifica ni bloquea. */
+    /* Despertar a quien estuviera esperando. wq_wake_all quiere sched_lock
+     * cogido, y aqui hay que cogerlo: este camino viene de una IRQ, no de
+     * sync.c. Se puede llamar desde un manejador porque solo cambia
+     * estados; no planifica ni bloquea. */
+    uint64_t f = sched_lock_irqsave();
     wq_wake_all(&rx_waiters);
+    sched_unlock_irqrestore(f);
 }
 
 /* Version bloqueante: en vez de preguntar cada 10 ms si ha llegado algo,
@@ -192,13 +197,13 @@ void uart_irq(void)
  * tanto no consume ni un ciclo. */
 char uart_getc_blocking(void)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
     char c;
 
     while (!uart_read(&c))
         wq_wait(&rx_waiters);
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
     return c;
 }
 

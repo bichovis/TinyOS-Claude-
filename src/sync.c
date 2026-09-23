@@ -9,15 +9,19 @@
 #include "sync.h"
 #include "sched.h"
 #include "irq.h"
+#include "spinlock.h"
 
 /* ====================== COLAS DE ESPERA ============================== */
 
 void wq_wait(struct waitqueue *wq)
 {
-    /* Se entra con las IRQ tapadas (responsabilidad del llamante). Eso es
+    /* Se entra con sched_lock COGIDO (responsabilidad del llamante). Eso es
      * lo que cierra la carrera clasica: si entre comprobar la condicion y
-     * dormirnos entrara una interrupcion que la cumpliera y despertara a
-     * esta cola, nos dormiriamos despues del aviso y no volveriamos jamas. */
+     * dormirnos se colara otro nucleo cumpliendola y despertando a esta
+     * cola, nos dormiriamos despues del aviso y no volveriamos jamas.
+     *
+     * Con un solo nucleo bastaba tapar las interrupciones. Con cuatro no:
+     * tapar las IRQ no calla a los otros tres. */
     current->state     = TASK_BLOCKED;
     current->wait_next = 0;
 
@@ -25,16 +29,17 @@ void wq_wait(struct waitqueue *wq)
     else          wq->head = current;
     wq->tail = current;
 
-    /* schedule() salva y restaura DAIF junto con el contexto del hilo, asi
-     * que al volver aqui (puede que mucho despues) las IRQ siguen tapadas
-     * exactamente igual que las dejamos. */
-    schedule();
+    /* schedule_locked() y no schedule(): el cerrojo ya es nuestro y tiene
+     * que seguir cogido a traves del cambio de contexto. Al volver aqui
+     * -puede que mucho despues, y en otro nucleo- lo tendremos otra vez. */
+    schedule_locked();
 }
 
+/* Los dos 'wake' se llaman SIEMPRE con sched_lock cogido, asi que no lo
+ * cogen ellos: volver a pedirlo aqui seria un interbloqueo instantaneo
+ * contra uno mismo. */
 void wq_wake_one(struct waitqueue *wq)
 {
-    uint64_t f = irq_save();
-
     struct task *t = wq->head;
     if (t) {
         wq->head = t->wait_next;
@@ -43,14 +48,10 @@ void wq_wake_one(struct waitqueue *wq)
         if (t->state == TASK_BLOCKED)
             t->state = TASK_READY;
     }
-
-    irq_restore(f);
 }
 
 void wq_wake_all(struct waitqueue *wq)
 {
-    uint64_t f = irq_save();
-
     struct task *t = wq->head;
     while (t) {
         struct task *next = t->wait_next;
@@ -60,8 +61,6 @@ void wq_wake_all(struct waitqueue *wq)
         t = next;
     }
     wq->head = wq->tail = 0;
-
-    irq_restore(f);
 }
 
 /* ============================ MUTEX ================================== */
@@ -75,7 +74,7 @@ void mutex_init(struct mutex *m)
 
 void mutex_lock(struct mutex *m)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
 
     /* 'while' y no 'if': al despertarnos, otro hilo puede habernos ganado
      * el mutex por delante. Hay que volver a comprobarlo siempre. */
@@ -85,12 +84,12 @@ void mutex_lock(struct mutex *m)
     m->locked = 1;
     m->owner  = current;
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
 }
 
 int mutex_trylock(struct mutex *m)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
     int got = 0;
 
     if (!m->locked) {
@@ -99,19 +98,19 @@ int mutex_trylock(struct mutex *m)
         got = 1;
     }
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
     return got;
 }
 
 void mutex_unlock(struct mutex *m)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
 
     m->locked = 0;
     m->owner  = 0;
     wq_wake_one(&m->waiters);
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
 }
 
 /* ========================== SEMAFOROS ================================ */
@@ -124,23 +123,23 @@ void sem_init(struct semaphore *s, int64_t initial)
 
 void sem_wait(struct semaphore *s)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
 
     while (s->count == 0)
         wq_wait(&s->waiters);
     s->count--;
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
 }
 
 void sem_post(struct semaphore *s)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
 
     s->count++;
     wq_wake_one(&s->waiters);
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
 }
 
 /* =========================== CANALES =================================
@@ -160,7 +159,7 @@ void chan_init(struct channel *c)
 
 void chan_send(struct channel *c, uint64_t msg)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
 
     while (c->count == CHAN_CAPACITY)
         wq_wait(&c->senders);           /* lleno: esperar a que alguien lea */
@@ -172,12 +171,12 @@ void chan_send(struct channel *c, uint64_t msg)
 
     wq_wake_one(&c->receivers);         /* hay comida */
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
 }
 
 int chan_try_send(struct channel *c, uint64_t msg)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
     int ok = 0;
 
     if (c->count < CHAN_CAPACITY) {
@@ -189,13 +188,13 @@ int chan_try_send(struct channel *c, uint64_t msg)
         ok = 1;
     }
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
     return ok;
 }
 
 uint64_t chan_recv(struct channel *c)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
 
     while (c->count == 0)
         wq_wait(&c->receivers);         /* vacio: esperar a que alguien envie */
@@ -207,6 +206,6 @@ uint64_t chan_recv(struct channel *c)
 
     wq_wake_one(&c->senders);           /* hay hueco */
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
     return msg;
 }

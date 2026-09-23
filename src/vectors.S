@@ -157,4 +157,8 @@ el0_32_serror:  handle_exception 15
  */
 .global ret_to_user
 ret_to_user:
+    // Igual que ret_from_fork: venimos con sched_lock cogido y sin marco de
+    // schedule() donde soltarlo. Antes del 'eret', que ademas destapa las
+    // IRQ al restaurar SPSR.
+    bl      sched_unlock_new_task
     kernel_exit

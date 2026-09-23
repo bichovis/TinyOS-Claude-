@@ -18,6 +18,7 @@
 #include "ipc.h"
 #include "sched.h"
 #include "irq.h"
+#include "spinlock.h"
 #include "uart.h"
 
 static struct port ports[MAX_PORTS];
@@ -38,7 +39,7 @@ void ipc_init(void)
 
 int port_create(uint64_t owner_pid)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
     int id = -1;
 
     for (int i = 0; i < MAX_PORTS; i++) {
@@ -55,7 +56,7 @@ int port_create(uint64_t owner_pid)
         }
     }
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
     return id;
 }
 
@@ -64,14 +65,14 @@ int port_send(int id, const struct message *m)
     if (id < 0 || id >= MAX_PORTS) return -1;
     struct port *p = &ports[id];
 
-    uint64_t f = irq_save();
-    if (!p->in_use) { irq_restore(f); return -1; }
+    uint64_t f = sched_lock_irqsave();
+    if (!p->in_use) { sched_unlock_irqrestore(f); return -1; }
 
     /* Si el buzon esta lleno, el emisor espera. Eso da control de flujo:
      * un cliente desbocado se frena solo en vez de tumbar al servidor. */
     while (p->count == PORT_QUEUE) {
         wq_wait(&p->senders);
-        if (!p->in_use) { irq_restore(f); return -1; }  /* murio el servidor */
+        if (!p->in_use) { sched_unlock_irqrestore(f); return -1; }  /* murio el servidor */
     }
 
     copy_msg(&p->q[p->tail], m);
@@ -80,7 +81,7 @@ int port_send(int id, const struct message *m)
     p->sent++;
 
     wq_wake_one(&p->receivers);
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
     return 0;
 }
 
@@ -89,12 +90,12 @@ int port_recv(int id, struct message *out, uint64_t pid)
     if (id < 0 || id >= MAX_PORTS) return -1;
     struct port *p = &ports[id];
 
-    uint64_t f = irq_save();
-    if (!p->in_use || p->owner != pid) { irq_restore(f); return -1; }
+    uint64_t f = sched_lock_irqsave();
+    if (!p->in_use || p->owner != pid) { sched_unlock_irqrestore(f); return -1; }
 
     while (p->count == 0) {
         wq_wait(&p->receivers);
-        if (!p->in_use || p->owner != pid) { irq_restore(f); return -1; }
+        if (!p->in_use || p->owner != pid) { sched_unlock_irqrestore(f); return -1; }
     }
 
     copy_msg(out, &p->q[p->head]);
@@ -103,17 +104,19 @@ int port_recv(int id, struct message *out, uint64_t pid)
     p->received++;
 
     wq_wake_one(&p->senders);
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
     return 0;
 }
 
 /* Un servidor puede morir. Sus puertos desaparecen y hay que despertar a
  * todo el que estuviera esperando, o se quedarian bloqueados para siempre
- * esperando a alguien que ya no existe. */
+ * esperando a alguien que ya no existe.
+ *
+ * Se llama desde task_exit(), que YA tiene sched_lock cogido y no lo va a
+ * soltar hasta despues del cambio de contexto. Pedirlo aqui otra vez seria
+ * un interbloqueo contra uno mismo. */
 void ipc_release_ports(uint64_t pid)
 {
-    uint64_t f = irq_save();
-
     for (int i = 0; i < MAX_PORTS; i++) {
         if (ports[i].in_use && ports[i].owner == pid) {
             ports[i].in_use = 0;
@@ -121,13 +124,11 @@ void ipc_release_ports(uint64_t pid)
             wq_wake_all(&ports[i].receivers);
         }
     }
-
-    irq_restore(f);
 }
 
 void ipc_dump(void)
 {
-    uint64_t f = irq_save();
+    uint64_t f = sched_lock_irqsave();
 
     uart_puts("\n  puerto  duenyo  cola  enviados  recibidos\n");
     for (int i = 0; i < MAX_PORTS; i++) {
@@ -145,5 +146,5 @@ void ipc_dump(void)
         uart_puts("\n");
     }
 
-    irq_restore(f);
+    sched_unlock_irqrestore(f);
 }

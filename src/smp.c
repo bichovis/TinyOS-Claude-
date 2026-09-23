@@ -68,33 +68,51 @@ static void fill_info(uint64_t core)
     cores[core].alive = 1;
 }
 
-/* ====================== EL TALLER ==================================
+/* ====================== EL CONTADOR EN DISPUTA =====================
  *
- * Los secundarios todavia no entran al planificador: eso es el paso 13c.
- * Pero ya pueden hacer algo, y hay una cosa que conviene hacer antes que
- * ninguna otra, que es comprobar que los cerrojos funcionan.
- *
- * El nucleo 0 deja un encargo y levanta la generacion; los tres lo ven,
- * lo hacen y avisan. Todos martillean el MISMO contador.
+ * Cuatro hilos de kernel sumando sobre la misma variable. Quien los
+ * reparte entre los nucleos es el planificador, que es exactamente como
+ * ocurren las carreras de verdad: nadie las programa a proposito.
  */
-static struct {
-    volatile uint64_t gen;           /* sube cada vez que hay encargo nuevo */
-    volatile uint64_t iters;
-    volatile uint64_t con_cerrojo;
-    volatile uint64_t hechos;
-} job;
-
 static volatile uint64_t contador;
+static volatile uint64_t hechos;
+static volatile uint64_t listos;
+static volatile uint64_t nucleo_de[CORES];
+static volatile uint64_t idx_sig;
+static uint64_t          hammer_iters;
+static uint64_t          hammer_cuantos;
+static int               hammer_lock;
 static struct spinlock   contador_lock = SPINLOCK("contador");
 
 /* El incremento en disputa. Sin cerrojo son tres pasos -leer, sumar,
  * escribir- y entre ellos cabe entero otro nucleo haciendo lo mismo: los
  * dos leen el mismo valor y los dos escriben el mismo, asi que dos
  * incrementos cuentan como uno. */
-static void martillear(uint64_t iters, int con_cerrojo)
+static void hammer_thread(void *arg)
 {
-    for (uint64_t i = 0; i < iters; i++) {
-        if (con_cerrojo) {
+    (void)arg;
+
+    /* Barrera de salida: esperar a estar los cuatro antes de empezar.
+     *
+     * Sin esto no hay nada que ver: cada hilo termina sus vueltas antes de
+     * que el siguiente llegue a arrancar, y el contador sale perfecto. La
+     * corrupcion no la causa compartir el dato, la causa compartirlo AL
+     * MISMO TIEMPO. Una carrera que no se solapa no es una carrera. */
+    uint64_t f = spin_lock_irqsave(&contador_lock);
+    listos++;
+    spin_unlock_irqrestore(&contador_lock, f);
+
+    while (listos < hammer_cuantos)
+        task_yield();
+
+    /* Dejar constancia de en que nucleo nos toca correr: si los cuatro
+     * dicen el mismo, no hay carrera posible por mucho que compartamos. */
+    f = spin_lock_irqsave(&contador_lock);
+    if (idx_sig < CORES) nucleo_de[idx_sig++] = this_core();
+    spin_unlock_irqrestore(&contador_lock, f);
+
+    for (uint64_t i = 0; i < hammer_iters; i++) {
+        if (hammer_lock) {
             uint64_t f = spin_lock_irqsave(&contador_lock);
             contador++;
             spin_unlock_irqrestore(&contador_lock, f);
@@ -102,6 +120,10 @@ static void martillear(uint64_t iters, int con_cerrojo)
             contador++;
         }
     }
+
+    f = spin_lock_irqsave(&contador_lock);
+    hechos++;                            /* tambien es un dato compartido */
+    spin_unlock_irqrestore(&contador_lock, f);
 }
 
 /* Lo llama boot.S en cada nucleo secundario, ya en EL1, con la MMU
@@ -123,42 +145,43 @@ void secondary_main(uint64_t core)
 
     fill_info(core);
 
-    irq_enable();                    /* ahora si */
+    irq_enable();
 
-    uint64_t visto = 0;
-    for (;;) {
-        while (job.gen == visto)
-            __asm__ volatile("wfe");     /* dormido hasta que haya encargo */
-        visto = job.gen;
-
-        martillear(job.iters, (int)job.con_cerrojo);
-
-        uint64_t f = spin_lock_irqsave(&contador_lock);
-        job.hechos++;                    /* tambien es un dato compartido */
-        spin_unlock_irqrestore(&contador_lock, f);
-    }
+    /* Y a hacer de idle, igual que el nucleo 0 al final de kernel_main. */
+    idle_loop();
 }
 
 uint64_t smp_hammer(uint64_t iters, int con_cerrojo)
 {
-    contador        = 0;
-    job.hechos      = 0;
-    job.iters       = iters;
-    job.con_cerrojo = (uint64_t)con_cerrojo;
+    contador     = 0;
+    hechos       = 0;
+    listos       = 0;
+    idx_sig      = 0;
+    hammer_iters = iters;
+    hammer_lock  = con_cerrojo;
 
-    /* El encargo entero visible ANTES que la senyal que lo anuncia, o un
-     * nucleo podria empezar a trabajar leyendo el numero de vueltas viejo. */
+    /* Los parametros visibles ANTES de crear a nadie, o un hilo podria
+     * arrancar leyendo el numero de vueltas viejo. */
     __asm__ volatile("dmb ish" ::: "memory");
-    job.gen++;
-    __asm__ volatile("dsb sy\n sev" ::: "memory");
 
-    martillear(iters, con_cerrojo);      /* el nucleo 0 tambien trabaja */
+    uint64_t creados = 0;
+    for (uint64_t c = 0; c < CORES; c++)
+        if (task_create("martillo", hammer_thread, 0) >= 0)
+            creados++;
+    hammer_cuantos = creados;           /* a cuantos espera la barrera */
 
-    /* Esperar a los otros tres, con limite. */
-    uint64_t limite = timer_now() + timer_hz() * 5;
-    while (job.hechos < CORES - 1 && timer_now() < limite)
-        ;
+    /* Esperar a que acaben, con limite: un hilo que no arranca no puede
+     * llevarse por delante la consola. */
+    uint64_t limite = timer_now() + timer_hz() * 10;
+    while (hechos < creados && timer_now() < limite)
+        task_yield();
 
+    uart_puts("(nucleos: ");
+    for (uint64_t i = 0; i < CORES; i++) {
+        uart_dec(nucleo_de[i]);
+        uart_puts(" ");
+    }
+    uart_puts(") ");
     return contador;
 }
 

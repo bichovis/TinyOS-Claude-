@@ -42,10 +42,21 @@ cpu_switch_to:
  */
 .global ret_from_fork
 ret_from_fork:
+    // Venimos con sched_lock cogido: nos lo ha pasado de mano el hilo que
+    // nos ha dado la CPU. Todos los demas lo sueltan en su propio marco de
+    // schedule(), pero nosotros no tenemos ninguno -nunca hemos pasado por
+    // alli-, asi que lo soltamos aqui. Es el mismo problema que la linea de
+    // abajo, y por la misma razon: este camino no es como los demas.
+    bl      sched_unlock_new_task
+
     // Nacemos dentro del handler de la interrupcion del timer, que corre con
     // las IRQ tapadas por hardware. Como este camino no pasa por kernel_exit
     // (no hay 'eret' que restaure SPSR), hay que destaparlas a mano o el
     // hilo nuevo correria para siempre sin que nadie pudiera desalojarlo.
+    //
+    // Y en este orden: primero soltar, despues destapar. Al reves, una IRQ
+    // podria entrar teniendo nosotros el cerrojo y pedirlo desde el
+    // manejador, esperando a que lo suelte alguien que es uno mismo.
     msr     daifclr, #2
 
     mov     x0,  x20                   // argumento

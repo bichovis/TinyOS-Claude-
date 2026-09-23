@@ -2,7 +2,7 @@
 #pragma once
 #include <stdint.h>
 
-#define MAX_TASKS     16
+#define MAX_TASKS     24
 #define TASK_QUANTUM  5       /* ticks seguidos que puede correr un hilo    */
 #define STACK_MAGIC   0x5441534B5F4F4B21UL   /* "TASK_OK!" al fondo de la pila */
 
@@ -64,6 +64,29 @@ static inline void set_this_task(struct task *t)
 
 void sched_init(void);
 void sched_adopt_core(uint64_t core);   /* lo llama cada nucleo secundario */
+void sched_start_smp(void);             /* y esto abre el planificador a todos */
+void idle_loop(void);                   /* lo que hace un nucleo sin trabajo   */
+
+/* --- El cerrojo del planificador --------------------------------------
+ * Uno solo, y grande: protege la tabla de tareas, sus estados, las colas de
+ * espera de sync.c y los puertos de ipc.c. Partirlo en varios seria mas
+ * rapido, pero no mas correcto, y los interbloqueos se multiplican con el
+ * numero de cerrojos.
+ *
+ * ORDEN DE CERROJOS, y esto hay que respetarlo: sched_lock se coge ANTES
+ * que el de la UART y el del PMM, nunca despues. Quien tenga el de la UART
+ * no puede pedir este. */
+uint64_t sched_lock_irqsave(void);
+void     sched_unlock_irqrestore(uint64_t flags);
+
+/* Planifica con el cerrojo YA cogido, y vuelve con el cogido. Lo usan
+ * wq_wait() y los que necesitan que "apuntarse en la cola" y "dormirse"
+ * sean una sola operacion indivisible. */
+void     schedule_locked(void);
+
+/* La llama un hilo recien nacido desde ensamblador: viene con el cerrojo
+ * cogido y no tiene marco donde soltarlo. */
+void     sched_unlock_new_task(void);
 int  task_create(const char *name, void (*fn)(void *), void *arg);
 int  task_create_user(const char *name, const uint8_t *image, uint64_t size,
                       uint64_t mmio_pa);

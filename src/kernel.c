@@ -446,7 +446,7 @@ static void command(char c)
         break;
 
     case 'w': {
-        const uint64_t N = 50000;
+        const uint64_t N = 200000;
         uart_puts("\n  Los cuatro nucleos suman ");
         uart_dec(N);
         uart_puts(" veces cada uno sobre el mismo contador.\n");
@@ -602,10 +602,14 @@ void kernel_main(uint64_t dtb_ptr)
     task_create("cons",   thread_consumer,    0);
     sched_dump();
 
+    /* Y ahora si: los otros tres nucleos entran al planificador. Hasta esta
+     * linea se han limitado a contar sus ticks. */
+    uart_puts("\n  Abriendo el planificador a los cuatro nucleos...\n");
+    sched_start_smp();
+
     menu();
 
-    /* La tarea 0 se queda de idle pura: solo se ejecuta cuando ningun otro
-     * hilo quiere CPU, y entonces para el nucleo hasta la proxima interrupcion. */
-    for (;;)
-        __asm__ volatile("wfi");
+    /* La tarea 0 se queda de idle pura, igual que los otros tres nucleos:
+     * solo se ejecuta cuando nadie mas quiere CPU. */
+    idle_loop();
 }
