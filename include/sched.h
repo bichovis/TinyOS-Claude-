@@ -84,6 +84,7 @@ struct task {
     uint64_t    sig_handler[SIG_MAX];  /* 0 = la accion por defecto          */
     uint64_t    sig_tramp;    /* por donde vuelve un manejador               */
     uint64_t    sig_frame;    /* donde guardo su contexto, 0 si no hay       */
+    int         sig_fp;       /* 1 si ese marco lleva ademas la FPU          */
     uint64_t    waiting_for;  /* a que pid espera, 0 si a ninguno            */
     struct waitqueue *wq;     /* en que cola duerme, 0 si no duerme          */
     int         interrumpido; /* 1 si lo desperto una senyal y no un aviso   */

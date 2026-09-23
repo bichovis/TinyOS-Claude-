@@ -91,6 +91,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 34   | exec por mmap: comprobar pasa a ser traer   | hecho  |
 | 35   | Dos particiones, /boot, /usr/bin y comillas | hecho  |
 | 36   | exec con argv[]: cada uno a lo suyo         | hecho  |
+| 37   | Las senyales guardan la coma flotante       | hecho  |
 
 ## Estructura
 
@@ -2342,6 +2343,80 @@ un buffer compartido la segunda pisaria a la primera. Es el mismo error de
 aliasing de ayer -escribir donde se lee- visto desde otro angulo, y esta
 vez evitado por construccion en vez de por cuidado.
 
+## Las senyales guardan la coma flotante
+
+Esto llevaba siete pasos en la lista de limitaciones, con esta coletilla:
+*"real, y de los que no se notan hasta que se notan"*. Era la unica cosa
+del documento que estaba **mal** en vez de **sin hacer**.
+
+Cuando llega una senyal, el kernel guarda el contexto del proceso en su
+pila y lo hace "aparecer" dentro del manejador. Al volver, restaura. Pero
+solo restauraba los registros **enteros**: si el manejador usaba decimales,
+le pisaba la coma flotante al programa interrumpido, que volvia a su bucle
+con otros numeros y sin manera de saber por que.
+
+La cura es meter los 528 bytes de la FPU en el marco de senyal, detras del
+contexto de siempre:
+
+```
+    sp                          -> los registros enteros
+    sp + sizeof(trap_frame)     -> la FPU, si este proceso la usa
+```
+
+**Solo si la usa**, y eso no es tacanyeria. La mayoria de los procesos no
+toca la coma flotante en su vida; hacerles pagar 528 bytes de pila en cada
+senyal seria cobrarles por algo que no tienen. Es la misma pereza del paso
+30, ahora aplicada a la pila en vez de a los registros.
+
+Hay un detalle de orden que importa: antes de copiar hay que **bajar a
+memoria** lo que este vivo en los registros. Si el proceso tiene la FPU
+encendida, la copia buena esta en el silicio y la de `t->fp_state` es de
+la ultima vez que lo desalojaron. Copiar sin bajarla guardaria un estado
+viejo, y el sintoma seria que la senyal a veces se traga unas decimas.
+
+Y un caso pequenyo al volver: si el proceso **no** habia tocado la FPU y el
+manejador **si**, no hay nada que restaurar, pero dejarle los numeros del
+manejador seria que el programa se encontrara luego basura con la que no
+contaba. Se suelta el area, y la proxima vez nace a cero.
+
+## Una prueba que falla cuando debe
+
+`user/trap.c` lleva ahora una cuenta con decimales en su bucle principal y
+ensucia la FPU a proposito dentro del manejador:
+
+```
+    [trap] vuelta 12, mi cuenta va por 1.500  (12 x 0.125)
+    [trap] atrapada la senyal 2, van 1
+    [trap] y de paso ensucio la FPU: 4987.385
+    [trap] vuelta 13, mi cuenta va por 1.625  (13 x 0.125)
+```
+
+La columna de la derecha es la comprobacion: la cuenta tiene que valer
+exactamente `i x 0.125` aunque hayas pulsado Ctrl-C en medio.
+
+**Pero que una prueba pase no dice nada hasta saber que falla cuando debe.**
+Aqui habia una duda razonable: `cuenta` es una variable local, y el
+compilador podria haberla dejado en la pila entre llamadas, en cuyo caso
+ninguna senyal la tocaria y la prueba pasaria igual sin arreglar nada.
+
+Asi que se comprobo al reves: desactivando el guardado y volviendo a
+correrla.
+
+```
+    [trap] vuelta 12, mi cuenta va por 1.500  (12 x 0.125)
+    [trap] atrapada la senyal 2, van 1
+    [trap] vuelta 13, mi cuenta va por 0.000  (13 x 0.125)
+    [trap] vuelta 14, mi cuenta va por 0.000  (14 x 0.125)
+```
+
+Se va a cero **y ya no vuelve**: la cuenta vivia en un registro de coma
+flotante de los que el ABI obliga a conservar entre llamadas (d8-d15), y
+el manejador se lo llevaba por delante. La prueba mide lo que dice medir.
+
+Es la tercera vez en este proyecto que hace falta este paso -romper el
+codigo a proposito para ver si la prueba se entera- y las tres veces ha
+cambiado lo que sabiamos.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -2354,10 +2429,6 @@ vez evitado por construccion en vez de por cuidado.
 - La libc no tiene `errno` ni ficheros con buffer (`FILE`, `fopen`): se
   trabaja con descriptores. `printf` entiende banderas, anchura, precision
   y `l`, pero no notacion exponencial (`%e`, `%g`) ni `long double`.
-- Las senyales no salvan la coma flotante. Un manejador que use decimales
-  pisa los registros del programa interrumpido, porque el marco de senyal
-  guarda los enteros y nada mas. Real, y de los que no se notan hasta que
-  se notan.
 - El cambio de contexto de FP es perezoso solo al restaurar. Al salir se
   salva siempre, porque con cuatro nucleos dejar el estado vivo en los
   registros de otro nucleo exigiria IPIs (ver "Coma flotante").

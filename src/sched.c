@@ -1016,15 +1016,36 @@ void signal_deliver(struct trap_frame *f)
             task_exit();                 /* no vuelve */
         }
 
-        uint64_t sp = (f->sp_el0 - sizeof(struct trap_frame)) & ~15UL;
+        /* El marco lleva los registros enteros y, si este proceso ha
+         * llegado a usar la FPU, tambien sus 528 bytes.
+         *
+         * Guardarlos solo cuando hacen falta no es tacanyeria: la mayoria
+         * de los procesos no toca la coma flotante en su vida, y hacerles
+         * pagar 528 bytes de pila en cada senyal seria cobrarles por algo
+         * que no usan. Es la misma pereza del paso 30, ahora en la pila. */
+        int con_fp = (t->fp_state != 0);
+        uint64_t marco = sizeof(struct trap_frame) + (con_fp ? FP_STATE_SIZE : 0);
 
-        if (!t->sig_tramp || !pila_escribible(sp, sizeof(struct trap_frame))) {
+        uint64_t sp = (f->sp_el0 - marco) & ~15UL;
+
+        if (!t->sig_tramp || !pila_escribible(sp, marco)) {
             uart_puts("\n  [kernel] no puedo entregarle la senyal: lo mato\n");
             task_exit();
         }
 
         kcopy((void *)sp, f, sizeof(struct trap_frame));
 
+        if (con_fp) {
+            /* Bajar a memoria lo que este vivo en los registros ANTES de
+             * copiarlo. Si el proceso tiene la FPU encendida, la copia
+             * buena esta en el silicio y la de t->fp_state es de la
+             * ultima vez que lo desalojaron. */
+            fp_switch_out(t);
+            kcopy((char *)sp + sizeof(struct trap_frame), t->fp_state,
+                  FP_STATE_SIZE);
+        }
+
+        t->sig_fp    = con_fp;
         t->sig_frame = sp;
         f->sp_el0    = sp;
         f->elr       = h;               /* el proceso "aparece" aqui */
@@ -1046,7 +1067,29 @@ int64_t signal_return(struct trap_frame *f)
     if (!vmm_translate_user(sp)) return -1;
 
     kcopy(f, (const void *)sp, sizeof(struct trap_frame));
+
+    /* Y la coma flotante, que es de lo que iba este paso.
+     *
+     * Lo que haya dejado el manejador en los registros se tira: se apaga
+     * la FPU -eso guarda lo suyo en t->fp_state, que enseguida se pisa- y
+     * se restaura lo que habia antes de la senyal. El programa
+     * interrumpido no se entera de nada, que es justo lo que se le
+     * prometio. */
+    if (t->sig_fp && t->fp_state) {
+        fp_switch_out(t);
+        kcopy(t->fp_state, (const char *)sp + sizeof(struct trap_frame),
+              FP_STATE_SIZE);
+    } else if (!t->sig_fp && t->fp_state) {
+        /* El proceso no habia tocado la FPU y el MANEJADOR si. No hay
+         * nada que restaurar, pero dejarle los numeros del manejador
+         * seria que el programa se encontrara luego basura con la que no
+         * contaba. Se suelta y la proxima vez nace a cero. */
+        fp_hw_disable();
+        fp_release(t);
+    }
+
     t->sig_frame = 0;
+    t->sig_fp    = 0;
     return (int64_t)f->x[0];
 }
 
@@ -1433,6 +1476,7 @@ int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
      * los que habia eran del programa anterior y ya no existen. */
     t->sig_pending = 0;
     t->sig_frame   = 0;
+    t->sig_fp      = 0;
     t->sig_tramp   = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
@@ -1596,6 +1640,7 @@ int task_fork(struct trap_frame *f)
     t->sig_tramp   = padre->sig_tramp;
     t->sig_pending = 0;
     t->sig_frame   = 0;
+    t->sig_fp      = 0;
     t->waiting_for = 0;
     t->parent      = padre->pid;
 
@@ -1695,6 +1740,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
      * codigo de un programa que ya no existe. */
     t->sig_pending = 0;
     t->sig_frame   = 0;
+    t->sig_fp      = 0;
     t->sig_tramp   = 0;
     t->waiting_for = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
