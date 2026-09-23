@@ -28,7 +28,7 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo
 
 # Programas de usuario con mas de un fichero fuente
 EXTRA_fs := user/sd.c
@@ -177,7 +177,7 @@ sdtest: all | $(BUILD)
 	 printf 'Mi nombre no cabe en 8.3.\n' > "$$D/un nombre bastante largo.txt"; \
 	 printf 'Y el mio tampoco, pero sin espacios.\n' > "$$D/ensamblador-de-prueba.txt"; \
 	 mkdir -p "$$D/USR/BIN"; \
-	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo; do \
+	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo; do \
 	   cp $(BUILD)/$$p.elf "$$D/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF"; \
 	 done;                         \
 	 sync; diskutil eject $$DEV >/dev/null
@@ -220,7 +220,7 @@ sdcard: all firmware
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
 	@printf 'Soy el de la particion de arranque, y cuelgo de /boot.\n' > $(BUILD)/sdcard/AVISO.TXT
 	@mkdir -p $(BUILD)/sddata/USR/BIN
-	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo; do \
+	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo; do \
 	   cp $(BUILD)/$$p.elf $(BUILD)/sddata/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done
 	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de datos de la Pi.\n' > $(BUILD)/sddata/HOLA.TXT

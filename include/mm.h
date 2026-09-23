@@ -198,6 +198,12 @@ int       vmm_unmap_in(uint64_t *pgd, uint64_t va);  /* y devuelve la pagina */
 void      vmm_switch_to(uint64_t *pgd, uint64_t asid);  /* tabla + etiqueta  */
 uint64_t  vmm_translate_user(uint64_t va);      /* ¿puede EL0 LEER aqui?     */
 int       user_touch_r(uint64_t va);           /* ...y si no, traerla       */
+
+/* Copiar entre el kernel y un proceso SIN fiarse del puntero: si la
+ * direccion no vale, esto vuelve con un numero en vez de reventar.
+ * Devuelven los bytes que NO se pudieron copiar. Ver src/usercopy.S. */
+uint64_t  copy_from_user(void *dst, uint64_t uva, uint64_t n);
+uint64_t  copy_to_user(uint64_t uva, const void *src, uint64_t n);
 uint64_t  vmm_translate_user_w(uint64_t va);    /* ¿puede EL0 ESCRIBIR aqui? */
 
 /* --- Lineal <-> fisico -------------------------------------------------

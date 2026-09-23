@@ -87,6 +87,29 @@ static void row(const char *label, uint64_t value)
     uart_puts("\n");
 }
 
+/* --- La tabla de arreglos ---------------------------------------------
+ *
+ * La construye el enlazador con lo que declaran las funciones de
+ * usercopy.S: pares (instruccion que puede fallar, a donde saltar).
+ *
+ * Se recorre entera, y con dos entradas eso es de risa. Linux la ordena
+ * al arrancar y hace busqueda binaria, porque alli son miles; la forma de
+ * la idea es la misma. */
+struct ex_entrada {
+    uint64_t instruccion;
+    uint64_t arreglo;
+};
+
+extern const struct ex_entrada __ex_table_start[];
+extern const struct ex_entrada __ex_table_end[];
+
+static uint64_t ex_table_buscar(uint64_t pc)
+{
+    for (const struct ex_entrada *e = __ex_table_start; e < __ex_table_end; e++)
+        if (e->instruccion == pc) return e->arreglo;
+    return 0;
+}
+
 static void dump(struct trap_frame *f, uint64_t index)
 {
     uint32_t ec  = (uint32_t)(f->esr >> 26) & 0x3F;
@@ -268,6 +291,48 @@ static void exception_body(struct trap_frame *f, uint64_t index)
                 }
                 return;                      /* a reintentar la instruccion */
             }
+        }
+    }
+
+    /* --- Un fallo del KERNEL sobre memoria de usuario ------------------
+     *
+     * Es el ultimo tipo de fallo que a este sistema le faltaba por saber
+     * manejar: el suyo propio, a proposito y con recuperacion.
+     *
+     * Pasa cuando copy_from_user o copy_to_user tocan una direccion del
+     * proceso y no hay nada ahi. Dos casos, y en este orden:
+     *
+     *   1. Se puede arreglar: la pagina esta mapeada de un fichero y
+     *      todavia no se ha traido, o es copy-on-write. Se resuelve y se
+     *      reintenta la instruccion, igual que si el fallo fuera del
+     *      proceso. El kernel ni se entera de que hubo un fallo.
+     *
+     *   2. No se puede: el puntero era basura. Entonces se busca la
+     *      instruccion en la tabla de arreglos y se cambia el punto de
+     *      retorno. El bucle de copia "vuelve" por su salida de error y
+     *      devuelve cuantos bytes le faltaron. Nadie muere.
+     *
+     * Lo importante del orden es que el caso 1 es el util: es lo que
+     * permite que exec cargue un ELF mapeado sin traerselo entero antes.
+     */
+    if (index < 8 && (ec == 0x24 || ec == 0x25)) {
+        uint64_t far = read_far();
+        /* El bit 6 del ISS dice si era escritura. Y hay que mirarlo en el
+         * ESR entero: enmascarar con 0x3F -que es lo que se hace mas
+         * arriba para quedarse con el codigo de fallo- se lo lleva por
+         * delante. Un 0x3F de mas y todas las escrituras parecen lecturas. */
+        int escritura = (f->esr & (1u << 6)) != 0;
+
+        if (far >= USER_BASE && far < USER_LIMIT && current && current->pgd) {
+
+            if (escritura ? user_touch_w(far) : user_touch_r(far))
+                return;                      /* arreglado: a reintentar */
+        }
+
+        uint64_t arreglo = ex_table_buscar(f->elr);
+        if (arreglo) {
+            f->elr = arreglo;                /* volver por la salida mala */
+            return;
         }
     }
 

@@ -95,6 +95,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 38   | rmdir y mv, o deshacer lo que se hizo       | hecho  |
 | 39   | Escribir nombres largos, y el ~1            | hecho  |
 | 40   | Variables de entorno, y el PATH fuera       | hecho  |
+| 41   | El kernel aprende a fallar y recuperarse    | hecho  |
 
 ## Estructura
 
@@ -130,6 +131,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  fp.c        coma flotante: cuentas y supervivencia
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
+    usercopy.S   copiar de/a un proceso pudiendo fallar sin morir
     path.c       juntar el directorio actual con una ruta relativa
     fpu.c        cuando encender la FPU y a quien salvarsela
     fpu.S        los 32 registros de 128 bits, y CPACR_EL1
@@ -2707,6 +2709,118 @@ en mi primera lectura porque el filtro con el que estaba leyendo el log
 descartaba todo lo que llevara `.ELF`. La prueba estaba bien; el que
 miraba, no.)
 
+## El kernel aprende a fallar y recuperarse
+
+Este proyecto lleva cuarenta pasos convirtiendo fallos en mecanismos: la
+pila que crece, copy-on-write, las paginas bajo demanda, la FPU perezosa,
+`mmap`. Todos eran fallos de **otro** -de un proceso- que el kernel
+atendia desde fuera.
+
+Faltaba el propio. Cuando el kernel toca memoria de un proceso y ahi no
+hay nada, hasta ahora se moria: *PANIC, excepcion no manejada*. Por eso
+`user_range_ok` traia las paginas **por adelantado**, y por eso `exec` se
+tragaba el ELF entero para leer una cabecera de sesenta y cuatro bytes.
+Era pagar por miedo.
+
+**Dos ideas, y las dos las pone el hardware.**
+
+La primera es `ldtr` y `sttr`, *load/store unprivileged*: ejecutandose en
+EL1, hacen el acceso con los permisos de **EL0**. Si la direccion no es
+del proceso -porque apunta al kernel, o a nada- la MMU lo rechaza igual
+que se lo rechazaria a el.
+
+Eso cambia de sitio una responsabilidad. El kernel comprobaba a mano que
+el puntero cayera dentro del espacio de usuario antes de tocarlo; ahora lo
+comprueba el silicio, en cada acceso, sin que se pueda olvidar. **Un
+kernel que valida punteros con ifs acaba teniendo un if que falta.**
+
+La segunda es la tabla de arreglos. Si el acceso falla, el manejador busca
+la direccion de la instruccion en una tabla y, si la encuentra, cambia el
+punto de retorno:
+
+```asm
+1:  ldtrb   w3, [x1]            /* la que puede fallar */
+    ...
+3:  mov     x0, x2              /* la salida de error  */
+    ret
+    ARREGLO 1b, 3b              /* y el par, en .ex_table */
+```
+
+La construye el **enlazador**, no el codigo: no hay que registrar nada al
+arrancar ni mantener una lista, las entradas aparecen porque alguien
+escribio la instruccion. Es el `__ex_table` de Linux con dos entradas en
+vez de miles.
+
+**El orden del manejador es lo que lo hace util.** Ante un fallo del
+kernel sobre una direccion de usuario, primero se INTENTA arreglar -la
+pagina puede ser de un fichero mapeado que aun no se ha traido, o COW- y
+solo si no hay manera se salta al arreglo. El primer caso es el que
+permite que `exec` cargue un ELF mapeado sin traerselo entero; el segundo
+es el que evita el panic.
+
+Con eso, la comprobacion de `exec` pasa de materializar doce KB a mirar
+que el rango este dentro del espacio de usuario. Lo demas se defiende
+solo.
+
+**Las cabeceras se copian antes de mirarlas**, y no solo por los fallos:
+leerlas directamente de la memoria del proceso deja la puerta abierta a
+que las cambie EN MEDIO, entre la comprobacion y el uso. Con cuatro
+nucleos eso no es teorico. Se comprueba lo que se va a usar, y se usa lo
+que se comprobo.
+
+## Una funcion que servia a dos amos
+
+El cambio rompio el arranque entero, y de la peor manera: once
+`[kernel] no he podido crearlo` seguidos, sin decir por que.
+
+`load_elf` sirve a dos amos y es facil no darse cuenta. Carga los
+programas **empotrados en el kernel** -los que arranca el menu- y tambien
+los que trae un proceso. Para los segundos hay que usar `copy_from_user`;
+para los primeros eso no vale, porque son memoria del kernel, EL0 no
+puede verla, y `ldtr` falla siempre.
+
+Se distingue por la direccion, que es lo unico que hay y lo unico que no
+se puede falsear: por encima de `KERNEL_VA_BASE` es nuestra.
+
+Y de paso salio un fallo pequenyo que llevaba ahi desde el principio: el
+bit que dice si un fallo fue de escritura es el 6 del ISS, y el codigo que
+lo miraba habia enmascarado antes con `0x3F`. Un `0x3F` de mas y todas las
+escrituras parecen lecturas.
+
+## Que falle cuando debe
+
+`user/malo.c` le da al kernel cuatro punteros que no valen:
+
+```
+    / $ malo
+      exec con un puntero al kernel : -1
+      exec con memoria sin mapear   : -1
+      exec con un puntero nulo      : -1
+      spawn con memoria sin mapear  : -1
+      --- y sigo vivo para contarlo ---
+```
+
+Solo **dos** de esos cuatro llegan a la tabla: el puntero al kernel y el
+nulo los para la comprobacion de rango antes de tocar nada. Los otros dos
+-una direccion de usuario sin mapear- pasan el rango, fallan al leerse, y
+es el arreglo el que devuelve el control.
+
+Como saberlo con seguridad: quitando la tabla.
+
+```
+    / $ malo
+      exec con un puntero al kernel : -1        <- el rango lo para
+
+    ############## EXCEPCION ##############
+      Causa   : EC=0x25  Data Abort en el mismo EL
+      Direccion (FAR_EL1) : 0x000000000E000000
+    *** PANIC: excepcion no manejada ***
+```
+
+Es la cuarta vez en este proyecto que hace falta romper algo a proposito
+para saber si la prueba mide lo que dice. Sigue mereciendo la pena todas
+las veces.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -2765,13 +2879,11 @@ miraba, no.)
   cambios al disco. Un proceso puede tener cuatro a la vez.
 - Llenar una pagina mapeada son 24 mensajes al servidor (176 bytes cada
   uno). Funciona, y es lento.
-- El kernel trae las paginas mapeadas ANTES de leerlas (`user_touch_r`), no
-  se recupera de un fallo mientras las lee. Un `copy_from_user` de verdad
-  lo haria al reves, con una tabla de excepciones, y no necesitaria
-  recorrer el rango entero por adelantado.
-- `exec` sobre un ELF mapeado trae el fichero ENTERO, porque
-  `user_range_ok` comprueba todo el rango antes de empezar. Solo cargar las
-  paginas que el ELF usa de verdad exige lo del punto anterior.
+- `copy_from_user` y `copy_to_user` copian byte a byte. Las de verdad
+  mueven palabras enteras y tienen varias entradas en la tabla, una por
+  cada tamanyo de acceso.
+- Solo `exec` y `spawn` usan la copia que sabe fallar. Las demas llamadas
+  siguen comprobando el rango a mano y trayendo las paginas antes.
 - El nombre corto que acompanya a uno largo se busca probando `~1`, `~2`…
   y mirando el directorio entero en cada intento. Con muchas colisiones es
   lento, y el numero se come las letras.

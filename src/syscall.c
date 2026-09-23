@@ -45,6 +45,22 @@ static int user_range_ok(uint64_t va, uint64_t len, int for_write)
 
 static int user_readable(uint64_t va, uint64_t len) { return user_range_ok(va, len, 0); }
 
+/* Solo mirar si el RANGO cae dentro del espacio de usuario, sin traer ni
+ * tocar nada.
+ *
+ * Sirve para lo que se va a leer con copy_from_user, que se defiende solo:
+ * las paginas que falten llegan cuando se tocan, y un puntero malo
+ * devuelve un error en vez de reventar. Traerse por adelantado un fichero
+ * de doce KB para leer una cabecera de sesenta y cuatro bytes era pagar
+ * por miedo. */
+static int user_rango(uint64_t va, uint64_t len)
+{
+    if (len == 0) return 1;
+    if (va < USER_BASE || va >= USER_LIMIT) return 0;
+    if (va + len < va || va + len > USER_LIMIT) return 0;
+    return 1;
+}
+
 /* Traerse una ruta del espacio del proceso. Se para en el cero o al
  * llenarse, y devuelve -1 si no habia nada legible: un puntero invalido
  * tiene que ser un error, no una ruta vacia que luego signifique el
@@ -214,7 +230,7 @@ void syscall_dispatch(struct trap_frame *f)
         uint64_t buf = f->x[0], len = f->x[1], uargs = f->x[2];
 
         if (len == 0 || len > 256 * 1024) { ret = -1; break; }
-        if (!user_readable(buf, len))     { ret = -1; break; }
+        if (!user_rango(buf, len))        { ret = -1; break; }
 
         struct args args, entorno;
         if (copiar_args(&args, uargs) < 0)            { ret = -1; break; }
@@ -280,7 +296,7 @@ void syscall_dispatch(struct trap_frame *f)
         uint64_t buf = f->x[0], len = f->x[1], uargs = f->x[2];
 
         if (len == 0 || len > 1024 * 1024) { ret = -1; break; }
-        if (!user_readable(buf, len))      { ret = -1; break; }
+        if (!user_rango(buf, len))         { ret = -1; break; }
 
         /* Los argumentos se copian ANTES de tocar nada del proceso, que
          * es lo unico que hace segura esta llamada: exec destruye el

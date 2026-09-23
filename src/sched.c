@@ -1213,6 +1213,35 @@ static void kcopy(void *dst, const void *src, uint64_t n)
  * con ceros. Ese "resto" es .bss, y no hace falta tratarlo aparte: las
  * paginas del PMM ya vienen limpias, asi que no hacer nada ES rellenar
  * con ceros. */
+/* Leer de la imagen de un programa, venga de donde venga.
+ *
+ * load_elf sirve a DOS AMOS y es facil no darse cuenta:
+ *
+ *   - los programas empotrados en el propio kernel, que arranca el menu;
+ *   - y los que trae un proceso, que casi siempre son un fichero mapeado.
+ *
+ * Para los segundos hay que usar copy_from_user, que accede con permisos
+ * de EL0 y sabe recuperarse. Para los primeros eso NO vale: son memoria
+ * del kernel, EL0 no puede verla, y ldtr falla siempre.
+ *
+ * Se distingue por la direccion, que es lo unico que hay y lo unico que
+ * no se puede falsear: por encima de KERNEL_VA_BASE es nuestro.
+ *
+ * (Esto costo un arranque entero en el que TODOS los procesos fallaban al
+ * crearse. El sintoma decia "no he podido crearlo" once veces seguidas y
+ * no decia por que; la causa era que una funcion que servia a dos amos
+ * paso a servir bien solo a uno.) */
+static int leer_imagen(void *dst, const uint8_t *img, uint64_t off, uint64_t n)
+{
+    uint64_t src = (uint64_t)img + off;
+
+    if (src >= KERNEL_VA_BASE) {
+        kcopy(dst, (const void *)src, n);
+        return 0;
+    }
+    return copy_from_user(dst, src, n) == 0 ? 0 : -1;
+}
+
 static int load_segment(uint64_t *pgd, const uint8_t *img, uint64_t size,
                         uint64_t vaddr, uint64_t off,
                         uint64_t filesz, uint64_t memsz, uint64_t flags)
@@ -1226,7 +1255,17 @@ static int load_segment(uint64_t *pgd, const uint8_t *img, uint64_t size,
 
         if (n) {
             if (off + p + n > size) return -1;    /* fichero truncado */
-            kcopy(phys_to_virt(page), img + off + p, n);
+
+            /* copy_from_user y no kcopy: 'img' es una direccion del
+             * PROCESO, y puede ser un fichero mapeado del que todavia no
+             * se ha traido nada. Cada pagina que falte llega sola, porque
+             * el fallo lo arregla el manejador y la instruccion se
+             * reintenta. Y si el puntero es basura, esto devuelve cuantos
+             * bytes faltaron en vez de reventar el kernel. */
+            if (leer_imagen(phys_to_virt(page), img, off + p, n) < 0) {
+                pmm_free(page);
+                return -1;
+            }
         }
 
         if (vmm_map_in(pgd, vaddr + p, page, flags) < 0) return -1;
@@ -1248,7 +1287,17 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
 {
     if (size < sizeof(struct elf64_ehdr)) return -1;
 
-    const struct elf64_ehdr *eh = (const struct elf64_ehdr *)img;
+    /* Las cabeceras se traen a memoria del kernel ANTES de mirarlas, y no
+     * es solo por los fallos de pagina: leerlas directamente de la memoria
+     * del proceso deja la puerta abierta a que las cambie EN MEDIO, entre
+     * la comprobacion y el uso. Con cuatro nucleos eso no es teorico: otro
+     * hilo del mismo proceso puede estar escribiendo ahi mismo.
+     *
+     * Se comprueba lo que se va a usar, y se usa lo que se comprobo. */
+    struct elf64_ehdr cab;
+    if (leer_imagen(&cab, img, 0, sizeof(cab)) < 0) return -1;
+
+    const struct elf64_ehdr *eh = &cab;
 
     if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
         eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F')      return -1;
@@ -1261,8 +1310,10 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
         eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf64_phdr) > size)
         return -1;
 
-    const struct elf64_phdr *ph =
-        (const struct elf64_phdr *)(img + eh->e_phoff);
+    struct elf64_phdr ph[8];
+    if (leer_imagen(ph, img, eh->e_phoff,
+                    (uint64_t)eh->e_phnum * sizeof(ph[0])) < 0)
+        return -1;
 
     int      cargados = 0;
     uint64_t fin      = USER_BASE;

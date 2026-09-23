@@ -31,6 +31,20 @@ SECTIONS
     }
 
     .rodata : ALIGN(8) { *(.rodata .rodata.*) }
+
+    /* La tabla de arreglos: pares (instruccion que puede fallar, a donde
+     * saltar si falla). La rellenan las propias funciones que tocan
+     * memoria de usuario, cada una con una linea de ensamblador que
+     * escribe aqui sin salirse de donde esta.
+     *
+     * Que la construya el ENLAZADOR y no el codigo es lo que la hace
+     * barata: no hay que registrar nada al arrancar ni mantener una lista;
+     * las entradas aparecen porque alguien escribio la instruccion. */
+    .ex_table : ALIGN(8) {
+        __ex_table_start = .;
+        KEEP(*(.ex_table))
+        __ex_table_end = .;
+    }
     .data   : ALIGN(8) { *(.data .data.*) }
 
     /* .bss = variables globales sin inicializar. No ocupan sitio en el binario,
