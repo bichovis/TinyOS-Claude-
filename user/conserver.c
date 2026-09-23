@@ -35,6 +35,9 @@
 #include "syscall.h"
 
 #define UART_DR   0x00              /* registro de datos               */
+/* Al leer DR, los bits de arriba NO son datos: son lo que fue mal con ese
+ * byte. El 11 es el que importa aqui. */
+#define DR_OE     (1u << 11)        /* overrun: llego un byte y no cabia */
 #define UART_FR   0x18              /* registro de estado              */
 #define UART_ICR  0x44              /* reconocer interrupciones        */
 #define FR_TXFF   (1u << 5)         /* FIFO de transmision llena       */
@@ -71,6 +74,8 @@ static void hw_puts(uint64_t base, const char *s)
  * y si queda alguno dentro la UART la volveria a levantar en cuanto se
  * desenmascare, con el agravante de que aqui el viaje de vuelta pasa por
  * el planificador. */
+static void hw_puts(uint64_t base, const char *s);
+
 static void drenar(uint64_t base)
 {
     volatile unsigned int *fr  = (volatile unsigned int *)(base + UART_FR);
@@ -80,23 +85,67 @@ static void drenar(uint64_t base)
     char buf[32];
     uint64_t n = 0;
     int interrumpir = 0;
+    int perdidos = 0;
 
-    while (!(*fr & FR_RXFE)) {
-        char c = (char)(*dr & 0xFF);
+    /* RECONOCER PRIMERO Y VACIAR DESPUES, y repetir mientras quede algo.
+     *
+     * Al reves -vaciar y luego reconocer- hay una carrera que mata la
+     * consola entera. Si llega un byte entre el "ya esta vacia" y el
+     * reconocimiento, el reconocimiento borra el aviso que ese byte acaba
+     * de levantar... y el byte se queda DENTRO de la FIFO. Como esta por
+     * debajo del umbral que dispara la interrupcion, nadie vuelve a
+     * avisar: la UART tiene datos, el driver no lo sabe, y el teclado se
+     * muere en silencio a mitad de una linea.
+     *
+     * Reconociendo antes, cualquier byte que llegue durante el vaciado
+     * deja su aviso en pie. Y el bucle de fuera cubre el caso simetrico:
+     * si entro algo justo despues del ultimo FR_RXFE, se ve aqui mismo en
+     * vez de esperar un aviso que quiza no llegue.
+     *
+     * Costo: teclear deprisa cortaba la linea a los veintitantos
+     * caracteres y el shell se quedaba esperando un salto de linea que ya
+     * no iba a llegar nunca. */
+    do {
+        *icr = INT_RX | INT_RT;
 
-        /* Ctrl-C no es un caracter que leer: es una orden, y decidirlo es
-         * trabajo del terminal. Lo que este proceso NO puede saber es a
-         * quien hay que interrumpir -eso esta en la tabla de procesos- asi
-         * que de eso se encarga el kernel. */
-        if (c == 3) { interrumpir = 1; continue; }
+        while (!(*fr & FR_RXFE)) {
+            unsigned int crudo = *dr;
+            char c = (char)(crudo & 0xFF);
 
-        if (n < sizeof(buf)) buf[n++] = c;
-    }
+            /* La FIFO de recepcion son 16 bytes. Si llega un byte mas antes de
+             * que nadie los haya sacado, la UART lo TIRA y enciende este bit.
+             *
+             * Que se pierda es inevitable a esta velocidad; lo que no tiene
+             * por que ser inevitable es que se pierda EN SILENCIO. Sin este
+             * aviso, el sintoma es un shell que se queda esperando una orden
+             * que nunca termina, y no hay forma de adivinar por que. */
+            if (crudo & DR_OE) perdidos++;
 
-    *icr = INT_RX | INT_RT;              /* reconocer en el propio chip */
+            /* Ctrl-C no es un caracter que leer: es una orden, y decidirlo es
+             * trabajo del terminal. Lo que este proceso NO puede saber es a
+             * quien hay que interrumpir -eso esta en la tabla de procesos- asi
+             * que de eso se encarga el kernel. */
+            if (c == 3) { interrumpir = 1; continue; }
+
+            if (n < sizeof(buf)) buf[n++] = c;
+
+            /* El buffer se llena antes que la FIFO si llega una rafaga:
+             * entregar lo que hay y seguir, en vez de tirarlo. */
+            if (n == sizeof(buf)) { console_push(buf, n); n = 0; }
+        }
+
+        /* ¿Entro algo mientras vaciabamos? Otra vuelta: su aviso ya esta
+         * puesto, pero el byte solo puede no llegar a disparar nada. */
+    } while (!(*fr & FR_RXFE));
 
     if (n) console_push(buf, n);
     if (interrumpir) console_int();
+
+    if (perdidos) {
+        /* Por el hardware y no por printf: printf escribe en el descriptor
+         * 1, que acaba pidiendonoslo a nosotros mismos. */
+        hw_puts(base, "\n  [conserver] se han perdido teclas (FIFO llena)\n");
+    }
 }
 
 int main(int argc, char **argv)

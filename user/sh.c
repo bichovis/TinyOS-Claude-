@@ -101,7 +101,7 @@ static uint64_t tamano_de(const char *fichero)
     struct fs_request r;
     r.port = (unsigned long)mi_puerto;
     r.arg  = 0;
-    for (int i = 0; i < FS_NAME_MAX; i++) r.name[i] = 0;
+    for (int i = 0; i < FS_PATH_MAX; i++) r.name[i] = 0;
     memcpy(r.name, fichero, strlen(fichero) + 1);
 
     m.type = FS_SIZE;
@@ -121,6 +121,29 @@ static uint64_t tamano_de(const char *fichero)
         return 0;
     }
     return ((struct fs_info *)m.data)->size;
+}
+
+/* Donde buscar un programa.
+ *
+ * Un PATH de dos sitios: el directorio actual primero, y el raiz despues.
+ * Hace falta desde que hay subdirectorios, porque si no "cd docs" dejaria
+ * de encontrar hasta "ls". Es la version mas pequenya posible de una idea
+ * que en Unix es una variable de entorno con ocho sitios, y esta aqui por
+ * el mismo motivo: sin ella, moverse de directorio te deja sin ordenes.
+ *
+ * Deja en 'ruta' la absoluta que si existe, o devuelve 0. */
+static int buscar_programa(const char *nom, char *ruta)
+{
+    if (realpath(nom, ruta) == 0 && tamano_de(ruta)) return 1;
+
+    char en_raiz[FS_PATH_MAX];
+    en_raiz[0] = '/';
+    uint64_t n = strlen(nom);
+    if (n + 2 > FS_PATH_MAX) return 0;
+    memcpy(en_raiz + 1, nom, n + 1);
+
+    if (tamano_de(en_raiz)) { memcpy(ruta, en_raiz, strlen(en_raiz) + 1); return 1; }
+    return 0;
 }
 
 static uint64_t cargar(const char *fichero, unsigned char **img)
@@ -271,6 +294,32 @@ static void quejarse(const char *que)
 
 /* --- Ejecutar -------------------------------------------------------- */
 
+/* Las que cambian algo del PROPIO shell. Devuelve 1 si se ha ocupado. */
+static int interna(char *orden, const char *der)
+{
+    if (der) return 0;                       /* "cd x | y" no tiene sentido */
+
+    if (orden[0] == 'c' && orden[1] == 'd' &&
+        (orden[2] == 0 || orden[2] == ' ')) {
+
+        const char *a = orden + 2;
+        while (*a == ' ') a++;
+        if (!*a) a = "/";                    /* "cd" a secas: al raiz */
+
+        if (chdir(a) < 0) printf("  no puedo entrar en %s\n", a);
+        return 1;
+    }
+
+    if (orden[0] == 'p' && orden[1] == 'w' && orden[2] == 'd' && !orden[3]) {
+        char aqui[FS_PATH_MAX];
+        getcwd(aqui, sizeof(aqui));
+        printf("  %s\n", aqui);
+        return 1;
+    }
+
+    return 0;
+}
+
 static void una(char *orden)
 {
     /* Primero se recorta la redireccion: lo que quede es la orden de
@@ -282,8 +331,11 @@ static void una(char *orden)
     if (!fichero_de(orden)) return;
 
     unsigned char *img;
-    uint64_t bytes = cargar(nombre, &img);
-    if (!bytes) { quejarse(nombre); return; }
+    char ruta[FS_PATH_MAX];
+    if (!buscar_programa(nombre, ruta)) { quejarse(nombre); return; }
+
+    uint64_t bytes = cargar(ruta, &img);
+    if (!bytes) { quejarse(ruta); return; }
 
     int64_t pid = fork();
     if (pid == 0) {
@@ -327,14 +379,20 @@ static void tuberia(char *izq, char *der)
     memcpy(nombre_izq, nombre, strlen(nombre) + 1);
 
     unsigned char *img1;
-    uint64_t b1 = cargar(nombre_izq, &img1);
-    if (!b1) { quejarse(nombre_izq); return; }
+    char ruta1[FS_PATH_MAX];
+    if (!buscar_programa(nombre_izq, ruta1)) { quejarse(nombre_izq); return; }
+
+    uint64_t b1 = cargar(ruta1, &img1);
+    if (!b1) { quejarse(ruta1); return; }
 
     if (!fichero_de(der)) { free(img1); return; }
 
     unsigned char *img2;
-    uint64_t b2 = cargar(nombre, &img2);
-    if (!b2) { quejarse(nombre); free(img1); return; }
+    char ruta2[FS_PATH_MAX];
+    if (!buscar_programa(nombre, ruta2)) { quejarse(nombre); free(img1); return; }
+
+    uint64_t b2 = cargar(ruta2, &img2);
+    if (!b2) { quejarse(ruta2); free(img1); return; }
 
     int fds[2];
     if (pipe(fds) < 0) {
@@ -388,11 +446,16 @@ int main(int argc, char **argv)
     printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
     printf("  se arrancan con fork + exec, se encadenan con | y se\n");
     printf("  redirigen con < y >\n");
-    printf("  Prueba: ls / cat hola.txt | upper / upper < hola.txt > dos.txt\n");
-    printf("          wc < hola.txt / salir\n");
+    printf("  Hay directorios: cd, pwd y mkdir\n");
+    printf("  Prueba: ls / mkdir docs / cd docs / cat /hola.txt > copia.txt\n");
+    printf("          cd .. / ls docs / wc < hola.txt / salir\n");
 
     for (;;) {
-        printf("\n$ ");
+        /* El prompt lleva el directorio: sin eso, con subdirectorios, se
+         * pierde uno a la segunda orden. */
+        char aqui[FS_PATH_MAX];
+        if (getcwd(aqui, sizeof(aqui)) < 0) aqui[0] = 0;
+        printf("\n%s $ ", aqui);
 
         int64_t largo = leer_linea();
         if (largo < 0) {                         /* fin de la entrada */
@@ -414,6 +477,18 @@ int main(int argc, char **argv)
             printf("  hasta luego\n");
             exit(0);
         }
+
+        /* --- Ordenes internas ---
+         *
+         * "cd" TIENE que ser interna, y no por comodidad. Si fuera un
+         * programa, el shell se bifurcaria, el hijo cambiaria SU
+         * directorio actual -que se hereda, pero hacia abajo- y al morir
+         * se lo llevaria con el. El shell seguiria donde estaba.
+         *
+         * Es la unica orden de este interprete que no puede ser un
+         * fichero en la tarjeta, y el motivo es exactamente el mismo por
+         * el que en cualquier Unix "cd" tampoco lo es. */
+        if (interna(izq, der)) continue;
 
         if (der) tuberia(izq, limpiar(der));
         else     una(izq);

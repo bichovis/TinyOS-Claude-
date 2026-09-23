@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "ipc_abi.h"
 #include "file.h"
+#include "fs_abi.h"
 
 struct waitqueue;
 
@@ -69,6 +70,19 @@ struct task {
     void       *fp_state;
     int         fp_activo;
     int         fp_pedida;   /* la llego a pedir alguna vez; para las cuentas */
+
+    /* --- El directorio actual ---
+     *
+     * Estado de proceso que no es ni memoria ni descriptores, que es lo
+     * que lo hace distinto de todo lo demas que hay en esta tabla. Se
+     * HEREDA en el fork -un hijo empieza donde estaba el padre- y
+     * SOBREVIVE al exec, al reves que los manejadores de senyal y que la
+     * FPU: el programa cambia, pero el sitio donde estabas no.
+     *
+     * Y de ahi sale que "cd" tenga que ser una orden interna del shell.
+     * Si fuera un programa, el shell se bifurcaria, el hijo cambiaria SU
+     * directorio, y al morir se lo llevaria consigo. */
+    char        cwd[FS_PATH_MAX];
 
     const char *name;
     char        namebuf[16]; /* para los que traen su nombre de argv[0]    */

@@ -41,6 +41,25 @@ static int user_range_ok(uint64_t va, uint64_t len, int for_write)
 }
 
 static int user_readable(uint64_t va, uint64_t len) { return user_range_ok(va, len, 0); }
+
+/* Traerse una ruta del espacio del proceso. Se para en el cero o al
+ * llenarse, y devuelve -1 si no habia nada legible: un puntero invalido
+ * tiene que ser un error, no una ruta vacia que luego signifique el
+ * raiz. */
+static int copiar_ruta(char *dst, uint64_t uva)
+{
+    if (!user_readable(uva, 1)) return -1;
+
+    uint64_t i = 0;
+    for (; i < FS_PATH_MAX - 1; i++) {
+        if (!vmm_translate_user(uva + i)) break;
+        char c = ((const char *)uva)[i];
+        if (!c) break;
+        dst[i] = c;
+    }
+    dst[i] = 0;
+    return i ? 0 : -1;
+}
 static int user_writable(uint64_t va, uint64_t len) { return user_range_ok(va, len, 1); }
 
 /* --- Copias entre espacios de direcciones -----------------------------
@@ -280,24 +299,57 @@ void syscall_dispatch(struct trap_frame *f)
      * que hace que el shell pueda ponerlo en el 0 o en el 1 con dup2 y que
      * el programa no se entere de nada. */
     case SYS_open: {
-        char nombre[FICH_NOMBRE];
-        if (!user_readable(f->x[0], 1)) { ret = -1; break; }
+        char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
+        if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
 
-        uint64_t i = 0;
-        for (; i < FICH_NOMBRE - 1; i++) {
-            if (!vmm_translate_user(f->x[0] + i)) break;
-            char c = ((const char *)f->x[0])[i];
-            if (!c) break;
-            nombre[i] = c;
-        }
-        nombre[i] = 0;
-        if (i == 0) { ret = -1; break; }
+        /* Se resuelve contra el directorio actual ANTES de bajar al
+         * servidor, que solo entiende rutas absolutas. */
+        if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
 
-        struct fichero *fi = file_open(nombre, (int)f->x[1]);
+        struct fichero *fi = file_open(abs, (int)f->x[1]);
         if (!fi) { ret = -1; break; }
 
         ret = task_fd_alloc(fi);
         if (ret < 0) file_close(fi);     /* no habia descriptor libre */
+        break;
+    }
+
+    /* --- El directorio actual --------------------------------------
+     * Las tres juntas porque son la misma idea: el cwd es del proceso, lo
+     * guarda el kernel, y el servidor de ficheros no se entera de que
+     * existe. */
+
+    case SYS_chdir: {
+        char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
+        if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
+        if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
+
+        /* Y comprobar que existe Y es un directorio. Sin esto, un "cd
+         * nada" dejaria al proceso apuntando a un sitio inventado y el
+         * error saldria mucho despues, al abrir cualquier cosa. */
+        if (!fs_es_directorio(abs)) { ret = -1; break; }
+
+        for (uint64_t i = 0; i < FS_PATH_MAX; i++) current->cwd[i] = abs[i];
+        ret = 0;
+        break;
+    }
+
+    case SYS_getcwd: {
+        uint64_t n = f->x[1];
+        if (n > FS_PATH_MAX) n = FS_PATH_MAX;
+        if (!user_writable(f->x[0], n)) { ret = -1; break; }
+        copy_bytes((void *)f->x[0], current->cwd, n);
+        ret = 0;
+        break;
+    }
+
+    case SYS_realpath: {
+        char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
+        if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
+        if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
+        if (!user_writable(f->x[1], FS_PATH_MAX)) { ret = -1; break; }
+        copy_bytes((void *)f->x[1], abs, FS_PATH_MAX);
+        ret = 0;
         break;
     }
 

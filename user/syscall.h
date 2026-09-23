@@ -99,6 +99,19 @@ static inline int64_t msg_recv(uint64_t port, struct message *m)
 /* --- MMIO concedido (solo para drivers) -------------------------------- */
 static inline uint64_t mmio_base(void)    { return (uint64_t)syscall2(SYS_mmio_base, 0, 0); }
 
+/* --- El directorio actual ---------------------------------------------
+ * realpath() une el cwd con una ruta relativa y la normaliza. La hace el
+ * KERNEL, no la libc, y eso es deliberado: el kernel la necesita igual
+ * para la redireccion, y dos implementaciones acabarian discrepando en
+ * algun caso raro. Ver src/path.c. */
+static inline int64_t chdir(const char *ruta)
+                                          { return syscall2(SYS_chdir, (uint64_t)ruta, 0); }
+static inline int64_t getcwd(char *buf, uint64_t n)
+                                          { return syscall2(SYS_getcwd, (uint64_t)buf, n); }
+static inline int64_t realpath(const char *ruta, char *salida)
+                                          { return syscall2(SYS_realpath, (uint64_t)ruta,
+                                                            (uint64_t)salida); }
+
 /* Abrir un fichero de la tarjeta y quedarselo en un descriptor. */
 static inline int64_t openf(const char *nombre, uint64_t modo)
                                           { return syscall2(SYS_open, (uint64_t)nombre, modo); }

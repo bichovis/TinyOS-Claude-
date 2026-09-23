@@ -26,7 +26,7 @@ static uint64_t pedir(uint64_t tipo, const char *nombre, uint64_t arg,
     r.port = (unsigned long)mio;
     r.arg  = arg;
 
-    for (int i = 0; i < FS_NAME_MAX; i++) r.name[i] = 0;
+    for (int i = 0; i < FS_PATH_MAX; i++) r.name[i] = 0;
     memcpy(r.name, nombre, strlen(nombre) + 1);
     for (uint64_t i = 0; i < FS_CHUNK; i++)
         r.data[i] = (i < n && datos) ? datos[i] : 0;
@@ -50,8 +50,13 @@ int main(int argc, char **argv)
     mio = port_create(-1);
     if (mio < 0) { printf("  [cp] sin puertos\n"); exit(1); }
 
-    const char *origen  = argv[1];
-    const char *destino = argv[2];
+    char ra[FS_PATH_MAX], rb[FS_PATH_MAX];
+    if (realpath(argv[1], ra) < 0 || realpath(argv[2], rb) < 0) {
+        printf("  [cp] ruta imposible\n");
+        exit(1);
+    }
+    const char *origen  = ra;
+    const char *destino = rb;
 
     if (pedir(FS_SIZE, origen, 0, 0, 0) != FS_OK) {
         printf("\n  ");

@@ -10,6 +10,7 @@ void     irq_send_resched(uint64_t core);  /* "mirate el turno" a otro nucleo */
 int      irq_register(uint64_t irq, int puerto);
 int      irq_ack(uint64_t irq);
 void     irq_release_port(int puerto);
+extern uint64_t irq_avisos_perdidos;
 void     irq_handle(void);      /* lo llama el vector IRQ desde vectors.S */
 uint64_t irq_count(void);              /* atendidas entre los cuatro nucleos */
 uint64_t irq_count_core(uint64_t core); /* y las de uno solo                 */

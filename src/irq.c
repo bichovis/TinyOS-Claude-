@@ -133,6 +133,10 @@ void irq_send_resched(uint64_t core)
  * la del temporizador seria dejarle parar el planificador. */
 static int irq_puerto = -1;
 
+/* Avisos que no cupieron en la cola del driver. Si esto no es cero, el
+ * driver no da abasto. */
+uint64_t irq_avisos_perdidos;
+
 int irq_register(uint64_t irq, int puerto)
 {
     if (irq != IRQ_UART || puerto < 0) return -1;
@@ -185,9 +189,22 @@ void irq_handle(void)
         if (p2 & (1u << (IRQ_UART - 32))) {
             if (irq_puerto >= 0) {
                 /* Hay un driver en EL0 esperandola: se le avisa y se cierra
-                 * hasta que diga que ya. */
+                 * hasta que diga que ya.
+                 *
+                 * Y si el aviso NO se puede entregar -la cola del puerto
+                 * llena- hay que volver a abrirla inmediatamente. Esto no
+                 * es una precaucion teorica: enmascarar y no avisar deja la
+                 * fuente cerrada esperando un irq_ack que nadie va a
+                 * hacer, y el teclado se muere para siempre sin un solo
+                 * mensaje de error. Es la version con interrupciones del
+                 * mismo fallo de siempre: dos pasos que tienen que pasar
+                 * los dos o ninguno. */
                 mmio_write(DISABLE_IRQS_2, 1u << (IRQ_UART - 32));
-                port_notify(irq_puerto, CMSG_IRQ);
+
+                if (port_notify(irq_puerto, CMSG_IRQ) < 0) {
+                    irq_avisos_perdidos++;
+                    mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
+                }
             } else {
                 uart_irq();              /* todavia la lleva el kernel */
             }

@@ -19,7 +19,9 @@ int main(int argc, char **argv)
         printf("\n  uso: cat NOMBRE.EXT\n");
         exit(1);
     }
-    const char *fichero = argv[1];
+    char ruta[FS_PATH_MAX];
+    if (realpath(argv[1], ruta) < 0) { printf("  [cat] ruta imposible\n"); exit(1); }
+    const char *fichero = ruta;
 
     int64_t mio = port_create(-1);
     if (mio < 0) { printf("  [cat] sin puertos\n"); exit(1); }

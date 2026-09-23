@@ -247,11 +247,15 @@ void uart_irq(void)
  * De la mitad para abajo -el buffer, los que esperan, read()- nada cambia.
  * Esa es la ventaja de haber separado el driver de la cola: se puede
  * sustituir el hardware por un proceso sin tocar a quien lee. */
+uint64_t uart_perdidos;               /* teclas tiradas por falta de sitio */
+
 void uart_push(const char *buf, uint64_t n)
 {
+    uint64_t tirados = 0;
+
     for (uint64_t i = 0; i < n; i++) {
         uint32_t next = (rx_head + 1) % RXBUF_SIZE;
-        if (next == rx_tail) break;       /* lleno: se tira el resto */
+        if (next == rx_tail) { tirados = n - i; break; }
         rxbuf[rx_head] = buf[i];
         rx_head = next;
     }
@@ -259,6 +263,26 @@ void uart_push(const char *buf, uint64_t n)
     uint64_t f = sched_lock_irqsave();
     wq_wake_all(&rx_waiters);
     sched_unlock_irqrestore(f);
+
+    /* El anillo son 64 bytes y quien lee va a su ritmo. Si llega mas de lo
+     * que cabe, sobra, y lo que sobra SE TIRA: no hay a donde meterlo y no
+     * hay forma de decirle al otro lado que pare, porque no hay control de
+     * flujo en este cable.
+     *
+     * Lo que si se puede es no perderlo en silencio. Sin este aviso el
+     * sintoma es un shell esperando una orden que nunca termina -se perdio
+     * el salto de linea- y no hay manera de adivinar por que. Un aviso por
+     * rafaga, no por byte, o el remedio seria peor. */
+    if (tirados) {
+        uart_perdidos += tirados;
+        uint64_t lf = uart_begin();
+        uart_puts("\n  [kernel] entrada demasiado rapida: ");
+        uart_dec(tirados);
+        uart_puts(" caracteres perdidos (");
+        uart_dec(uart_perdidos);
+        uart_puts(" en total)\n");
+        uart_end(lf);
+    }
 }
 
 /* Version bloqueante: en vez de preguntar cada 10 ms si ha llegado algo,

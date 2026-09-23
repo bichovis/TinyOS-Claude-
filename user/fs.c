@@ -130,10 +130,96 @@ static int montar(void)
  * corte de corriente a mitad deja el volumen a medias, como en 1980.
  */
 
+/* --- Nombres largos (VFAT) --------------------------------------------
+ *
+ * FAT guarda los nombres en 8.3 y punto. Los nombres largos se anyadieron
+ * despues, en 1995, y el truco con el que se hizo es de los mas elegantes
+ * que hay en informatica: delante de la entrada corta de toda la vida se
+ * ponen entradas EXTRA con el atributo 0x0F.
+ *
+ * Ese 0x0F es solo-lectura + oculto + sistema + etiqueta-de-volumen a la
+ * vez, una combinacion que no tiene ningun sentido. Y ahi esta la gracia:
+ * MS-DOS, que no sabia nada de esto, las descartaba por absurdas y seguia
+ * viendo el disco entero con sus nombres cortos. Un formato ampliado sin
+ * romper a quien no entiende la ampliacion.
+ *
+ * Cada entrada extra lleva 13 caracteres UTF-16 repartidos en tres huecos
+ * (1-10, 14-25, 28-31), porque tuvieron que colarse entre los campos que
+ * ya existian. Van en orden INVERSO: la primera que aparece en el disco es
+ * el ultimo trozo del nombre, y lleva el bit 0x40 en su numero de
+ * secuencia para decir "por aqui empieza".
+ *
+ * Y una suma de comprobacion del nombre CORTO, repetida en cada trozo. No
+ * es paranoia: si un sistema antiguo renombra el fichero, toca la entrada
+ * corta y deja las largas huerfanas apuntando a un nombre que ya no
+ * existe. La suma es lo que detecta ese desacuerdo. Si no cuadra, se tira
+ * el nombre largo y se usa el corto, que siempre esta.
+ */
+static uint8_t suma_83(const uint8_t *d)
+{
+    uint8_t s = 0;
+    for (int i = 0; i < 11; i++)
+        s = (uint8_t)(((s & 1) ? 0x80 : 0) + (s >> 1) + d[i]);
+    return s;
+}
+
+struct lfn {
+    char    nombre[FS_NAME_MAX];
+    int     valido;
+    uint8_t suma;
+};
+
+static void lfn_reset(struct lfn *l)
+{
+    l->valido = 0;
+    for (int i = 0; i < FS_NAME_MAX; i++) l->nombre[i] = 0;
+}
+
+static void lfn_add(struct lfn *l, const uint8_t *d)
+{
+    int seq = d[0] & 0x3F;
+
+    if (d[0] & 0x40) {                       /* el ultimo trozo del nombre */
+        lfn_reset(l);
+        l->valido = 1;
+        l->suma   = d[13];
+    }
+
+    /* Un trozo suelto, sin su cabecera, o de otro fichero: no vale nada. */
+    if (!l->valido || seq < 1 || seq > 20 || d[13] != l->suma) {
+        lfn_reset(l);
+        return;
+    }
+
+    static const int hueco[13] = { 1,3,5,7,9, 14,16,18,20,22,24, 28,30 };
+    int base = (seq - 1) * 13;
+
+    for (int i = 0; i < 13; i++) {
+        uint16_t c = (uint16_t)(d[hueco[i]] | (d[hueco[i] + 1] << 8));
+        if (c == 0x0000 || c == 0xFFFF) break;   /* fin, o relleno */
+
+        int o = base + i;
+        if (o >= FS_NAME_MAX - 1) break;
+
+        /* Solo ASCII. Lo de fuera se marca en vez de inventarselo: un '?'
+         * se ve, y un byte truncado al azar da un nombre que parece bueno
+         * y no abre nada. */
+        l->nombre[o] = (c < 128) ? (char)c : '?';
+    }
+}
+
 /* Las dos viven mas abajo, con la parte de lectura, porque las comparten
  * los dos lados. */
 static void     a_8_3(const char *nombre, char out[11]);
 static uint32_t siguiente_cluster(uint32_t c);
+
+/* Y estas tres tambien: las necesita el recorrido de directorios, que esta
+ * antes, y se definen con el resto de la parte de lectura. */
+static void nombre_de_entrada(const struct lfn *l, const uint8_t *d,
+                              char salida[FS_NAME_MAX]);
+static void de_8_3(const uint8_t *d, char salida[FS_NAME_MAX]);
+static int  igual_sin_caja(const char *a, const char *b);
+
 
 
 static int escribir(uint32_t lba, const uint8_t *src)
@@ -190,49 +276,126 @@ static void free_chain(uint32_t c)
     }
 }
 
-/* Localizar la entrada de directorio de un fichero: en que sector esta y
- * en que posicion dentro de el. Con eso se puede leer y tambien MODIFICAR,
- * que es lo que hace falta para cambiarle el tamanyo. */
-static int dir_lookup(const char *nombre, uint32_t *lba, uint32_t *off)
+/* --- Un directorio, sea el raiz o no ---------------------------------
+ *
+ * En FAT16 el directorio raiz es RARO: es una region de sectores fija,
+ * puesta justo detras de las FAT, con un numero de entradas decidido al
+ * formatear y que no se puede cambiar. Un subdirectorio, en cambio, es un
+ * fichero normal y corriente cuyo contenido son entradas de 32 bytes: una
+ * cadena de clusters, que crece como cualquier otra.
+ *
+ * Son dos cosas distintas de verdad, y la unica forma de no escribir dos
+ * veces cada recorrido es esconder la diferencia detras de una pregunta:
+ * "dame el sector numero N de este directorio". El cluster 0 quiere decir
+ * el raiz, que es un numero que no existe como cluster de datos -los
+ * validos empiezan en el 2- y por eso sirve de marca.
+ *
+ * Que el raiz tenga un tope y los demas no es la razon de que en FAT16 se
+ * pueda llenar el directorio raiz teniendo el disco medio vacio. */
+static int dir_sector(uint32_t dir, uint32_t n, uint32_t *lba)
+{
+    if (dir == 0) {                              /* el raiz */
+        uint32_t sectores = (root_entries * 32 + 511) / 512;
+        if (n >= sectores) return -1;
+        *lba = root_lba + n;
+        return 0;
+    }
+
+    uint32_t c = dir;
+    for (uint32_t saltar = n / sec_per_clus; saltar; saltar--) {
+        c = siguiente_cluster(c);
+        if (c < 2 || c >= 0xFFF8) return -1;      /* se acabo la cadena */
+    }
+    *lba = data_lba + (c - 2) * sec_per_clus + (n % sec_per_clus);
+    return 0;
+}
+
+/* Localizar una entrada dentro de un directorio: en que sector esta y en
+ * que posicion. Con eso se puede leer y tambien MODIFICAR, que es lo que
+ * hace falta para cambiarle el tamanyo.
+ *
+ * 'quiero': 0 solo ficheros, 1 solo directorios, -1 lo que sea. Hace
+ * falta porque al recorrer una ruta las componentes de en medio TIENEN que
+ * ser directorios, y la ultima no. */
+static int dir_lookup_en(uint32_t dir, const char *nombre, int quiero,
+                         uint32_t *lba, uint32_t *off)
 {
     char patron[11];
     a_8_3(nombre, patron);
 
-    uint32_t sectores = (root_entries * 32 + 511) / 512;
-    for (uint32_t s = 0; s < sectores; s++) {
-        uint8_t *b = cached(root_lba + s);
+    /* El acumulador vive FUERA del bucle de sectores: una cadena de
+     * entradas largas puede empezar al final de un sector y terminar en el
+     * siguiente, y si se reiniciara en cada sector se perderian justo los
+     * nombres mas largos. */
+    struct lfn l;
+    lfn_reset(&l);
+
+    for (uint32_t s = 0; ; s++) {
+        uint32_t sl;
+        if (dir_sector(dir, s, &sl) < 0) return -1;
+
+        uint8_t *b = cached(sl);
         if (!b) return -1;
 
         for (int e = 0; e < 512; e += 32) {
             uint8_t *d = b + e;
-            if (d[0] == 0x00) return -1;
-            if (d[0] == 0xE5) continue;
-            if ((d[11] & 0x0F) == 0x0F) continue;
-            if (d[11] & (0x08 | 0x10)) continue;
+            if (d[0] == 0x00) return -1;          /* fin del directorio */
 
+            if ((d[11] & 0x0F) == 0x0F) { lfn_add(&l, d); continue; }
+
+            if (d[0] == 0xE5) { lfn_reset(&l); continue; }   /* borrada */
+            if (d[11] & 0x08) { lfn_reset(&l); continue; }   /* etiqueta */
+
+            char largo[FS_NAME_MAX];
+            nombre_de_entrada(&l, d, largo);
+            lfn_reset(&l);                        /* consumido */
+
+            int es_dir = (d[11] & 0x10) ? 1 : 0;
+            if (quiero >= 0 && es_dir != quiero) continue;
+
+            /* Vale cualquiera de los dos nombres. El corto sigue
+             * funcionando porque esta siempre y porque es lo que ensenya
+             * un sistema que no entienda los largos. */
             int igual = 1;
             for (int i = 0; i < 11; i++)
                 if (d[i] != (uint8_t)patron[i]) { igual = 0; break; }
-            if (!igual) continue;
 
-            *lba = root_lba + s;
+            if (!igual && !igual_sin_caja(largo, nombre)) continue;
+
+            *lba = sl;
             *off = (uint32_t)e;
             return 0;
         }
     }
-    return -1;
 }
 
-/* Crear una entrada nueva. Se reaprovecha la primera casilla borrada que
- * aparezca, y si no hay ninguna se usa la primera sin estrenar. */
-static int dir_create(const char *nombre, uint32_t *lba, uint32_t *off)
+/* El cluster donde empieza un subdirectorio, dada su entrada.
+ *
+ * Ojo con el "..": en FAT, el ".." del primer nivel apunta al cluster 0, y
+ * el 0 quiere decir el raiz. No es un caso especial inventado por
+ * nosotros, viene asi en el disco. */
+static uint32_t entrada_cluster(uint32_t lba, uint32_t off)
+{
+    uint8_t *b = cached(lba);
+    return b ? le16(b + off + 26) : 0;
+}
+
+/* Crear una entrada nueva en un directorio. Se reaprovecha la primera
+ * casilla borrada que aparezca, y si no hay ninguna se usa la primera sin
+ * estrenar.
+ *
+ * 'attr' es 0x20 para un fichero y 0x10 para un directorio. */
+static int dir_create_en(uint32_t dir, const char *nombre, uint8_t attr,
+                         uint32_t *lba, uint32_t *off)
 {
     char patron[11];
     a_8_3(nombre, patron);
 
-    uint32_t sectores = (root_entries * 32 + 511) / 512;
-    for (uint32_t s = 0; s < sectores; s++) {
-        uint8_t *b = cached(root_lba + s);
+    for (uint32_t s = 0; ; s++) {
+        uint32_t sl;
+        if (dir_sector(dir, s, &sl) < 0) return -1;   /* directorio lleno */
+
+        uint8_t *b = cached(sl);
         if (!b) return -1;
 
         for (int e = 0; e < 512; e += 32) {
@@ -243,21 +406,83 @@ static int dir_create(const char *nombre, uint32_t *lba, uint32_t *off)
 
             for (int i = 0; i < 11; i++) d[i] = (uint8_t)patron[i];
             for (int i = 11; i < 32; i++) d[i] = 0;
-            d[11] = 0x20;                       /* archivo normal */
+            d[11] = attr;
 
             /* Si esta era la marca de "aqui se acaba el directorio", la
              * siguiente casilla tiene que heredarla o el recorrido no
              * pararia nunca. */
             if (ultima && e + 32 < 512) d[32] = 0x00;
 
-            if (escribir(root_lba + s, b) < 0) return -1;
+            if (escribir(sl, b) < 0) return -1;
 
-            *lba = root_lba + s;
+            *lba = sl;
             *off = (uint32_t)e;
             return 0;
         }
     }
-    return -1;                                   /* directorio raiz lleno */
+}
+
+/* --- Recorrer una ruta ------------------------------------------------
+ *
+ * "/DOCS/NOTAS/A.TXT" se parte en componentes y se baja una a una: se
+ * busca "DOCS" en el raiz, se coge su cluster, se busca "NOTAS" ahi
+ * dentro, y se para antes de la ultima. Lo que sale es el directorio que
+ * CONTIENE lo que se pedia, mas el nombre suelto de la ultima componente.
+ *
+ * Esa separacion no es un capricho de la implementacion: crear, borrar y
+ * renombrar necesitan las dos mitades por separado, porque lo que se toca
+ * es la entrada DENTRO del directorio padre. Un "abrir" que solo devolviera
+ * el fichero no valdria para ninguna de las tres.
+ *
+ * Las rutas llegan siempre absolutas: el servidor no sabe que es un
+ * directorio actual, y no quiere saberlo. Ver fs_abi.h. */
+static int resolver(const char *ruta, uint32_t *dir, char *ultimo)
+{
+    if (ruta[0] != '/') return -1;               /* tiene que ser absoluta */
+
+    uint32_t actual = 0;                         /* el raiz */
+    const char *p = ruta + 1;
+
+    for (;;) {
+        /* Cortar la componente siguiente. */
+        char comp[FS_NAME_MAX];
+        uint32_t n = 0;
+        while (*p && *p != '/' && n < FS_NAME_MAX - 1) comp[n++] = *p++;
+        comp[n] = 0;
+        while (*p && *p != '/') p++;             /* por si era larguisima */
+
+        if (*p != '/') {                         /* era la ultima */
+            if (n == 0) return -1;               /* "/docs/" no nombra nada */
+            *dir = actual;
+            for (uint32_t i = 0; i <= n; i++) ultimo[i] = comp[i];
+            return 0;
+        }
+
+        p++;                                     /* saltar la barra */
+        if (n == 0) continue;                    /* "//", que no estorba */
+
+        /* Componente de en medio: TIENE que ser un directorio. */
+        uint32_t lba, off;
+        if (dir_lookup_en(actual, comp, 1, &lba, &off) < 0) return -1;
+        actual = entrada_cluster(lba, off);
+    }
+}
+
+/* Los dos de siempre, ahora encima de resolver(). */
+static int dir_lookup(const char *ruta, uint32_t *lba, uint32_t *off)
+{
+    uint32_t dir;
+    char ultimo[FS_NAME_MAX];
+    if (resolver(ruta, &dir, ultimo) < 0) return -1;
+    return dir_lookup_en(dir, ultimo, 0, lba, off);
+}
+
+static int dir_create(const char *ruta, uint32_t *lba, uint32_t *off)
+{
+    uint32_t dir;
+    char ultimo[FS_NAME_MAX];
+    if (resolver(ruta, &dir, ultimo) < 0) return -1;
+    return dir_create_en(dir, ultimo, 0x20, lba, off);
 }
 
 /* Leer y modificar un campo de la entrada de directorio. */
@@ -424,60 +649,200 @@ static void a_8_3(const char *nombre, char out[11])
     }
 }
 
-/* --- Buscar en el directorio raiz ------------------------------------- */
-/* Devuelve 0 y rellena cluster/tamanyo, o -1 si no esta. Si 'nombre' es 0,
- * devuelve la entrada numero 'indice' (para listar). */
-static int buscar(const char *nombre, uint32_t indice,
-                  uint32_t *cluster, uint32_t *tam, char salida[12])
+/* --- Buscar y listar, ya con rutas ------------------------------------ */
+
+/* "HOLA    TXT" de vuelta a "HOLA.TXT". */
+static void de_8_3(const uint8_t *d, char salida[FS_NAME_MAX])
 {
-    char patron[11];
-    if (nombre) a_8_3(nombre, patron);
+    int o = 0;
+    for (int i = 0; i < 8 && d[i] != ' '; i++) salida[o++] = (char)d[i];
+    if (d[8] != ' ') {
+        salida[o++] = '.';
+        for (int i = 8; i < 11 && d[i] != ' '; i++) salida[o++] = (char)d[i];
+    }
+    salida[o] = 0;
+}
 
+static void nombre_de_entrada(const struct lfn *l, const uint8_t *d,
+                              char salida[FS_NAME_MAX])
+{
+    if (l->valido && l->nombre[0] && l->suma == suma_83(d)) {
+        for (int i = 0; i < FS_NAME_MAX; i++) salida[i] = l->nombre[i];
+        return;
+    }
+    de_8_3(d, salida);
+}
+
+/* Comparar nombres sin distinguir mayusculas, que es la regla de FAT. */
+static int igual_sin_caja(const char *a, const char *b)
+{
+    for (;; a++, b++) {
+        if (mayus(*a) != mayus(*b)) return 0;
+        if (!*a) return 1;
+    }
+}
+
+/* Localizar lo que nombra una ruta: fichero o directorio, da igual. */
+static int buscar(const char *ruta, uint32_t *cluster, uint32_t *tam,
+                  uint32_t *flags)
+{
+    /* El raiz no tiene entrada de directorio en ninguna parte: no es hijo
+     * de nadie. Asi que no se puede buscar, hay que saberlo.
+     *
+     * Sin esto, preguntar por "/" daba error, y el sintoma aparecia lejos
+     * del sitio: "cd .." desde el primer nivel no funcionaba, porque
+     * chdir comprueba que el destino existe y es un directorio, y el
+     * destino era el raiz. */
+    int solo_barras = 1;
+    for (const char *p = ruta; *p; p++) if (*p != '/') { solo_barras = 0; break; }
+    if (ruta[0] == '/' && solo_barras) {
+        *cluster = 0;
+        *tam     = 0;
+        if (flags) *flags = FS_ES_DIR;
+        return 0;
+    }
+
+    uint32_t dir;
+    char ultimo[FS_NAME_MAX];
+    if (resolver(ruta, &dir, ultimo) < 0) return -1;
+
+    uint32_t lba, off;
+    if (dir_lookup_en(dir, ultimo, -1, &lba, &off) < 0) return -1;
+
+    uint8_t *b = cached(lba);
+    if (!b) return -1;
+
+    *cluster = le16(b + off + 26);
+    *tam     = le32(b + off + 28);
+    if (flags) *flags = (b[off + 11] & 0x10) ? FS_ES_DIR : 0;
+    return 0;
+}
+
+/* El cluster de un directorio dado por su ruta. La raiz es el caso
+ * especial y por eso se mira aparte: "/" no tiene ultima componente que
+ * buscar, y el cluster 0 no se corresponde con ningun dato del disco. */
+static int resolver_dir(const char *ruta, uint32_t *dir)
+{
+    if (ruta[0] != '/') return -1;
+
+    uint32_t cluster, tam, flags;
+    if (buscar(ruta, &cluster, &tam, &flags) < 0) return -1;
+    if (!(flags & FS_ES_DIR)) return -1;
+    *dir = cluster;
+    return 0;
+}
+
+/* La entrada numero 'indice' de un directorio.
+ *
+ * "." y ".." se saltan POR EL NOMBRE, y eso tiene su historia. Un
+ * directorio hecho por TinyOS las lleva con atributo 0x10 (directorio) y
+ * uno hecho por macOS con 0x12 (directorio + oculto). Como aqui se
+ * descartan las ocultas -macOS deja un "._loquesea" al lado de cada
+ * fichero y llenan el listado de basura-, las de macOS desaparecian y las
+ * nuestras no: la MISMA entrada salia o no segun quien hubiera creado el
+ * directorio.
+ *
+ * Mirar el nombre en vez del atributo es lo unico que da el mismo
+ * resultado en los dos casos. Es un recordatorio util: en FAT los
+ * atributos son una sugerencia que cada sistema rellena a su gusto, y
+ * apoyarse en ellos para decidir QUE es algo sale caro. */
+static int listar(uint32_t dir, uint32_t indice, struct fs_info *out)
+{
     uint32_t vistas = 0;
-    uint32_t sectores = (root_entries * 32 + 511) / 512;
 
-    for (uint32_t s = 0; s < sectores; s++) {
-        uint8_t *b = cached(root_lba + s);
+    struct lfn l;
+    lfn_reset(&l);
+
+    for (uint32_t s = 0; ; s++) {
+        uint32_t lba;
+        if (dir_sector(dir, s, &lba) < 0) return -1;
+
+        uint8_t *b = cached(lba);
         if (!b) return -1;
 
         for (int e = 0; e < 512; e += 32) {
             uint8_t *d = b + e;
 
             if (d[0] == 0x00) return -1;          /* fin del directorio */
+
+            /* Las entradas de nombre largo se acumulan; la corta que viene
+             * detras es la que las cobra. */
+            if ((d[11] & 0x0F) == 0x0F) { lfn_add(&l, d); continue; }
+
+            char nombre[FS_NAME_MAX];
+            nombre_de_entrada(&l, d, nombre);
+            lfn_reset(&l);
+
             if (d[0] == 0xE5) continue;           /* borrada            */
-            if ((d[11] & 0x0F) == 0x0F) continue; /* nombre largo       */
             if (d[11] & 0x08) continue;           /* etiqueta de volumen*/
-            if (d[11] & 0x10) continue;           /* subdirectorio      */
             if (d[11] & 0x02) continue;           /* oculta: un Mac deja */
                                                   /* un "._loquesea" al  */
                                                   /* lado de cada fichero*/
 
-            if (nombre) {
-                int igual = 1;
-                for (int i = 0; i < 11; i++)
-                    if (d[i] != (uint8_t)patron[i]) { igual = 0; break; }
-                if (!igual) continue;
-            } else if (vistas++ != indice) {
-                continue;
-            }
+            if (d[0] == '.') continue;            /* "." y "..", ver arriba */
 
-            *cluster = le16(d + 26);
-            *tam     = le32(d + 28);
+            if (vistas++ != indice) continue;
 
-            if (salida) {
-                int o = 0;
-                for (int i = 0; i < 8 && d[i] != ' '; i++) salida[o++] = (char)d[i];
-                if (d[8] != ' ') {
-                    salida[o++] = '.';
-                    for (int i = 8; i < 11 && d[i] != ' '; i++)
-                        salida[o++] = (char)d[i];
-                }
-                salida[o] = 0;
-            }
+            out->size  = le32(d + 28);
+            out->flags = (d[11] & 0x10) ? FS_ES_DIR : 0;
+            for (int i = 0; i < FS_NAME_MAX; i++) out->name[i] = nombre[i];
             return 0;
         }
     }
-    return -1;
+}
+
+/* Crear un directorio.
+ *
+ * Un directorio es un fichero cuyo contenido son entradas de 32 bytes, asi
+ * que crearlo es: pedir un cluster, ponerlo a ceros -el 0x00 de la primera
+ * entrada es lo que marca "aqui se acaba"- y escribir dentro las dos
+ * entradas que tiene todo directorio menos el raiz: "." apuntando a si
+ * mismo y ".." apuntando al padre.
+ *
+ * Ese ".." es la unica forma que tiene FAT de subir un nivel: no hay
+ * indice de padres en ningun sitio, esta escrito en cada hijo. Y el del
+ * primer nivel apunta al cluster 0, que es como se dice "el raiz". */
+static int dir_nuevo(const char *ruta)
+{
+    uint32_t padre;
+    char nombre[FS_NAME_MAX];
+    if (resolver(ruta, &padre, nombre) < 0) return -1;
+
+    uint32_t lba, off;
+    if (dir_lookup_en(padre, nombre, -1, &lba, &off) == 0) return -1;  /* ya existe */
+
+    uint32_t c = alloc_cluster();
+    if (!c) return -1;
+
+    /* A ceros, entero. Un cluster reciclado trae la basura del fichero
+     * anterior, y esa basura se leeria como entradas de directorio. */
+    uint8_t vacio[512];
+    for (int i = 0; i < 512; i++) vacio[i] = 0;
+    for (uint32_t s = 0; s < sec_per_clus; s++)
+        if (escribir(data_lba + (c - 2) * sec_per_clus + s, vacio) < 0) return -1;
+
+    /* "." y "..", a mano, en el primer sector. */
+    uint8_t *b = cached(data_lba + (c - 2) * sec_per_clus);
+    if (!b) return -1;
+
+    for (int i = 0; i < 11; i++) b[i] = ' ';
+    b[0] = '.';
+    b[11] = 0x10;
+    b[26] = (uint8_t)(c & 0xFF);
+    b[27] = (uint8_t)(c >> 8);
+
+    for (int i = 32; i < 43; i++) b[i] = ' ';
+    b[32] = '.'; b[33] = '.';
+    b[43] = 0x10;
+    b[58] = (uint8_t)(padre & 0xFF);
+    b[59] = (uint8_t)(padre >> 8);
+
+    if (escribir(data_lba + (c - 2) * sec_per_clus, b) < 0) return -1;
+
+    /* Y ahora si, la entrada en el padre. La ultima, para que un fallo a
+     * mitad no deje un directorio que se ve pero esta sin estrenar. */
+    if (dir_create_en(padre, nombre, 0x10, &lba, &off) < 0) return -1;
+    return dir_update(lba, off, c, 0);           /* los directorios miden 0 */
 }
 
 /* --- Seguir la cadena de clusters ------------------------------------- */
@@ -599,24 +964,33 @@ int main(int argc, char **argv)
 
         struct fs_request *r = (struct fs_request *)pet.data;
         uint64_t quien = r->port;
-        uint32_t cluster = 0, tam = 0;
-        char nombre[12];
+        uint32_t cluster = 0, tam = 0, flags = 0;
+
+        r->name[FS_PATH_MAX - 1] = 0;         /* venga de donde venga */
 
         switch (pet.type) {
 
         case FS_SIZE:
-            if (buscar(r->name, 0, &cluster, &tam, 0) < 0) {
+            if (buscar(r->name, &cluster, &tam, &flags) < 0) {
                 responder(quien, FS_ERROR, "", 0);
             } else {
                 struct fs_info info;
-                info.size = tam;
-                for (int i = 0; i < FS_NAME_MAX; i++) info.name[i] = r->name[i];
+                info.size  = tam;
+                info.flags = flags;
+
+                /* Solo la ultima componente: quien pregunta por
+                 * "/DOCS/A.TXT" ya sabe la ruta, lo que no sabe es como
+                 * quedo el nombre despues de pasar por 8.3. */
+                uint32_t dir;
+                if (resolver(r->name, &dir, info.name) < 0) info.name[0] = 0;
+
                 responder(quien, FS_OK, &info, sizeof(info));
             }
             break;
 
         case FS_READ: {
-            if (buscar(r->name, 0, &cluster, &tam, 0) < 0) {
+            if (buscar(r->name, &cluster, &tam, &flags) < 0 ||
+                (flags & FS_ES_DIR)) {
                 responder(quien, FS_ERROR, "", 0);
                 break;
             }
@@ -628,16 +1002,23 @@ int main(int argc, char **argv)
             break;
         }
 
-        case FS_LIST:
-            if (buscar(0, (uint32_t)r->arg, &cluster, &tam, nombre) < 0) {
+        /* Ahora LIST lleva la ruta del directorio que se quiere listar, y
+         * no solo el indice: el raiz ha dejado de ser el unico sitio. */
+        case FS_LIST: {
+            uint32_t dir;
+            struct fs_info info;
+            if (resolver_dir(r->name, &dir) < 0)
+                responder(quien, FS_ERROR, "", 0);
+            else if (listar(dir, (uint32_t)r->arg, &info) < 0)
                 responder(quien, FS_EOF, "", 0);
-            } else {
-                struct fs_info info;
-                info.size = tam;
-                for (int i = 0; i < FS_NAME_MAX; i++)
-                    info.name[i] = (i < 12) ? nombre[i] : 0;
+            else
                 responder(quien, FS_OK, &info, sizeof(info));
-            }
+            break;
+        }
+
+        case FS_MKDIR:
+            responder(quien, dir_nuevo(r->name) < 0 ? FS_ERROR : FS_OK,
+                      "", 0);
             break;
 
         case FS_WRITE: {

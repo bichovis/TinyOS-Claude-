@@ -4,10 +4,16 @@
  * PORT_FILES y contesta al puerto que el cliente le diga.
  *
  * El protocolo NO tiene open/close, y es a proposito: cada peticion lleva
- * el nombre del fichero y el desplazamiento. Un servidor sin estado no
- * tiene descriptores que perder cuando un cliente muere sin avisar, ni
- * tabla que limpiar, ni limite de ficheros abiertos. Se paga con una
- * busqueda en el directorio por peticion, que el servidor se cachea.
+ * la ruta del fichero y el desplazamiento. Un servidor sin estado no tiene
+ * descriptores que perder cuando un cliente muere sin avisar, ni tabla que
+ * limpiar, ni limite de ficheros abiertos. Se paga con una busqueda en el
+ * directorio por peticion, que el servidor se cachea.
+ *
+ * DESDE EL PASO 31 LAS RUTAS SON ABSOLUTAS, SIEMPRE. El servidor no sabe
+ * que es un "directorio actual" ni quiere saberlo: eso es estado de cada
+ * proceso, y un servidor sin estado que preguntara por el dejaria de
+ * serlo. Quien manda la peticion resuelve antes la ruta con realpath(),
+ * que es una llamada al kernel, que es quien guarda el cwd.
  */
 #pragma once
 #include "ipc_abi.h"
@@ -21,28 +27,39 @@
 #define FS_WRITE       4     /* name + arg=offset + data -> escribe        */
 #define FS_CREATE      5     /* name -> lo crea, o lo vacia si ya estaba   */
 #define FS_DELETE      6     /* name -> lo borra                           */
+#define FS_MKDIR       7     /* name -> crea un directorio                 */
 
 /* --- Respuestas (message.type) ---------------------------------------- */
 #define FS_OK        100
 #define FS_ERROR     101     /* no existe, o la tarjeta fallo              */
 #define FS_EOF       102     /* no queda nada que leer ahi                 */
 
-/* Lo que va en message.data de una peticion. Ocupa los 128 bytes justos.
+/* Lo que va en message.data de una peticion. Ocupa los 256 bytes justos.
  *
- * El nombre baja a 16 bytes porque un 8.3 son doce caracteres y el cero:
- * lo que sobra se aprovecha para los datos, que es lo que escasea. */
-#define FS_NAME_MAX    16
-#define FS_CHUNK       96    /* bytes utiles por mensaje de lectura/escritura */
+ * La ruta son 64 bytes: con 8.3 por componente eso da unos cinco niveles,
+ * de sobra para un volumen FAT16. Lo que sobra es para los datos, que es
+ * lo que escasea. */
+#define FS_PATH_MAX    64
+#define FS_NAME_MAX    64    /* una componente suelta, con nombre largo    */
+#define FS_CHUNK      176    /* bytes utiles por mensaje de lectura/escritura */
 
 struct fs_request {
     unsigned long port;              /* a donde contestar                  */
     unsigned long arg;               /* desplazamiento, o indice en LIST   */
-    char          name[FS_NAME_MAX]; /* "HOLA.TXT", en formato 8.3         */
+    char          name[FS_PATH_MAX]; /* "/DOCS/HOLA.TXT", absoluta         */
     char          data[FS_CHUNK];    /* lo que se escribe                  */
 };
 
 /* En una respuesta a FS_SIZE o FS_LIST, esto es lo que va en data. */
+#define FS_ES_DIR   1
+
 struct fs_info {
     unsigned long size;
-    char          name[FS_NAME_MAX];
+    unsigned long flags;             /* FS_ES_DIR si es un directorio      */
+    char          name[FS_NAME_MAX]; /* solo la componente, no la ruta     */
 };
+
+/* Ojo a la tension entre los dos tamanyos: una componente puede tener 63
+ * caracteres pero la RUTA entera sigue midiendo 64. O sea que un nombre
+ * largo cabe en el raiz y no cabe tres niveles abajo. Subir FS_PATH_MAX
+ * obligaria a bajar FS_CHUNK, porque los dos salen del mismo mensaje. */

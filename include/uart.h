@@ -30,6 +30,7 @@ void uart_dec(uint64_t v);
 /* --- Recepcion por interrupcion --------------------------------------- */
 void uart_enable_rx_irq(void);      /* pide a la PL011 que avise al recibir */
 void uart_irq(void);
-void uart_push(const char *buf, uint64_t n);                /* lo llama irq.c cuando salta la IRQ   */
+void uart_push(const char *buf, uint64_t n);
+extern uint64_t uart_perdidos;       /* teclas tiradas por falta de sitio */                /* lo llama irq.c cuando salta la IRQ   */
 int  uart_read(char *out);          /* saca un byte del buffer: 1=hay, 0=no */
 int  uart_getc_blocking(void);   /* -1 si lo interrumpe una senyal */      /* duerme el hilo hasta que llegue algo */

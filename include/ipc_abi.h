@@ -10,7 +10,17 @@
 /* 128 y no 48: una peticion de escritura tiene que llevar el nombre del
  * fichero Y los datos en el mismo mensaje. Con 8 puertos de 8 mensajes,
  * la cola entera del kernel son 10 KB de .bss. */
-#define MSG_DATA_MAX   128
+/* Un mensaje lleva 256 bytes de datos. Eran 128 hasta el paso 31, y
+ * crecieron porque una peticion al servidor de ficheros tiene que llevar
+ * ahora una RUTA entera y no un nombre de doce caracteres. Con 128 no
+ * cabian las dos cosas: o la ruta era ridicula o el trozo de fichero se
+ * quedaba en la mitad.
+ *
+ * Lo que cuesta: cada puerto tiene ocho huecos, y hay ocho puertos, asi
+ * que el kernel pasa de 9,7 KB de colas a 17,9 KB. A cambio, FS_CHUNK
+ * sube de 96 a 176 bytes y leer un fichero necesita casi la mitad de
+ * viajes. */
+#define MSG_DATA_MAX         256
 
 struct message {
     unsigned long from;             /* pid del remitente: lo pone el kernel */
@@ -75,6 +85,17 @@ struct message {
 /* Abrir un fichero de la tarjeta y quedarselo en un descriptor. Es lo que
  * hace falta para que el shell pueda redirigir con > y <. */
 #define SYS_open         29   /* (nombre, modo) -> fd | -1                  */
+
+/* El directorio actual de un proceso. Se hereda en el fork y sobrevive al
+ * exec; por eso "cd" tiene que ser una orden interna del shell y no un
+ * programa (ver sched.h). */
+#define SYS_chdir        30   /* (ruta) -> 0 | -1                           */
+#define SYS_getcwd       31   /* (buffer, bytes) -> 0 | -1                  */
+
+/* Unir el cwd con una ruta relativa y normalizar. Lo hace el kernel para
+ * que solo haya UNA implementacion: la usan los programas y la usa el
+ * propio kernel para la redireccion. */
+#define SYS_realpath     32   /* (ruta, salida) -> 0 | -1                   */
 
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */

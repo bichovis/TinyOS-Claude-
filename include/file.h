@@ -13,6 +13,7 @@
 #pragma once
 #include <stdint.h>
 #include "sync.h"
+#include "fs_abi.h"
 
 #define MAX_FD     8
 #define PIPE_BUF   1024
@@ -27,7 +28,9 @@ struct pipe {
 
 enum { F_LIBRE = 0, F_CONSOLA, F_PIPE_R, F_PIPE_W, F_FICHERO };
 
-#define FICH_NOMBRE  16
+/* Un descriptor guarda la RUTA ENTERA, ya absoluta. Cabe de sobra, porque
+ * el servidor no admite ninguna mas larga. */
+#define FICH_NOMBRE  FS_PATH_MAX
 
 struct fichero {
     int          tipo;
@@ -49,6 +52,14 @@ int64_t file_read(struct fichero *f, uint64_t uva, uint64_t n);
 int64_t file_write(struct fichero *f, uint64_t uva, uint64_t n);
 void    file_dup(struct fichero *f);
 void    file_close(struct fichero *f);
+
+/* Unir el directorio actual con una ruta relativa, y normalizar. Es
+ * textual: no mira el disco. Ver src/path.c. */
+int path_resolve(const char *base, const char *rel, char *out, uint64_t cap);
+
+/* Comprobar que una ruta absoluta nombra un directorio. Lo pregunta al
+ * servidor, que es el unico que lo sabe. */
+int fs_es_directorio(const char *ruta);
 
 /* Abre un fichero de la tarjeta. modo es O_LEER u O_ESCRIBIR. */
 struct fichero *file_open(const char *nombre, int modo);

@@ -44,7 +44,9 @@ int main(int argc, char **argv)
         printf("\n  uso: run PROGRAMA.ELF [argumentos]\n");
         exit(1);
     }
-    const char *programa = argv[1];
+    char ruta[FS_PATH_MAX];
+    if (realpath(argv[1], ruta) < 0) { printf("  [run] ruta imposible\n"); exit(1); }
+    const char *programa = ruta;
     juntar_args(argc, argv);
 
     int64_t mio = port_create(-1);

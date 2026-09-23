@@ -1219,6 +1219,10 @@ int task_exec(const uint8_t *image, uint64_t size, const char *args,
     fp_hw_disable();
     fp_release(t);
 
+    /* El directorio actual NO se toca, y esa ausencia es la regla: el
+     * programa cambia, el sitio donde estabas no. Es lo que hace que
+     * "cd docs" seguido de "cat notas.txt" funcione. */
+
     /* El MMIO concedido NO se hereda: se le dio al programa que habia, y
      * ese programa ya no existe. Un driver que hace exec deja de ser un
      * driver. */
@@ -1336,6 +1340,11 @@ int task_fork(struct trap_frame *f)
     t->counter   = TASK_QUANTUM;
     t->ticks_run = 0;
     t->mmio_va   = padre->mmio_va;
+
+    /* El directorio actual se hereda. Es lo que hace que "cd docs" en el
+     * shell tenga efecto sobre lo que ejecutes despues. */
+    for (int i = 0; i < FS_PATH_MAX; i++) t->cwd[i] = padre->cwd[i];
+
     t->brk_base  = padre->brk_base;
     t->brk       = padre->brk;
     t->stack_low = padre->stack_low;
@@ -1454,6 +1463,11 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->fp_state  = 0;
     t->fp_activo = 0;
     t->fp_pedida = 0;
+
+    /* Y en el raiz. Un proceso creado desde el menu del kernel no tiene de
+     * quien heredar un directorio actual. */
+    t->cwd[0] = '/';
+    t->cwd[1] = 0;
 
     /* Entrada, salida y errores a la consola. Si quien lo arranca quiere
      * otra cosa, que los cambie despues. */

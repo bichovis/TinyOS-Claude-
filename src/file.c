@@ -228,6 +228,16 @@ static int fs_transaccion(uint64_t tipo, const char *nombre, uint64_t off,
     return ok;
 }
 
+int fs_es_directorio(const char *ruta)
+{
+    struct message resp;
+    if (fs_transaccion(FS_SIZE, ruta, 0, 0, 0, &resp) < 0) return 0;
+    if (resp.type != FS_OK) return 0;
+
+    struct fs_info *i = (struct fs_info *)resp.data;
+    return (i->flags & FS_ES_DIR) ? 1 : 0;
+}
+
 struct fichero *file_open(const char *nombre, int modo)
 {
     struct message resp;

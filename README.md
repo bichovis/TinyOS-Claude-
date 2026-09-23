@@ -85,6 +85,8 @@ Tres cosas que QEMU perdona y el silicio no:
 | 28   | Redireccion: < y >                          | hecho  |
 | 29   | Una libc: crt0, printf y libc.a             | hecho  |
 | 30   | Coma flotante, y el fallo como aviso        | hecho  |
+| 31   | Subdirectorios, y el directorio actual      | hecho  |
+| 32   | Nombres largos, y una interrupcion perdida  | hecho  |
 
 ## Estructura
 
@@ -112,8 +114,11 @@ Tres cosas que QEMU perdona y el silicio no:
                  trap.c      atrapa Ctrl-C     kill.c  manda senyales
                  upper.c     filtro: lee de la entrada y escribe en la salida
                  wc.c        cuenta lo que le pasa por delante
+                 mkdir.c     crea un directorio
+                 fp.c        coma flotante: cuentas y supervivencia
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
+    path.c       juntar el directorio actual con una ruta relativa
     fpu.c        cuando encender la FPU y a quien salvarsela
     fpu.S        los 32 registros de 128 bits, y CPACR_EL1
     lib/         la libc de los programas, archivada en build/libc.a:
@@ -1610,6 +1615,246 @@ entero y fraccion, que es lo que hace que `0.9999` con dos decimales salga
 `-mgeneral-regs-only` precisamente por esto; el kernel, que si lo lleva, no
 podria tener un `printf` con decimales aunque quisiera.
 
+## Subdirectorios, y el directorio actual
+
+El sistema de ficheros llevaba dieciseis pasos siendo el enano de la casa:
+procesos que se bifurcan, se comunican, se senyalan y redirigen, y una
+tarjeta plana con dieciocho ficheros en un solo monton.
+
+**El raiz de FAT16 no es un directorio.** Esa es la primera sorpresa. Un
+subdirectorio es un fichero normal cuyo contenido son entradas de 32 bytes:
+una cadena de clusters, que crece como cualquier otra. El raiz, en cambio,
+es una **region de sectores fija**, puesta detras de las FAT, con un numero
+de entradas decidido al formatear y que no se puede cambiar nunca. No tiene
+entrada de directorio en ninguna parte, porque no es hijo de nadie.
+
+Son dos cosas distintas de verdad, y la unica forma de no escribir dos
+veces cada recorrido es esconder la diferencia detras de una pregunta:
+
+```c
+    static int dir_sector(uint32_t dir, uint32_t n, uint32_t *lba);
+```
+
+"Dame el sector numero N de este directorio". El cluster 0 quiere decir el
+raiz, y sirve de marca porque no existe como cluster de datos: los validos
+empiezan en el 2. Con esa funcion, buscar, crear y listar son el mismo
+codigo para los dos casos.
+
+(De ahi viene, por cierto, que en FAT16 se pueda llenar el directorio raiz
+teniendo el disco medio vacio. El raiz tiene tope; los demas no.)
+
+**Resolver una ruta devuelve DOS cosas.** `/DOCS/NOTAS/A.TXT` se parte en
+componentes y se baja una a una, parando **antes** de la ultima:
+
+```c
+    static int resolver(const char *ruta, uint32_t *dir, char *ultimo);
+```
+
+Lo que sale es el directorio que CONTIENE lo que se pedia, mas el nombre
+suelto. Esa separacion no es un detalle de implementacion: crear, borrar y
+renombrar necesitan las dos mitades por separado, porque lo que se toca es
+la entrada DENTRO del directorio padre. Un "abrir" que solo devolviera el
+fichero no valdria para ninguna de las tres.
+
+## El directorio actual, o estado que no es memoria
+
+Aqui esta lo que hace este paso distinto de los anteriores. Un proceso
+tiene memoria, descriptores, senyales, registros de FPU. El directorio
+actual **no es ninguna de esas cosas**: son sesenta y cuatro bytes de texto
+que no significan nada para el hardware y todo para quien abre un fichero.
+
+```c
+    char cwd[FS_PATH_MAX];      /* en struct task */
+```
+
+Lo interesante es como se comporta en los tres momentos que ya conoces:
+
+| suceso | senyales | FPU | cwd |
+|--------|----------|-----|-----|
+| `fork` | se heredan | se hereda | **se hereda** |
+| `exec` | se borran  | se borra  | **sobrevive** |
+| morir  | se pierde  | se libera | se pierde |
+
+Esa casilla de `exec` es la unica de su columna, y es la que importa: el
+programa cambia, el sitio donde estabas no. Sin ella, `cd docs` seguido de
+`cat notas.txt` no funcionaria.
+
+**Y de ahi sale que `cd` tenga que ser una orden interna del shell.** No
+por comodidad ni por velocidad: si fuera un programa, el shell se
+bifurcaria, el hijo cambiaria SU directorio -que se hereda, pero hacia
+abajo- y al morir se lo llevaria consigo. El shell seguiria donde estaba.
+Es la unica orden de este interprete que no puede ser un fichero en la
+tarjeta, y es exactamente el mismo motivo por el que en cualquier Unix
+tampoco lo es.
+
+**Una sola implementacion de la normalizacion.** El servidor de ficheros
+solo entiende rutas absolutas, y es a proposito: no tiene estado, y el
+directorio actual es estado. Asi que alguien tiene que unir las dos cosas,
+y ese alguien resulta ser el kernel dos veces: para la redireccion (`>`
+sobre una ruta relativa) y para los programas, que hablan con el servidor
+por su cuenta.
+
+Dos implementaciones -una en el kernel, otra en la libc- acabarian
+discrepando en algun caso raro, `/a/../..` o `a//b`, y el sintoma seria que
+el shell y el programa no ven el mismo fichero. De ahi `SYS_realpath`: hay
+una funcion, `path_resolve()`, y los programas usan la del kernel.
+
+Lo que hace es **puramente textual**: no toca el disco, `.` se tira y `..`
+quita la componente anterior. Conviene saber que eso solo es correcto
+porque FAT no tiene enlaces simbolicos: con ellos, `/a/b/..` no tiene por
+que ser `/a`.
+
+**Un PATH de dos sitios.** En cuanto hay subdirectorios, `cd docs` te deja
+sin ordenes: `ls` ya no esta donde estas. El shell busca ahora el
+ejecutable primero en el directorio actual y luego en el raiz. Es la
+version mas pequenya posible de una idea que en Unix es una variable de
+entorno con ocho sitios, y esta aqui por el mismo motivo exacto.
+
+## Lo que el disco dijo cuando le pregunte
+
+Dos cosas salieron mal, y las dos merecen contarse.
+
+**El raiz no sabia describirse a si mismo.** `cd ..` desde el primer nivel
+fallaba con "no puedo entrar en ..". La causa estaba lejos del sintoma:
+`chdir` comprueba que el destino existe y es un directorio, para eso
+pregunta al servidor por `/`, y `resolver("/")` no encontraba ninguna
+ultima componente que buscar. El raiz no tiene entrada de directorio en
+ningun sitio, asi que no se puede **buscar**: hay que saberlo. Cuatro
+lineas de caso especial, en el unico sitio donde el caso especial existe de
+verdad.
+
+**Y una hipotesis que resulto falsa.** Al listar, el `/prueba` que habia
+creado TinyOS ensenyaba `.` y `..`, y el `/docs` que habia creado el Mac
+no. Supuse que macOS no las escribia. Lo comprobe con un volcado del
+sector, que es lo que habia que hacer antes de suponer nada:
+
+```
+     0  name='.          '  attr=0x12
+     1  name='..         '  attr=0x12
+     2  name='NOTAS      '  attr=0x10
+     ...
+     4  name='_NOTA~3    '  attr=0x22      <- el "._NOTAS" de macOS
+```
+
+macOS **si** las escribe. Lo que hace es marcarlas con 0x12: directorio
+**mas oculto**. Y este servidor descarta las ocultas, porque macOS deja un
+`._loquesea` al lado de cada fichero y sin ese filtro el listado es la
+mitad basura. Asi que la MISMA entrada aparecia o no segun quien hubiera
+creado el directorio.
+
+Se arregla mirando el **nombre** y no el atributo, que es lo unico que da
+el mismo resultado en los dos casos. Y deja una leccion sobre FAT que vale
+mas que el arreglo: **los atributos son una sugerencia que cada sistema
+rellena a su gusto**, y apoyarse en ellos para decidir QUE es algo sale
+caro.
+
+## Nombres largos, y el truco de 1995
+
+Con subdirectorios funcionando, un `ls` de la tarjeta de verdad devolvio
+esto:
+
+```
+    ENSA~209.ELF   101240 bytes
+```
+
+El nombre estaba ahi, entero, en el disco. Lo que pasaba es que este
+servidor solo leia la entrada de 8.3 y tiraba las otras.
+
+FAT guarda los nombres en 8.3 y punto. Los largos se anyadieron despues, y
+el truco con el que se hizo es de los mas elegantes que hay: delante de la
+entrada corta de toda la vida se ponen entradas EXTRA con el atributo
+**0x0F**, que es solo-lectura + oculto + sistema + etiqueta-de-volumen a la
+vez. Una combinacion que no tiene ningun sentido.
+
+Y ahi esta la gracia. MS-DOS, que no sabia nada de esto, las descartaba
+por absurdas y seguia viendo el disco entero con sus nombres cortos. Un
+formato ampliado **sin romper a quien no entiende la ampliacion**, y sin
+un bit de version en ninguna parte.
+
+Cada entrada extra lleva 13 caracteres UTF-16 repartidos en tres huecos
+(bytes 1-10, 14-25 y 28-31), porque tuvieron que colarse entre los campos
+que ya existian. Van en orden **inverso**: la primera que aparece en el
+disco es el ultimo trozo del nombre, y lleva el bit 0x40 para decir "por
+aqui empieza".
+
+Y una **suma de comprobacion del nombre corto**, repetida en cada trozo.
+No es paranoia: si un sistema antiguo renombra el fichero, toca la entrada
+corta y deja las largas huerfanas, apuntando a un nombre que ya no existe.
+La suma detecta ese desacuerdo, y entonces se usa el corto, que siempre
+esta. Es una decision de disenyo que asume que **otro sistema va a tocar
+tus datos sin entenderlos**, y sigue funcionando cuando pasa.
+
+El acumulador vive fuera del bucle de sectores, y no es un detalle: una
+cadena de entradas largas puede empezar al final de un sector y acabar en
+el siguiente, que es justo lo que pasa con los nombres mas largos.
+
+Hay una tension que conviene ver: una componente puede medir 63
+caracteres, pero la RUTA entera sigue midiendo 64. Un nombre largo cabe en
+el raiz y no cabe tres niveles abajo. Subir el limite obligaria a bajar
+`FS_CHUNK`, porque los dos salen del mismo mensaje de 256 bytes.
+
+## Una interrupcion perdida, y una conclusion que estaba mal
+
+Probando los nombres largos, el shell se quedaba a medias de una linea:
+veintitantos caracteres y nunca mas. Lo di por un artefacto de las
+pruebas -mi guion tecleaba mas rapido de lo que QEMU consume- y lo escribi
+asi en las limitaciones.
+
+**Era un fallo de verdad, y bueno.**
+
+El driver de consola vaciaba la FIFO y **despues** reconocia la
+interrupcion en el chip:
+
+```c
+    while (!(*fr & FR_RXFE)) { ...sacar bytes... }
+    *icr = INT_RX | INT_RT;              /* <- tarde */
+```
+
+Si llega un byte entre el "ya esta vacia" y el reconocimiento, el
+reconocimiento borra el aviso que ese byte acaba de levantar. Y el byte se
+queda **dentro** de la FIFO. Como esta por debajo del umbral que dispara la
+interrupcion, nadie vuelve a avisar nunca: la UART tiene datos, el driver
+no lo sabe, y el teclado se muere en silencio a mitad de una linea.
+
+La cura es reconocer **antes** y volver a mirar despues:
+
+```c
+    do {
+        *icr = INT_RX | INT_RT;          /* primero */
+        while (!(*fr & FR_RXFE)) { ...sacar bytes... }
+    } while (!(*fr & FR_RXFE));          /* ¿entro algo mientras? */
+```
+
+Reconociendo antes, cualquier byte que llegue durante el vaciado deja su
+aviso en pie. Y el bucle de fuera cubre el caso simetrico: si entro algo
+justo despues del ultimo `FR_RXFE`, se ve ahi mismo en vez de esperar un
+aviso que quiza no llegue.
+
+**Lo que hay que aprender de esto no es el arreglo.** El arreglo son cuatro
+lineas. Lo que costo caro fue haber tenido la explicacion correcta
+delante -"se pierde entrada cuando tecleo deprisa"- y haberla archivado
+como problema de la prueba en vez de seguir tirando. Una prueba que falla
+de forma reproducible no es ruido aunque el fallo sea incomodo.
+
+Tres cosas mas salieron de ahi, todas del mismo estilo:
+
+- **`uart_push` tiraba caracteres en silencio.** El anillo son 64 bytes,
+  quien lee va a su ritmo, y lo que sobra se pierde: es inevitable sin
+  control de flujo en el cable. Lo que no tiene por que ser inevitable es
+  no enterarse. Ahora dice `entrada demasiado rapida: 23 caracteres
+  perdidos (179 en total)`, y con eso el sintoma deja de ser un misterio.
+
+- **Enmascarar y no avisar mataba la consola.** En `irq_handle`, la
+  interrupcion se cierra y luego se manda el mensaje al driver. Si el
+  mensaje no cabe en la cola, la fuente quedaba cerrada esperando un
+  `irq_ack` que nadie iba a hacer. Son dos pasos que tienen que pasar los
+  dos o ninguno; ahora, si el aviso falla, se reabre.
+
+- **El driver detecta el overrun del hardware.** Al leer `DR`, los bits de
+  arriba no son datos: el 11 dice que llego un byte y no cabia. QEMU no
+  parece modelarlo -nunca se encendio-, pero en silicio si pasa, y estaba
+  sin mirar.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -1643,8 +1888,21 @@ podria tener un `printf` con decimales aunque quisiera.
 - Solo se puede pedir la interrupcion de la UART. La lista de fuentes que
   un proceso puede reclamar esta escrita a mano en `irq_register()`; un
   sistema serio la sacaria de un arbol de dispositivos.
-- El servidor de ficheros entiende FAT16 y solo mira el directorio raiz:
-  nada de FAT32 ni de subdirectorios.
+- El servidor de ficheros entiende FAT16 y nombres 8.3: nada de FAT32 ni
+  de nombres largos. Los `~1` que deja Windows o macOS se ven tal cual.
+- No hay `rmdir`, ni `mv`, ni borrado recursivo. Y `rm` sobre un
+  directorio no lo comprueba: se puede dejar una entrada sin sus datos.
+- La ruta son 64 bytes y cada componente 8.3, o sea unos cinco niveles.
+- El anillo de entrada de la consola son 64 bytes y lo que no cabe se
+  pierde. Ahora al menos lo dice; un terminal de verdad tendria control de
+  flujo (XON/XOFF o RTS/CTS) y no perderia nada.
+- Los nombres largos se LEEN pero no se escriben: un fichero creado desde
+  TinyOS se guarda en 8.3, en mayusculas y truncado.
+- De los nombres largos solo se entiende el ASCII. Lo de fuera sale como
+  '?', a proposito: un byte truncado al azar daria un nombre que parece
+  bueno y no abre nada.
+- El shell parte la linea por espacios y no tiene comillas, asi que un
+  fichero cuyo nombre lleve espacios se puede listar pero no abrir.
 - No hay diario ni nada que se le parezca: un corte de corriente a mitad de
   una escritura deja el volumen inconsistente, como en 1980.
 - Los ficheros nuevos no llevan fecha. FAT tiene campos para ella, pero la

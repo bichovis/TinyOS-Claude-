@@ -25,8 +25,8 @@ int main(int argc, char **argv)
     struct fs_request r;
     r.port = (unsigned long)mio;
     r.arg  = 0;
-    for (int i = 0; i < FS_NAME_MAX; i++) r.name[i] = 0;
-    memcpy(r.name, argv[1], strlen(argv[1]) + 1);
+    for (int i = 0; i < FS_PATH_MAX; i++) r.name[i] = 0;
+    if (realpath(argv[1], r.name) < 0) { printf("  [rm] ruta imposible\n"); exit(1); }
 
     m.type = FS_DELETE;
     m.len  = 0;
