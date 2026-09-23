@@ -18,7 +18,7 @@ struct port {
 };
 
 void ipc_init(void);
-int  port_create(uint64_t owner_pid);                       /* id o -1      */
+int  port_create(uint64_t owner_pid, int64_t want);                       /* id o -1      */
 int  port_send(int id, const struct message *m);            /* 0 o -1       */
 int  port_recv(int id, struct message *out, uint64_t pid);  /* 0 o -1       */
 void ipc_release_ports(uint64_t pid);   /* al morir un proceso              */

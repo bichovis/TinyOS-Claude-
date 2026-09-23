@@ -49,7 +49,7 @@ void _start(void)
         exit(1);
     }
 
-    int64_t port = port_create();
+    int64_t port = port_create(PORT_CONSOLE);
     if (port != PORT_CONSOLE) {
         kprint("  [conserver] no he podido quedarme el puerto 0\n");
         exit(1);

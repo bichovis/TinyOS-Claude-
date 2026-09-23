@@ -19,12 +19,74 @@
 extern const uint8_t  user_hello[];      extern const uint64_t user_hello_size;
 extern const uint8_t  user_conserver[];  extern const uint64_t user_conserver_size;
 extern const uint8_t  user_client[];     extern const uint64_t user_client_size;
+extern const uint8_t  user_fs[];         extern const uint64_t user_fs_size;
+extern const uint8_t  user_ls[];         extern const uint64_t user_ls_size;
+extern const uint8_t  user_cat[];        extern const uint64_t user_cat_size;
+extern const uint8_t  user_run[];        extern const uint64_t user_run_size;
 
 /* Registros de la PL011. Se los concedemos al driver de consola para que
  * pueda hacer su trabajo desde EL0 sin pasar por el kernel. Aqui hace falta
  * la direccion FISICA (es la que se va a meter en una tabla de paginas),
  * no la virtual por la que los ve el kernel. */
 #define UART0_PHYS  (PERIPHERAL_PA + 0x201000)
+
+/* Registros del controlador EMMC. Se los concedemos al servidor de
+ * ficheros por el mismo camino: una pagina de MMIO en su espacio, y a
+ * partir de ahi habla con la tarjeta sin pasar por el kernel. */
+#define EMMC_PHYS   (PERIPHERAL_PA + 0x300000)
+
+/* --- Enrutar los pines de la tarjeta al EMMC --------------------------
+ *
+ * En la Pi 3 hay DOS controladores de SD: el Arasan (el EMMC de arriba) y
+ * el SDHOST de Broadcom. Por defecto el EMMC esta cableado al modulo WiFi
+ * y no al zocalo de la tarjeta; para que hable con la SD hay que llevar los
+ * GPIO 48 a 53 a su funcion alternativa 3.
+ *
+ * QEMU no emula el multiplexado de pines, asi que alli el driver funciona
+ * sin esto y en la placa no funciona en absoluto.
+ *
+ * Y esto lo hace el KERNEL, no el driver, aunque el driver viva en EL0 y
+ * sea el dueño del periferico. El motivo es que el bloque GPIO es uno solo
+ * para toda la placa: darle al servidor de ficheros la pagina del GPIO
+ * seria darle tambien los pines de la UART, y con ellos la posibilidad de
+ * dejar al sistema sin consola. Conceder un periferico incluye enrutarle
+ * los pines, y el pin mux se queda donde estan los privilegios.
+ */
+#define GPIO_BASE   (PERIPHERAL_BASE + 0x200000)
+#define GPPUD       (GPIO_BASE + 0x94)
+#define GPPUDCLK1   (GPIO_BASE + 0x9C)
+
+static void gpio_function(int pin, uint32_t fn)
+{
+    uint64_t reg   = GPIO_BASE + 4 * (pin / 10);
+    int      shift = (pin % 10) * 3;
+    uint32_t v     = mmio_read(reg);
+
+    v &= ~(7u << shift);
+    v |=  (fn & 7u) << shift;
+    mmio_write(reg, v);
+}
+
+static void sd_route_pins(void)
+{
+    gpio_function(47, 0);                   /* deteccion de tarjeta: entrada */
+    for (int pin = 48; pin <= 53; pin++)
+        gpio_function(pin, 7);              /* ALT3 = EMMC                   */
+
+    /* Resistencias de pull-up en los seis. La secuencia es la que manda el
+     * manual de Broadcom y no se puede abreviar: poner el modo, esperar,
+     * marcar los pines, esperar, y limpiar las dos cosas. */
+    uint32_t pines = 0;
+    for (int pin = 47; pin <= 53; pin++)
+        pines |= 1u << (pin - 32);          /* GPPUDCLK1 cubre el 32 al 53 */
+
+    mmio_write(GPPUD, 2);                   /* 2 = pull-up */
+    delay_cycles(150);
+    mmio_write(GPPUDCLK1, pines);
+    delay_cycles(150);
+    mmio_write(GPPUD, 0);
+    mmio_write(GPPUDCLK1, 0);
+}
 
 /* Ventana virtual para los experimentos, dentro del espacio del kernel pero
  * fuera del mapa lineal: ahi no hay nada fisico. Que funcione es justamente
@@ -371,6 +433,10 @@ static void menu(void)
     uart_puts("  x - traducciones VA -> PA del kernel\n");
     uart_puts("  j - estado de los cuatro nucleos\n");
     uart_puts("  d - que los hilos de demostracion hablen (o se callen)\n");
+    uart_puts("  f - arrancar el SERVIDOR DE FICHEROS (driver SD en EL0)\n");
+    uart_puts("  o - listar la tarjeta\n");
+    uart_puts("  a - volcar HOLA.TXT de la tarjeta\n");
+    uart_puts("  e - cargar HELLO.BIN de la tarjeta y ejecutarlo\n");
     uart_puts("  w - los 4 nucleos contra un contador (con y sin cerrojo)\n");
     uart_puts("  b - medir velocidad de la memoria\n");
     uart_puts("  t - tiempo e interrupciones\n");
@@ -460,6 +526,34 @@ static void command(char c)
     case 'r':
         demo_readonly();
         break;
+
+    case 'f': {
+        uart_puts("\n  [kernel] enrutando los pines de la tarjeta al EMMC\n");
+        sd_route_pins();
+        uart_puts("  [kernel] arrancando el servidor de ficheros en EL0,\n");
+        uart_puts("           con la pagina del EMMC mapeada en su espacio\n");
+        int pid = task_create_user("fs", user_fs, user_fs_size, EMMC_PHYS);
+        if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
+        break;
+    }
+
+    case 'o': {
+        int pid = task_create_user("ls", user_ls, user_ls_size, 0);
+        if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
+        break;
+    }
+
+    case 'a': {
+        int pid = task_create_user("cat", user_cat, user_cat_size, 0);
+        if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
+        break;
+    }
+
+    case 'e': {
+        int pid = task_create_user("run", user_run, user_run_size, 0);
+        if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
+        break;
+    }
 
     case 'd':
         verboso = !verboso;

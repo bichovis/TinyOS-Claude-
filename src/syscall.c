@@ -15,6 +15,7 @@
 #include "timer.h"
 #include "mm.h"
 #include "ipc.h"
+#include "mbox.h"
 
 extern struct mutex *console_mutex(void);
 
@@ -135,7 +136,7 @@ void syscall_dispatch(struct trap_frame *f)
         break;
 
     case SYS_port_create:
-        ret = port_create(current->pid);
+        ret = port_create(current->pid, (int64_t)f->x[0]);
         break;
 
     case SYS_send:
@@ -145,6 +146,35 @@ void syscall_dispatch(struct trap_frame *f)
     case SYS_recv:
         ret = sys_recv(a0, a1);
         break;
+
+    /* Crear un proceso con una imagen que trae el llamante.
+     *
+     * El puntero es del espacio del proceso que llama, y aqui se puede
+     * desreferenciar sin mas porque TTBR0 sigue siendo el suyo: estamos
+     * dentro de SU syscall. task_create_user() copia de ahi a las paginas
+     * del hijo. Si nos desalojan a medias, al volver TTBR0 vuelve con
+     * nosotros. */
+    case SYS_spawn: {
+        uint64_t buf = f->x[0], len = f->x[1];
+
+        if (len == 0 || len > 256 * 1024) { ret = -1; break; }
+        if (!user_readable(buf, len))     { ret = -1; break; }
+
+        ret = task_create_user("spawn", (const uint8_t *)buf, len, 0);
+        break;
+    }
+
+    /* Un driver de EL0 no puede hablar con el buzon de la GPU: el buzon es
+     * uno solo para toda la maquina y darlo entero seria dar el control de
+     * la placa. Pero si necesita saber a que velocidad va su reloj, porque
+     * de ahi sale el divisor. El kernel contesta a esa pregunta concreta y
+     * a ninguna mas. */
+    case SYS_clock_rate: {
+        uint64_t id = f->x[0];
+        if (id != CLK_EMMC && id != CLK_UART && id != CLK_CORE) { ret = -1; break; }
+        ret = (int64_t)mbox_clock_rate((uint32_t)id);
+        break;
+    }
 
     case SYS_mmio_base:
         /* El kernel concede el MMIO al crear el proceso; aqui solo le

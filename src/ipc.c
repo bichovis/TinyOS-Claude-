@@ -37,10 +37,31 @@ void ipc_init(void)
         ports[i].in_use = 0;
 }
 
-int port_create(uint64_t owner_pid)
+/* 'want' es el puerto que se pide, o -1 para cualquiera.
+ *
+ * Poder pedir uno concreto es lo que permite que existan puertos CONOCIDOS:
+ * un cliente tiene que saber a donde escribirle al servidor de ficheros sin
+ * preguntarle a nadie. Si el numero dependiera del orden de arranque, todo
+ * el invento se vendria abajo el dia que se arranque al reves. */
+int port_create(uint64_t owner_pid, int64_t want)
 {
     uint64_t f = sched_lock_irqsave();
     int id = -1;
+
+    if (want >= 0) {
+        if (want < MAX_PORTS && !ports[want].in_use) {
+            struct port *p = &ports[want];
+            p->in_use = 1;
+            p->owner  = owner_pid;
+            p->head = p->tail = p->count = 0;
+            p->sent = p->received = 0;
+            p->receivers.head = p->receivers.tail = 0;
+            p->senders.head   = p->senders.tail   = 0;
+            id = (int)want;
+        }
+        sched_unlock_irqrestore(f);
+        return id;
+    }
 
     for (int i = 0; i < MAX_PORTS; i++) {
         if (!ports[i].in_use) {

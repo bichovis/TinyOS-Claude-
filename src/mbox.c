@@ -34,6 +34,7 @@
 #define MBOX_CH_PROP  8              /* canal de "property tags"          */
 
 #define TAG_GET_ARM_MEMORY  0x00010005u
+#define TAG_GET_CLOCK_RATE  0x00030002u
 #define TAG_END             0x00000000u
 #define CODE_REQUEST        0x00000000u
 #define CODE_RESP_OK        0x80000000u
@@ -103,4 +104,29 @@ int mbox_arm_memory(uint64_t *base, uint64_t *size)
     *base = buf[5];
     *size = buf[6];
     return (*size != 0);
+}
+
+/* Cuanto va de rapido un reloj de la placa. Los identificadores los fija la
+ * GPU: 1 = EMMC, 2 = UART, 3 = ARM, 4 = core.
+ *
+ * Esto hace falta porque el divisor de un periferico se calcula a partir de
+ * su reloj base, y ese reloj depende de la configuracion de la placa. Darlo
+ * por supuesto es lo que hace que un driver funcione en el emulador y no en
+ * el hardware: el divisor sale de un numero inventado.
+ */
+uint32_t mbox_clock_rate(uint32_t clock_id)
+{
+    buf[0] = 8 * 4;
+    buf[1] = CODE_REQUEST;
+    buf[2] = TAG_GET_CLOCK_RATE;
+    buf[3] = 8;                      /* espacio para la respuesta         */
+    buf[4] = 4;                      /* tamano de la peticion             */
+    buf[5] = clock_id;
+    buf[6] = 0;                      /* <- la GPU escribe aqui los Hz     */
+    buf[7] = TAG_END;
+
+    if (!mbox_call(MBOX_CH_PROP))
+        return 0;
+
+    return buf[6];
 }

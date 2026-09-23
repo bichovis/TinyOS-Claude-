@@ -30,7 +30,15 @@ struct message {
 #define SYS_getpid        4
 #define SYS_sleep         5
 #define SYS_uptime        6
-#define SYS_port_create   7    /* () -> id de puerto                       */
+#define SYS_port_create   7    /* (deseado o -1) -> id de puerto           */
 #define SYS_send          8    /* (puerto, struct message *) -> 0 | -1     */
 #define SYS_recv          9    /* (puerto, struct message *) -> 0 | -1     */
 #define SYS_mmio_base    10    /* () -> VA del MMIO concedido, 0 si ninguno*/
+#define SYS_spawn        11    /* (buffer, bytes) -> pid | -1              */
+#define SYS_clock_rate   12    /* (id) -> Hz de un reloj de la placa        */
+
+/* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del
+ * buzon de la GPU y solo contesta a esta lista corta. */
+#define CLK_EMMC        1
+#define CLK_UART        2
+#define CLK_CORE        4

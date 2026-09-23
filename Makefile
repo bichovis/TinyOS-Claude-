@@ -27,7 +27,10 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client
+UPROGS  := hello conserver client fs ls cat run
+
+# Programas de usuario con mas de un fichero fuente
+EXTRA_fs := user/sd.c
 UCFLAGS := -Wall -Wextra -Werror -O2 -std=c11 -ffreestanding -nostdlib \
            -nostartfiles -mcpu=cortex-a53 -mgeneral-regs-only -mstrict-align \
            -fno-stack-protector -fno-pie -fno-common -Iuser -I$(INCDIR)
@@ -41,7 +44,7 @@ OBJS    := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(wildcard $(SRCDIR)/*.c)) \
            $(patsubst %,$(BUILD)/%_bin.o,$(UPROGS))
 DEPS    := $(OBJS:.o=.d)
 
-.PHONY: all clean run debug dump sdcard sd firmware
+.PHONY: all clean run debug dump sdcard sd firmware sdtest
 all: $(BUILD)/kernel8.img
 
 $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
@@ -57,10 +60,11 @@ $(BUILD)/%.S.o: $(SRCDIR)/%.S | $(BUILD)
 # se pasa a binario plano y se empotra en el kernel como un array de C.
 .PRECIOUS: $(BUILD)/%.elf $(BUILD)/%.bin $(BUILD)/%_bin.c
 
-$(BUILD)/%.elf: user/%.c user/header.S user/syscall.h $(INCDIR)/ipc_abi.h \
-                $(INCDIR)/user_abi.h user/user.ld | $(BUILD)
+$(BUILD)/%.elf: user/%.c user/header.S user/syscall.h user/sd.c user/sd.h \
+                $(INCDIR)/ipc_abi.h $(INCDIR)/user_abi.h $(INCDIR)/fs_abi.h \
+                user/user.ld | $(BUILD)
 	@echo "  CC-U  user/$*.c"
-	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c user/header.S -o $@
+	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c $(EXTRA_$*) user/header.S -o $@
 
 $(BUILD)/%.bin: $(BUILD)/%.elf
 	@$(OBJCOPY) -O binary $< $@
@@ -85,9 +89,28 @@ $(BUILD)/kernel8.img: $(BUILD)/kernel8.elf
 $(BUILD):
 	@mkdir -p $(BUILD)
 
+# Una imagen de tarjeta para probar el servidor de ficheros sin tocar la SD
+# de verdad: FAT16 con tabla de particiones, como la placa.
+sdtest: $(BUILD)/hello.bin | $(BUILD)
+	@rm -f $(BUILD)/sd.img
+	@dd if=/dev/zero of=$(BUILD)/sd.img bs=1m count=64 2>/dev/null
+	@DEV=$$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage \
+	        $(BUILD)/sd.img 2>/dev/null | head -1 | awk '{print $$1}');       \
+	 diskutil eraseDisk "MS-DOS FAT16" TINYOS MBRFormat $$DEV >/dev/null;     \
+	 printf 'Hola desde la tarjeta SD.\nEste fichero lo ha puesto un Mac y lo va a leer TinyOS.\n' > /Volumes/TINYOS/HOLA.TXT; \
+	 cp $(BUILD)/hello.bin /Volumes/TINYOS/HELLO.BIN;                         \
+	 sync; diskutil eject $$DEV >/dev/null
+	@echo "  $(BUILD)/sd.img lista (FAT16, con HOLA.TXT y HELLO.BIN)"
+	@echo "  'make run' la usa automaticamente."
+
+
+SDIMG ?= $(BUILD)/sd.img
+SDOPT  = $(if $(wildcard $(SDIMG)),-drive file=$(SDIMG)$(,)if=sd$(,)format=raw,)
+, := ,
+
 # QEMU emula la raspi3b; la PL011 sale por stdio.
 run: $(BUILD)/kernel8.elf
-	$(QEMU) -M raspi3b -kernel $< -serial stdio -serial null -display none
+	$(QEMU) -M raspi3b -kernel $< -serial stdio -serial null -display none $(SDOPT)
 
 # Igual pero esperando a gdb en el puerto 1234 (aarch64-elf-gdb, target remote :1234)
 debug: $(BUILD)/kernel8.elf
@@ -107,6 +130,9 @@ firmware:
 sdcard: $(BUILD)/kernel8.img firmware
 	@cp config.txt $(BUILD)/sdcard/
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
+	@# Para el servidor de ficheros: algo que leer y algo que ejecutar.
+	@cp $(BUILD)/hello.bin $(BUILD)/sdcard/HELLO.BIN
+	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de arranque de la Pi.\n' > $(BUILD)/sdcard/HOLA.TXT
 	@echo
 	@echo "Listo en $(BUILD)/sdcard:"
 	@ls -l $(BUILD)/sdcard

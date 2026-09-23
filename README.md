@@ -69,6 +69,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 13c-1| Temporizador e interrupciones por nucleo    | hecho  |
 | 13c-2| Que los cuatro nucleos ejecuten hilos       | hecho  |
 | 14   | Pulido: IPIs, cerrojos mas finos            | hecho  |
+| 15   | Servidor de ficheros: SD, FAT16 y `spawn`   | hecho  |
 
 ## Estructura
 
@@ -85,6 +86,10 @@ Tres cosas que QEMU perdona y el silicio no:
     user/        programas de usuario, compilados aparte y empotrados:
                  header.S    la cabecera que lee el cargador
                  hello.c     usa syscalls directas
+                 sd.c        driver de la tarjeta SD (EMMC/SDHCI)
+                 fs.c        servidor de ficheros FAT16, sirve el puerto 1
+                 ls.c        lista la tarjeta      cat.c  vuelca un fichero
+                 run.c       carga un programa de la tarjeta y lo arranca
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
     tools/       bin2c.py           binario de usuario -> array de C
@@ -429,6 +434,67 @@ comentadas en el sitio donde importan:
     necesitan la cache: el store-exclusive falla siempre y `spin_lock()`
     gira para siempre. Un spinlock necesita la cache encendida.
 
+## El servidor de ficheros
+
+El kernel **no sabe leer ficheros**, y eso es el punto entero.
+
+`user/sd.c` habla con el controlador EMMC (0x3F300000) desde EL0, con la
+pagina de registros concedida igual que la PL011 del servidor de consola.
+`user/fs.c` monta FAT16 encima y sirve el puerto 1. Si cualquiera de los
+dos se cuelga, se cuelga el: el kernel ni se entera.
+
+Arrancar una tarjeta SD es una conversacion con un orden fijo, porque la
+tarjeta es una maquina de estados:
+
+    CMD0    "reiniciate"            -> estado idle
+    CMD8    "¿aguantas 2.7-3.6 V?"  -> distingue las modernas
+    ACMD41  "enciendete"            -> se repite hasta que dice que si
+    CMD2    "dime quien eres"       -> su numero de serie
+    CMD3    "toma una direccion"    -> la RCA
+    CMD7    "te elijo a ti"         -> pasa a estado transfer
+
+Y el reloj sube por etapas: la identificacion va a 400 kHz porque es lo
+unico que toda tarjeta garantiza entender, y solo despues se sube a 25 MHz.
+
+El reloj base NO se puede dar por supuesto, y esto costo un arranque en la
+placa. Estaba escrito a mano a 41,666 MHz, copiado de un tutorial. La Pi
+dice **200 MHz** y QEMU dice 50. Con el numero inventado, el divisor de los
+25 MHz salia 0, se quedaba en 1, y la tarjeta acababa a 100 MHz: cuatro
+veces por encima de lo que admite. Todo el protocolo estaba bien —CMD0 a
+CMD3 pasaban limpiamente a 400 kHz— y fallaba en CMD7, la primera orden
+despues de subir el reloj. Ahora se lo preguntamos a la GPU
+(`SYS_clock_rate`), y el divisor redondea hacia ARRIBA: truncar da un
+divisor menor, y un divisor menor es un reloj mas rapido del que se pide.
+
+Un driver de EL0 no puede hablar con el buzon de la GPU —es uno solo para
+toda la maquina y darlo entero seria dar el control de la placa—, asi que
+el kernel contesta esa pregunta concreta y ninguna mas, con una lista
+blanca de tres relojes. Mismo criterio que con el pin mux: el kernel es el
+dueño de lo que es de todos, y responde preguntas estrechas.
+
+**El protocolo no tiene open/close**, y es deliberado: cada peticion lleva
+el nombre y el desplazamiento. Un servidor sin estado no tiene descriptores
+que perder cuando un cliente muere sin avisar, ni tabla que limpiar, ni
+limite de ficheros abiertos. Se paga con una busqueda por peticion, que el
+servidor se cachea.
+
+### Y quien carga los programas
+
+Hasta aqui todos los programas de usuario venian empotrados en la imagen
+del kernel por `tools/bin2c.py`. El comando `e` los saca de la tarjeta, y
+fijate en quien hace que:
+
+    [run] leyendo HELLO.BIN de la tarjeta...
+    [run] 4100 bytes leidos, se los paso al kernel
+    [run] arrancado como pid 16
+    >> Hola desde EL0. Soy un proceso de usuario.
+
+`user/run.c` lee los bytes del servidor de ficheros y luego llama a
+`spawn()`, que es lo unico que pone el kernel: convertir bytes en proceso.
+Si fuera al reves —el kernel leyendo de un servidor de usuario— el kernel
+dependeria de un proceso que puede morirse, y eso es justo lo que un
+microkernel no hace. `exec` es cosa del usuario.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -436,6 +502,15 @@ comentadas en el sitio donde importan:
   correcto. (Lo que si se saco de el es la carga de un proceso, que son
   milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
   sin el y publica con el otra vez.)
+- El servidor de ficheros solo LEE, solo entiende FAT16 y solo mira el
+  directorio raiz. Nada de escribir, nada de FAT32, nada de subdirectorios.
+- El reloj base del EMMC esta puesto a mano (41.666 MHz, el de la placa).
+  Lo suyo seria preguntarselo a la GPU por el buzon, pero el buzon es del
+  kernel y el driver vive en EL0.
+- Un proceso no recibe argumentos: el kernel lo crea y lo suelta. Por eso
+  `cat` y `run` llevan el nombre del fichero escrito dentro.
+- Un mensaje lleva 48 bytes, asi que cargar un programa de 4 KB son 86
+  idas y venidas por el IPC. Funciona y se nota.
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
   en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
   carga no hay nada que priorizar.
