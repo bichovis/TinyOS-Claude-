@@ -102,6 +102,8 @@ struct message {
  * segun se toquen. Devuelve la direccion, y el tamanyo en *tam. */
 #define SYS_mmap         33   /* (ruta, uint64_t *tam) -> direccion | -1    */
 
+#define SYS_munmap       34   /* (direccion) -> 0 | -1                      */
+
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */
 

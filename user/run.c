@@ -17,10 +17,7 @@
 #include "syscall.h"
 #include "fs_abi.h"
 
-#define MAX_IMG   (32 * 1024)
 
-static struct message m;
-static unsigned char imagen[MAX_IMG];
 
 /* Rehacer la linea de argumentos para el hijo: todo lo que venga despues
  * de "run". Asi "run HELLO.ELF uno dos" arranca HELLO.ELF viendose a si
@@ -49,42 +46,23 @@ int main(int argc, char **argv)
     const char *programa = ruta;
     juntar_args(argc, argv);
 
-    int64_t mio = port_create(-1);
-    if (mio < 0) { printf("  [run] sin puertos\n"); exit(1); }
-
-    printf("\n  [run] leyendo ");
-    printf("%s", programa);
-    printf(" de la tarjeta...\n");
-
+    /* Esto eran treinta lineas de pedirle trozos al servidor y meterlos en
+     * un array de 32 KB. Ahora es una llamada, y el array ha desaparecido:
+     * ni se reserva ni se llena. El kernel traera las paginas que necesite
+     * mientras lee el ELF, y ni una mas. */
     uint64_t total = 0;
-    while (total < MAX_IMG) {
-        struct fs_request r;
-        r.port = (unsigned long)mio;
-        r.arg  = total;
-        memcpy(r.name, programa, strlen(programa) + 1);
-
-        m.type = FS_READ;
-        m.len  = sizeof(r);
-        memcpy(m.data, (const char *)&r, sizeof(r));
-        if (msg_send(PORT_FILES, &m) < 0) {
-            printf("  [run] no hay servidor de ficheros: arrancalo con 'f'\n");
-            exit(1);
-        }
-
-        if (msg_recv((uint64_t)mio, &m) < 0) break;
-        if (m.type == FS_ERROR) { printf("  [run] no existe\n"); exit(1); }
-        if (m.type != FS_OK || m.len == 0) break;
-
-        for (uint64_t i = 0; i < m.len; i++)
-            imagen[total + i] = (unsigned char)m.data[i];
-        total += m.len;
+    const char *imagen = mmap(programa, &total);
+    if (!imagen) {
+        printf("  [run] no existe, o no hay servidor de ficheros (arrancalo con 'f')\n");
+        exit(1);
     }
 
-    printf("  [run] %lu bytes leidos, se los paso al kernel\n", total);
+    printf("\n  [run] %s mapeado, %lu bytes\n", programa, total);
 
     int64_t pid = spawn(imagen, total, args_hijo);
     if (pid < 0) printf("  [run] el kernel no lo ha querido\n");
     else         printf("  [run] arrancado como pid %lu\n", (uint64_t)pid);
 
-    exit(0);
+    munmap(imagen);
+    return 0;
 }

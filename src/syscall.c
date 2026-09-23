@@ -34,7 +34,10 @@ static int user_range_ok(uint64_t va, uint64_t len, int for_write)
 
     /* Comprobar pagina a pagina: el rango puede cruzar varias. */
     for (uint64_t p = va & ~(PAGE_SIZE - 1); p < va + len; p += PAGE_SIZE) {
-        uint64_t ok = for_write ? (uint64_t)user_touch_w(p) : vmm_translate_user(p);
+        /* user_touch_r y no vmm_translate_user: la pagina puede no estar
+         * y poder estarlo. Ver user_touch_r en sched.c. */
+        uint64_t ok = for_write ? (uint64_t)user_touch_w(p)
+                                : (uint64_t)user_touch_r(p);
         if (!ok) return 0;
     }
     return 1;
@@ -371,6 +374,10 @@ void syscall_dispatch(struct trap_frame *f)
         ret = base;
         break;
     }
+
+    case SYS_munmap:
+        ret = task_munmap(f->x[0]);
+        break;
 
     case SYS_close:
         ret = task_fd_close((int)f->x[0]);

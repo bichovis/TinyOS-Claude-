@@ -146,46 +146,29 @@ static int buscar_programa(const char *nom, char *ruta)
     return 0;
 }
 
+/* Cargar un programa es ahora MAPEARLO.
+ *
+ * Aqui habia cuarenta lineas: pedir el tamanyo, reservar ese tamanyo con
+ * malloc, y dar vueltas pidiendole trozos al servidor de ficheros hasta
+ * llenarlo. Todo eso lo hace ya el kernel, y no porque se haya movido de
+ * sitio: es que ya no hace falta. mmap devuelve una direccion sin leer
+ * nada, y los trozos llegan cuando alguien los toca. El que los toca es el
+ * cargador de ELF del kernel, dentro de exec.
+ *
+ * Lo que el shell se ahorra no es codigo, es una COPIA: antes el fichero
+ * entero pasaba por un malloc suyo para que el kernel lo copiara de ahi a
+ * las paginas del programa nuevo. Ahora va del servidor a esas paginas.
+ */
 static uint64_t cargar(const char *fichero, unsigned char **img)
 {
-    motivo = "";
-    *img   = 0;
+    uint64_t tam = 0;
+    const char *p = mmap(fichero, &tam);
 
-    uint64_t tam = tamano_de(fichero);
-    if (!tam) { if (!motivo[0]) motivo = "esta vacio"; return 0; }
+    if (!p) { motivo = "no esta en la tarjeta"; *img = 0; return 0; }
+    if (!tam) { munmap(p); motivo = "esta vacio"; *img = 0; return 0; }
 
-    unsigned char *p = malloc(tam);
-    if (!p) { motivo = "no me cabe en memoria"; return 0; }
-
-    uint64_t total = 0;
-    while (total < tam) {
-        struct fs_request r;
-        r.port = (unsigned long)mi_puerto;
-        r.arg  = total;
-        memcpy(r.name, fichero, strlen(fichero) + 1);
-
-        m.type = FS_READ;
-        m.len  = sizeof(r);
-        memcpy(m.data, (const char *)&r, sizeof(r));
-
-        if (msg_send(PORT_FILES, &m) < 0 ||
-            msg_recv((uint64_t)mi_puerto, &m) < 0) {
-            motivo = "el servidor de ficheros se ha ido a mitad";
-            break;
-        }
-        if (m.type != FS_OK || m.len == 0) break;
-
-        uint64_t n = m.len;
-        if (total + n > tam) n = tam - total;
-        for (uint64_t i = 0; i < n; i++)
-            p[total + i] = (unsigned char)m.data[i];
-        total += n;
-    }
-
-    if (!total) { free(p); motivo = "esta vacio"; return 0; }
-
-    *img = p;
-    return total;
+    *img = (unsigned char *)p;
+    return tam;
 }
 
 /* --- Partir una orden ------------------------------------------------ */
@@ -345,7 +328,7 @@ static void una(char *orden)
         exit(1);
     }
 
-    free(img);
+    munmap((const char *)img);
     if (pid < 0) { printf("  no he podido bifurcarme\n"); return; }
 
     /* El codigo de salida del hijo. Solo se dice si no es cero, que es
@@ -385,19 +368,19 @@ static void tuberia(char *izq, char *der)
     uint64_t b1 = cargar(ruta1, &img1);
     if (!b1) { quejarse(ruta1); return; }
 
-    if (!fichero_de(der)) { free(img1); return; }
+    if (!fichero_de(der)) { munmap((const char *)img1); return; }
 
     unsigned char *img2;
     char ruta2[FS_PATH_MAX];
-    if (!buscar_programa(nombre, ruta2)) { quejarse(nombre); free(img1); return; }
+    if (!buscar_programa(nombre, ruta2)) { quejarse(nombre); munmap((const char *)img1); return; }
 
     uint64_t b2 = cargar(ruta2, &img2);
-    if (!b2) { quejarse(ruta2); free(img1); return; }
+    if (!b2) { quejarse(ruta2); munmap((const char *)img1); return; }
 
     int fds[2];
     if (pipe(fds) < 0) {
         printf("  no hay tuberias libres\n");
-        free(img1); free(img2);
+        munmap((const char *)img1); munmap((const char *)img2);
         return;
     }
 
@@ -429,8 +412,8 @@ static void tuberia(char *izq, char *der)
      * el final. */
     closefd(fds[0]);
     closefd(fds[1]);
-    free(img1);
-    free(img2);
+    munmap((const char *)img1);
+    munmap((const char *)img2);
 
     if (p1 > 0) waitpid((uint64_t)p1);
     if (p2 > 0) waitpid((uint64_t)p2);

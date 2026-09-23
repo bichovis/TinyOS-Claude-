@@ -88,6 +88,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 31   | Subdirectorios, y el directorio actual      | hecho  |
 | 32   | Nombres largos, y una interrupcion perdida  | hecho  |
 | 33   | mmap: el kernel pide y un proceso contesta  | hecho  |
+| 34   | exec por mmap: comprobar pasa a ser traer   | hecho  |
 
 ## Estructura
 
@@ -1948,6 +1949,87 @@ kernel no existe. Tercera vez en este proyecto, y siempre se ve igual: no
 falla el compilador, falla el enlazador, y el mensaje no menciona ninguna
 estructura.
 
+## exec por mmap, o comprobar pasa a ser conseguir
+
+El shell cargaba un programa asi: preguntar el tamanyo, reservar ese
+tamanyo con `malloc`, y dar vueltas pidiendole trozos al servidor de
+ficheros hasta llenarlo. Cuarenta lineas. Luego le pasaba ese buffer a
+`exec`, y el kernel copiaba de ahi a las paginas del programa nuevo.
+
+Con `mmap` son dos lineas. Pero lo interesante no es el codigo que
+desaparece del shell: es **lo que hubo que cambiar en el kernel** para que
+pudiera desaparecer.
+
+**El kernel daba por hecho que la memoria de usuario estaba.** Antes de
+leer un puntero que viene de EL0, comprobaba:
+
+```c
+    uint64_t ok = for_write ? user_touch_w(p) : vmm_translate_user(p);
+```
+
+`vmm_translate_user` es `at s1e0r`: le pregunta a la MMU si EL0 puede leer
+ahi. Si dice que no, error. Eso valia mientras "estar mapeada" fuera una
+propiedad **estable**: o estaba o no estaba, y preguntar no cambiaba nada.
+
+Con ficheros mapeados deja de serlo. La pagina no esta, **pero puede
+estarlo** si alguien la pide. Preguntar antes de tocar devuelve un "no" que
+en realidad era un "todavia no", y `exec` sobre un ELF mapeado fallaba sin
+haber intentado nada.
+
+**Asi que se cambia comprobar por conseguir:**
+
+```c
+    int user_touch_r(uint64_t va)
+    {
+        if (vmm_translate_user(va)) return 1;                       /* ya esta */
+        if (task_mmap_fault(va) && vmm_translate_user(va)) return 1;/* traela  */
+        if (task_grow_stack(va, va) && vmm_translate_user(va)) return 1;
+        return 0;                                                   /* nada que hacer */
+    }
+```
+
+El kernel ya no pregunta si puede leer: **hace lo que haga falta para
+poder**, y solo falla cuando no queda nada que intentar. Es el gemelo de
+`user_touch_w`, que llevaba desde el paso 23 haciendo lo mismo para
+escribir -COW y crecer la pila- sin que se viera que era un patron.
+
+Esa funcion es el paso entero. Todo lo demas sale gratis: `read`, `write`,
+`msg_send` y `exec` pasan por el mismo sitio, asi que todos aceptan ya
+memoria que aun no existe.
+
+**Y trae una regla nueva que hay que respetar.** `user_touch_r` puede
+DORMIR: traer una pagina mapeada es un viaje al servidor de ficheros. Antes
+comprobar era una instruccion (`at`) y no podia bloquear; ahora puede. Por
+eso `file.c` copia a un buffer intermedio ANTES de entrar en sus secciones
+criticas, y no al reves. Esa decision se tomo en el paso 26 por otro motivo
+-los fallos de pagina y `sched_lock`- y resulta que ya protegia de esto.
+
+**munmap, que hacia falta de verdad.** Un proceso tiene cuatro ranuras de
+mapeo y el shell mapea un fichero por cada orden: sin soltarlos, a la
+quinta orden se queda sin sitio. `task_munmap` quita del mapa las paginas
+que se llegaron a traer y devuelve la ranura. Las que nunca se tocaron no
+estan mapeadas, asi que `vmm_unmap_in` dice -1 y no pasa nada; y las que el
+`fork` dejo compartidas solo bajan un contador.
+
+Se comprueba pidiendo las paginas libres antes y despues de seis
+ejecuciones:
+
+```
+    / $ map hola.txt         paginas libres: 245369
+    / $ ls   (x6)
+    / $ map hola.txt         paginas libres: 245369
+```
+
+Ni una. Conviene medirlo asi y no mirando la memoria total al final: la
+primera vez que lo intente salieron nueve paginas de diferencia, y no eran
+una fuga sino el propio shell todavia sin recoger por el recolector. Una
+medida que incluye lo que no querias medir no vale.
+
+**Lo que se ahorra es una copia, no memoria.** El fichero ya no pasa por un
+`malloc` del shell para que el kernel lo copie de ahi: va del servidor a
+las paginas del programa nuevo. `run` pierde ademas un array estatico de
+32 KB que reservaba siempre, se usara o no.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -1993,9 +2075,13 @@ estructura.
   al morir el proceso o al hacer `exec`. Un proceso puede tener cuatro.
 - Llenar una pagina mapeada son 24 mensajes al servidor (176 bytes cada
   uno). Funciona, y es lento.
-- `exec` sigue cargando el ELF entero en memoria con `malloc` antes de
-  arrancarlo. Pasarlo por `mmap` exigiria que el kernel tolerase fallos de
-  pagina mientras copia de memoria de usuario, que es otra pieza.
+- El kernel trae las paginas mapeadas ANTES de leerlas (`user_touch_r`), no
+  se recupera de un fallo mientras las lee. Un `copy_from_user` de verdad
+  lo haria al reves, con una tabla de excepciones, y no necesitaria
+  recorrer el rango entero por adelantado.
+- `exec` sobre un ELF mapeado trae el fichero ENTERO, porque
+  `user_range_ok` comprueba todo el rango antes de empezar. Solo cargar las
+  paginas que el ELF usa de verdad exige lo del punto anterior.
 - Los nombres largos se LEEN pero no se escriben: un fichero creado desde
   TinyOS se guarda en 8.3, en mayusculas y truncado.
 - De los nombres largos solo se entiende el ASCII. Lo de fuera sale como

@@ -120,6 +120,9 @@ static inline const char *mmap(const char *ruta, uint64_t *tam)
     return r < 0 ? 0 : (const char *)(uint64_t)r;
 }
 
+static inline int64_t munmap(const char *p)
+                                          { return syscall2(SYS_munmap, (uint64_t)p, 0); }
+
 /* Abrir un fichero de la tarjeta y quedarselo en un descriptor. */
 static inline int64_t openf(const char *nombre, uint64_t modo)
                                           { return syscall2(SYS_open, (uint64_t)nombre, modo); }

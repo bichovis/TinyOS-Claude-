@@ -184,6 +184,7 @@ uint64_t task_creados(void);                  /* hilos que han existido     */
 /* Mapear un fichero. Devuelve la direccion o -1; el tamanyo va en *tam. */
 int64_t task_mmap(const char *ruta, uint64_t *tam);
 int     task_mmap_fault(uint64_t direccion);  /* 1 si lo ha resuelto        */
+int     task_munmap(uint64_t base);
 struct fichero *task_fd(int fd);              /* el de este proceso, o 0    */
 int  task_fd_alloc(struct fichero *f);        /* el primer hueco libre      */
 int  task_fd_close(int fd);

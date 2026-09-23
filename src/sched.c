@@ -645,6 +645,37 @@ int task_mmap_fault(uint64_t direccion)
     return 1;
 }
 
+/* Soltar un mapeo: quitar del mapa las paginas que se llegaron a traer y
+ * devolver la ranura.
+ *
+ * Hace falta de verdad y no por elegancia. Un proceso tiene cuatro
+ * ranuras, y el shell mapea un fichero por cada orden que ejecuta: sin
+ * esto, a la quinta orden se queda sin sitio. */
+int task_munmap(uint64_t base)
+{
+    struct task *t = current;
+    if (!t || !t->pgd) return -1;
+
+    for (int i = 0; i < MAX_MAPEOS; i++) {
+        struct mapeo *m = &t->mapeos[i];
+        if (m->base != base || !m->base) continue;
+
+        uint64_t paginas = (m->len + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (paginas == 0) paginas = 1;
+
+        /* vmm_unmap_in devuelve la pagina fisica al gestor, que lleva
+         * cuentas: si el fork la dejo compartida, solo baja el contador. Y
+         * las que nunca se llegaron a tocar no estan mapeadas, asi que
+         * unmap dice -1 y no pasa nada. */
+        for (uint64_t p = 0; p < paginas; p++)
+            vmm_unmap_in(t->pgd, m->base + p * PAGE_SIZE);
+
+        m->base = 0;
+        return 0;
+    }
+    return -1;
+}
+
 static void mapeos_limpiar(struct task *t)
 {
     for (int i = 0; i < MAX_MAPEOS; i++) t->mapeos[i].base = 0;
@@ -896,6 +927,37 @@ void task_console_interrupt(void)
  * Asi que aqui se intenta, por orden: ¿se puede ya?, ¿es una pagina
  * compartida que toca copiar?, ¿es la pila, que aun no ha crecido hasta
  * ahi? Y solo si nada de eso vale, que no. */
+/* Hacer que una direccion de usuario SE PUEDA LEER, trayendola si hace
+ * falta. Es el gemelo de user_touch_w, y su aparicion marca un cambio de
+ * idea.
+ *
+ * Hasta el paso 33, el kernel COMPROBABA la memoria de usuario antes de
+ * tocarla: 'at s1e0r' decia si estaba, y si no estaba, error. Eso valia
+ * mientras "estar mapeada" fuera una propiedad estable. Con ficheros
+ * mapeados deja de serlo: la pagina no esta, pero puede estarlo si alguien
+ * la pide. Comprobar antes de tocar devuelve un no que era un todavia no.
+ *
+ * Asi que se cambia comprobar por CONSEGUIR. El kernel ya no pregunta si
+ * puede leer: hace lo que haga falta para poder, y solo falla cuando ya no
+ * queda nada que intentar.
+ *
+ * OJO: esto puede DORMIR -traer una pagina mapeada es un viaje al servidor
+ * de ficheros- asi que no se puede llamar con un cerrojo cogido. Por eso
+ * file.c copia a un buffer intermedio antes de entrar en sus secciones
+ * criticas, y no al reves. */
+int user_touch_r(uint64_t va)
+{
+    if (!current || !current->pgd) return 0;
+
+    if (vmm_translate_user(va)) return 1;
+
+    if (task_mmap_fault(va) && vmm_translate_user(va)) return 1;
+
+    if (task_grow_stack(va, va) && vmm_translate_user(va)) return 1;
+
+    return 0;
+}
+
 int user_touch_w(uint64_t va)
 {
     if (!current || !current->pgd) return 0;
