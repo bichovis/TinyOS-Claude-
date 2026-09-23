@@ -22,7 +22,7 @@
 
 static struct message m;
 static char           linea[MAX_LINEA];
-static char           nombre[32];
+static char           nombre[FS_PATH_MAX];
 static int64_t        mi_puerto;
 
 
@@ -123,27 +123,61 @@ static uint64_t tamano_de(const char *fichero)
     return ((struct fs_info *)m.data)->size;
 }
 
-/* Donde buscar un programa.
+/* --- El PATH ----------------------------------------------------------
  *
- * Un PATH de dos sitios: el directorio actual primero, y el raiz despues.
- * Hace falta desde que hay subdirectorios, porque si no "cd docs" dejaria
- * de encontrar hasta "ls". Es la version mas pequenya posible de una idea
- * que en Unix es una variable de entorno con ocho sitios, y esta aqui por
- * el mismo motivo: sin ella, moverse de directorio te deja sin ordenes.
+ * Donde buscar un programa cuando lo que has escrito no lleva barras.
  *
- * Deja en 'ruta' la absoluta que si existe, o devuelve 0. */
+ * Primero el directorio actual, y luego /usr/bin, que es donde viven los
+ * ejecutables del sistema. Hace falta desde que hay subdirectorios: sin
+ * esto, "cd docs" te dejaria sin ordenes, porque "ls" ya no estaria donde
+ * estas.
+ *
+ * Es una lista escrita aqui y no una variable de entorno, porque este
+ * sistema todavia no tiene entorno. La idea es la misma: un programa se
+ * llama por su nombre y alguien decide donde se busca.
+ *
+ * Que el directorio actual vaya PRIMERO es comodo y en Unix no se hace:
+ * ahi "." no esta en el PATH por defecto, porque entrar en un directorio
+ * ajeno y escribir "ls" podria ejecutar el "ls" que haya dejado el duenyo
+ * del directorio. Aqui no hay varios usuarios, asi que no hay a quien
+ * enganyar. */
+static const char *PATH[] = { 0, "/usr/bin" };   /* el 0 es "donde estoy" */
+
+/* Deja en 'ruta' la absoluta que si existe, o devuelve 0. */
 static int buscar_programa(const char *nom, char *ruta)
 {
-    if (realpath(nom, ruta) == 0 && tamano_de(ruta)) return 1;
+    for (uint64_t i = 0; i < sizeof(PATH) / sizeof(PATH[0]); i++) {
+        if (!PATH[i]) {
+            /* El directorio actual: de eso ya se encarga realpath. */
+            if (realpath(nom, ruta) == 0 && tamano_de(ruta)) return 1;
+            continue;
+        }
 
-    char en_raiz[FS_PATH_MAX];
-    en_raiz[0] = '/';
-    uint64_t n = strlen(nom);
-    if (n + 2 > FS_PATH_MAX) return 0;
-    memcpy(en_raiz + 1, nom, n + 1);
+        uint64_t d = strlen(PATH[i]), n = strlen(nom);
+        if (d + 1 + n + 1 > FS_PATH_MAX) continue;
 
-    if (tamano_de(en_raiz)) { memcpy(ruta, en_raiz, strlen(en_raiz) + 1); return 1; }
+        memcpy(ruta, PATH[i], d);
+        ruta[d] = '/';
+        memcpy(ruta + d + 1, nom, n + 1);
+
+        if (tamano_de(ruta)) return 1;
+    }
     return 0;
+}
+
+/* Decir DONDE se ha buscado. Un "no encuentro ls" a secas manda a pensar
+ * que el fichero no esta; enseñar la lista dice que quiza esta, pero en
+ * otro sitio. */
+static void no_esta(const char *nom)
+{
+    printf("  %s: no lo encuentro. He mirado en:\n", nom);
+    for (uint64_t i = 0; i < sizeof(PATH) / sizeof(PATH[0]); i++) {
+        if (PATH[i]) printf("    %s\n", PATH[i]);
+        else {
+            char aqui[FS_PATH_MAX];
+            if (getcwd(aqui, sizeof(aqui)) == 0) printf("    %s\n", aqui);
+        }
+    }
 }
 
 /* Cargar un programa es ahora MAPEARLO.
@@ -195,16 +229,43 @@ static char *limpiar(char *s)
  * Los nombres los pone el que llama en buffers suyos, y no en 'nombre',
  * que lo usa cargar() para el ejecutable: en "cat < a > b" hay tres
  * ficheros en juego a la vez. */
-static void mayusculas(char *dst, const char *s, uint64_t max)
+/* Copiar UNA palabra, quitandole las comillas. Devuelve donde se quedo,
+ * para poder seguir leyendo detras.
+ *
+ * Las comillas se tratan en tres sitios de este shell -el nombre del
+ * programa, y los destinos de < y >- mas un cuarto en el kernel, que es
+ * quien parte los argumentos. Cuatro sitios para la misma regla es uno de
+ * esos olores que acaban en un fallo: el dia que alguien anyada un quinto
+ * sitio y se olvide, saldra un "no existe" sobre un fichero que si esta.
+ * La cura de verdad seria que exec recibiera un array ya partido, y eso
+ * es otro paso. */
+static const char *una_palabra(char *dst, const char *s, uint64_t max)
 {
     uint64_t o = 0;
+    char comilla = 0;
+
     while (*s == ' ') s++;
-    while (*s && *s != ' ' && o < max - 1) {
-        char c = *s++;
-        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-        dst[o++] = c;
+
+    while (*s) {
+        if (comilla) {
+            if (*s == comilla) { comilla = 0; s++; continue; }
+        } else {
+            if (*s == ' ') break;
+            if (*s == '"' || *s == '\'') { comilla = *s++; continue; }
+        }
+        if (o < max - 1) dst[o++] = *s;
+        s++;
     }
+
     dst[o] = 0;
+    return s;
+}
+
+static void mayusculas(char *dst, const char *s, uint64_t max)
+{
+    una_palabra(dst, s, max);
+    for (uint64_t i = 0; dst[i]; i++)
+        if (dst[i] >= 'a' && dst[i] <= 'z') dst[i] = (char)(dst[i] - 32);
 }
 
 /* Devuelve: bit 0 si hay "<", bit 1 si hay ">".
@@ -218,15 +279,22 @@ static int redirecciones(char *orden, char *ent, char *sal)
     ent[0] = sal[0] = 0;
 
     uint64_t fin = strlen(orden);
+    char comilla = 0;
 
     for (uint64_t i = 0; i < fin; i++) {
+        /* Un < o un > DENTRO de comillas es parte del nombre, no una
+         * redireccion. Sin esto, "cat > mayor>que.txt" cortaria dos
+         * veces y el segundo trozo seria el nombre. */
+        if (comilla) { if (orden[i] == comilla) comilla = 0; continue; }
+        if (orden[i] == '"' || orden[i] == '\'') { comilla = orden[i]; continue; }
+
         if (orden[i] != '<' && orden[i] != '>') continue;
 
         char cual = orden[i];
         orden[i] = 0;                    /* la orden termina aqui */
 
-        if (cual == '<') { mayusculas(ent, orden + i + 1, 32); hay |= 1; }
-        else             { mayusculas(sal, orden + i + 1, 32); hay |= 2; }
+        if (cual == '<') { mayusculas(ent, orden + i + 1, FS_PATH_MAX); hay |= 1; }
+        else             { mayusculas(sal, orden + i + 1, FS_PATH_MAX); hay |= 2; }
     }
     return hay;
 }
@@ -244,7 +312,11 @@ static int aplicar(int hay, const char *ent, const char *sal)
     }
     if (hay & 2) {
         int64_t fd = openf(sal, O_ESCRIBIR);
-        if (fd < 0) { printf("  no puedo escribir "); printf("%s", sal); printf("\n"); return -1; }
+        if (fd < 0) {
+            printf("  no puedo escribir %s\n", sal);
+            printf("  (los nombres nuevos tienen que caber en 8.3: sin espacios)\n");
+            return -1;
+        }
         dup2((int)fd, 1);
         closefd((int)fd);
     }
@@ -253,15 +325,10 @@ static int aplicar(int hay, const char *ent, const char *sal)
 
 static int fichero_de(const char *orden)
 {
-    char palabra[32];
-    uint64_t p = 0;
+    char palabra[FS_PATH_MAX];
+    una_palabra(palabra, orden, sizeof(palabra));
 
-    while (*orden == ' ') orden++;
-    while (*orden && *orden != ' ' && p < sizeof(palabra) - 1)
-        palabra[p++] = *orden++;
-    palabra[p] = 0;
-
-    if (!p) return 0;
+    if (!palabra[0]) return 0;
     nombre_de(palabra);
     return 1;
 }
@@ -308,14 +375,14 @@ static void una(char *orden)
     /* Primero se recorta la redireccion: lo que quede es la orden de
      * verdad, y es eso lo que se busca en la tarjeta y lo que recibe el
      * programa como argumentos. */
-    char ent[32], sal[32];
+    char ent[FS_PATH_MAX], sal[FS_PATH_MAX];
     int  hay = redirecciones(orden, ent, sal);
 
     if (!fichero_de(orden)) return;
 
     unsigned char *img;
     char ruta[FS_PATH_MAX];
-    if (!buscar_programa(nombre, ruta)) { quejarse(nombre); return; }
+    if (!buscar_programa(nombre, ruta)) { no_esta(nombre); return; }
 
     uint64_t bytes = cargar(ruta, &img);
     if (!bytes) { quejarse(ruta); return; }
@@ -352,7 +419,8 @@ static void una(char *orden)
  */
 static void tuberia(char *izq, char *der)
 {
-    char ent1[32], sal1[32], ent2[32], sal2[32];
+    char ent1[FS_PATH_MAX], sal1[FS_PATH_MAX];
+    char ent2[FS_PATH_MAX], sal2[FS_PATH_MAX];
     int  hay1 = redirecciones(izq, ent1, sal1);
     int  hay2 = redirecciones(der, ent2, sal2);
 
@@ -363,7 +431,7 @@ static void tuberia(char *izq, char *der)
 
     unsigned char *img1;
     char ruta1[FS_PATH_MAX];
-    if (!buscar_programa(nombre_izq, ruta1)) { quejarse(nombre_izq); return; }
+    if (!buscar_programa(nombre_izq, ruta1)) { no_esta(nombre_izq); return; }
 
     uint64_t b1 = cargar(ruta1, &img1);
     if (!b1) { quejarse(ruta1); return; }
@@ -372,7 +440,7 @@ static void tuberia(char *izq, char *der)
 
     unsigned char *img2;
     char ruta2[FS_PATH_MAX];
-    if (!buscar_programa(nombre, ruta2)) { quejarse(nombre); munmap((const char *)img1); return; }
+    if (!buscar_programa(nombre, ruta2)) { no_esta(nombre); munmap((const char *)img1); return; }
 
     uint64_t b2 = cargar(ruta2, &img2);
     if (!b2) { quejarse(ruta2); munmap((const char *)img1); return; }
@@ -429,7 +497,7 @@ int main(int argc, char **argv)
     printf("\n  TinyOS. Las ordenes son programas de la tarjeta,\n");
     printf("  se arrancan con fork + exec, se encadenan con | y se\n");
     printf("  redirigen con < y >\n");
-    printf("  Hay directorios: cd, pwd y mkdir\n");
+    printf("  Hay directorios: cd, pwd y mkdir. Las ordenes viven en /usr/bin\n");
     printf("  Prueba: ls / mkdir docs / cd docs / cat /hola.txt > copia.txt\n");
     printf("          cd .. / ls docs / wc < hola.txt / salir\n");
 

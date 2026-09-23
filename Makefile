@@ -140,23 +140,48 @@ $(BUILD):
 
 # Una imagen de tarjeta para probar el servidor de ficheros sin tocar la SD
 # de verdad: FAT16 con tabla de particiones, como la placa.
+# Una imagen con LAS DOS PARTICIONES de la tarjeta de verdad: BOOT en
+# FAT16 (donde iria el firmware) y DATA en FAT32 (que es el raiz).
+#
+# 512 MB no es capricho: FAT32 exige 65.525 clusters como minimo, y por
+# debajo de eso las herramientas formatean FAT16 aunque les pidas FAT32.
+# El tipo de un volumen FAT es una consecuencia de su tamanyo.
 sdtest: all | $(BUILD)
 	@rm -f $(BUILD)/sd.img
-	@dd if=/dev/zero of=$(BUILD)/sd.img bs=1m count=64 2>/dev/null
+	@dd if=/dev/zero of=$(BUILD)/sd.img bs=1m count=512 2>/dev/null
+	@# Los puntos de montaje se PREGUNTAN, nunca se adivinan.
+	@#
+	@# Aqui ponia /Volumes/BOOT y /Volumes/DATA a pelo, y eso es una trampa
+	@# con dientes: si hay una tarjeta de verdad puesta en el Mac con esos
+	@# mismos nombres -que es justo lo que pasa cuando estas trabajando en
+	@# esto- macOS monta la imagen con otro nombre y el script escribe en la
+	@# TARJETA. Salio bien de milagro; podria haber borrado algo.
 	@DEV=$$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage \
 	        $(BUILD)/sd.img 2>/dev/null | head -1 | awk '{print $$1}');       \
-	 diskutil eraseDisk "MS-DOS FAT16" TINYOS MBRFormat $$DEV >/dev/null;     \
-	 printf 'Hola desde la tarjeta SD.\nEste fichero lo ha puesto un Mac y lo va a leer TinyOS.\n' > /Volumes/TINYOS/HOLA.TXT; \
-	 mkdir -p /Volumes/TINYOS/DOCS/NOTAS; \
-	 printf 'Estoy dentro de un subdirectorio.\n' > /Volumes/TINYOS/DOCS/LEEME.TXT; \
-	 printf 'Y yo dos niveles abajo.\n' > /Volumes/TINYOS/DOCS/NOTAS/HONDO.TXT; \
-	 printf 'Mi nombre no cabe en 8.3.\n' > "/Volumes/TINYOS/un nombre bastante largo.txt"; \
-	 printf 'Y el mio tampoco, pero sin espacios.\n' > /Volumes/TINYOS/ensamblador-de-prueba.txt; \
+	 test -n "$$DEV" || { echo "  no he podido montar la imagen"; exit 1; };  \
+	 diskutil partitionDisk $$DEV MBR                                         \
+	          "MS-DOS FAT16" BOOT 64M "MS-DOS FAT32" DATA R >/dev/null;       \
+	 B=$$(diskutil info -plist $${DEV}s1 | plutil -extract MountPoint raw -); \
+	 D=$$(diskutil info -plist $${DEV}s2 | plutil -extract MountPoint raw -); \
+	 case "$$B$$D" in /Volumes/*) ;; *)                                       \
+	   echo "  puntos de montaje raros: '$$B' '$$D'";                          \
+	   diskutil eject $$DEV >/dev/null; exit 1;; esac;                        \
+	 echo "  BOOT en $$B, DATA en $$D";                                       \
+	 cp config.txt "$$B/";                                                    \
+	 cp $(BUILD)/kernel8.img "$$B/";                                          \
+	 printf 'Soy el de la particion de arranque.\n' > "$$B/AVISO.TXT";        \
+	 printf 'Hola desde la tarjeta SD.\nEste fichero lo ha puesto un Mac y lo va a leer TinyOS.\n' > "$$D/HOLA.TXT"; \
+	 mkdir -p "$$D/DOCS/NOTAS"; \
+	 printf 'Estoy dentro de un subdirectorio.\n' > "$$D/DOCS/LEEME.TXT"; \
+	 printf 'Y yo dos niveles abajo.\n' > "$$D/DOCS/NOTAS/HONDO.TXT"; \
+	 printf 'Mi nombre no cabe en 8.3.\n' > "$$D/un nombre bastante largo.txt"; \
+	 printf 'Y el mio tampoco, pero sin espacios.\n' > "$$D/ensamblador-de-prueba.txt"; \
+	 mkdir -p "$$D/USR/BIN"; \
 	 for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map; do \
-	   cp $(BUILD)/$$p.elf /Volumes/TINYOS/$$(echo $$p | tr a-z A-Z).ELF; \
+	   cp $(BUILD)/$$p.elf "$$D/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF"; \
 	 done;                         \
 	 sync; diskutil eject $$DEV >/dev/null
-	@echo "  $(BUILD)/sd.img lista (FAT16, con HOLA.TXT y HELLO.ELF)"
+	@echo "  $(BUILD)/sd.img lista: BOOT (FAT16) -> /boot, DATA (FAT32) -> /"
 	@echo "  'make run' la usa automaticamente."
 
 
@@ -183,30 +208,50 @@ firmware:
 	@sh tools/fetch-firmware.sh $(BUILD)/sdcard
 
 # Prepara en build/sdcard todo lo que hay que copiar a la particion FAT32
+# Ahora la tarjeta tiene dos particiones y cada una lleva cosas distintas:
+#   build/sdcard -> BOOT (FAT16): firmware, config.txt y el kernel
+#   build/sddata -> DATA (FAT32): los programas y los datos, o sea el raiz
 sdcard: all firmware
+	@rm -rf $(BUILD)/sddata && mkdir -p $(BUILD)/sddata
+	@# Los programas vivian aqui hasta el paso 35 y ahora van en DATA.
+	@# Sin esto se quedarian, y la Pi arrancaria con dos copias de cada uno.
+	@rm -f $(BUILD)/sdcard/*.ELF $(BUILD)/sdcard/HOLA.TXT
 	@cp config.txt $(BUILD)/sdcard/
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
-	@# Para el servidor de ficheros: algo que leer y algo que ejecutar.
+	@printf 'Soy el de la particion de arranque, y cuelgo de /boot.\n' > $(BUILD)/sdcard/AVISO.TXT
+	@mkdir -p $(BUILD)/sddata/USR/BIN
 	@for p in hello ls cat run write rm cp mem deep forkd trap kill upper wc fp mkdir map; do \
-	   cp $(BUILD)/$$p.elf $(BUILD)/sdcard/$$(echo $$p | tr a-z A-Z).ELF; \
+	   cp $(BUILD)/$$p.elf $(BUILD)/sddata/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF; \
 	 done
-	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de arranque de la Pi.\n' > $(BUILD)/sdcard/HOLA.TXT
+	@printf 'Hola desde la tarjeta SD.\nEste fichero esta en la particion de datos de la Pi.\n' > $(BUILD)/sddata/HOLA.TXT
 	@echo
-	@echo "Listo en $(BUILD)/sdcard:"
-	@ls -l $(BUILD)/sdcard
+	@echo "BOOT (FAT16, va en /boot):"
+	@ls $(BUILD)/sdcard
 	@echo
-	@echo "Copialo a una SD con una particion FAT32, o usa:  make sd SD=/Volumes/TUSD"
+	@echo "DATA (FAT32, es el raiz):"
+	@ls $(BUILD)/sddata
+	@echo "  USR/BIN:"
+	@ls $(BUILD)/sddata/USR/BIN | tr '\n' ' '; echo
+	@echo
+	@echo "Copialas con:  make sd SD=/Volumes/boot DATA=/Volumes/DATA"
 
 # Copia directamente a una SD ya montada.
 # 'cp -R .../.' y no 'cp .../*': hay un subdirectorio (overlays/) y el glob
 # solo pasa nombres, asi que un cp a secas se lo salta y falla.
 sd: sdcard
-	@test -d "$(SD)" || { echo "No existe $(SD). Usa: make sd SD=/Volumes/TUSD"; exit 1; }
+	@test -d "$(SD)" || { echo "No existe $(SD). Usa: make sd SD=/Volumes/boot DATA=/Volumes/DATA"; exit 1; }
 	@cp -R $(BUILD)/sdcard/. "$(SD)/"
+	@if [ -n "$(DATA)" ]; then                                            \
+	   test -d "$(DATA)" || { echo "No existe $(DATA)"; exit 1; };        \
+	   cp -R $(BUILD)/sddata/. "$(DATA)/";                                \
+	   echo "Copiado a $(DATA) (el raiz).";                               \
+	 else                                                                 \
+	   echo "AVISO: sin DATA=... no se han copiado los programas.";        \
+	   echo "       Usa: make sd SD=$(SD) DATA=/Volumes/DATA";             \
+	 fi
 	@sync
-	@echo "Copiado a $(SD):"
-	@ls -R "$(SD)" | head -20
-	@echo "Expulsala y arranca la Pi."
+	@echo "Copiado a $(SD) (el /boot)."
+	@echo "Expulsalas y arranca la Pi."
 
 clean:
 	@rm -rf $(BUILD)

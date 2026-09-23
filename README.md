@@ -89,6 +89,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 32   | Nombres largos, y una interrupcion perdida  | hecho  |
 | 33   | mmap: el kernel pide y un proceso contesta  | hecho  |
 | 34   | exec por mmap: comprobar pasa a ser traer   | hecho  |
+| 35   | Dos particiones, /boot, /usr/bin y comillas | hecho  |
 
 ## Estructura
 
@@ -2030,6 +2031,234 @@ medida que incluye lo que no querias medir no vale.
 las paginas del programa nuevo. `run` pierde ademas un array estatico de
 32 KB que reservaba siempre, se usara o no.
 
+## Dos particiones, dos sistemas de ficheros
+
+La tarjeta de la Pi tiene dos particiones: `boot` en FAT16, que es la que
+lee el firmware, y `DATA` en FAT32. Hasta aqui el servidor montaba la
+primera que encontrase y hacia como que la otra no existia. Ahora `DATA`
+es `/` y `boot` cuelga de `/boot`.
+
+```
+    [fs] /      FAT32  8 sectores/cluster  115218 clusters
+    [fs] /boot  FAT16  4 sectores/cluster   31181 clusters
+```
+
+**FAT16 y FAT32 son el mismo formato con dos diferencias que importan.**
+
+La primera: en FAT16 el directorio raiz es una **region fija** detras de
+las FAT, con un numero de entradas decidido al formatear. En FAT32 esa
+region no existe: el raiz es una cadena de clusters como cualquier
+directorio, y el BPB dice por cual empieza. Es mejor en todo -crece, no
+tiene tope- y la unica razon de que FAT16 no lo hiciera asi es que en 1983
+habia que poder encontrar el raiz sin leer la FAT.
+
+Para este servidor el cambio fue de dos lineas, y solo porque el paso 31
+ya habia escondido la diferencia entre el raiz y los demas detras de
+`dir_sector()`. Sin aquello, habria habido que tocar cada recorrido.
+
+La segunda: las casillas de la tabla miden 16 o 32 bits. De ahi los
+nombres. Y hay un detalle que se olvida siempre: **los cuatro bits de
+arriba de una casilla FAT32 estan reservados y no son parte del numero**.
+Hay que enmascarar al leer y conservarlos al escribir; si no, un volumen
+que los traiga a uno da clusters astronomicos y la cadena se va a paseo.
+
+**Y una cosa que NO esta en el BPB: de que tipo es.** No hay ningun campo
+que lo diga. El `"FAT16   "` que se ve en el sector es una etiqueta que
+nadie garantiza y que ningun sistema serio mira. La forma oficial de
+averiguarlo es **contar los clusters**: menos de 4085 es FAT12, menos de
+65525 es FAT16, y el resto FAT32.
+
+O sea que el tipo de un volumen FAT es una **consecuencia de su tamanyo**,
+no un dato. Eso tiene un efecto practico inmediato: la imagen de pruebas
+tuvo que pasar de 64 MB a 512, porque por debajo de cierto tamanyo
+`diskutil` formatea FAT16 aunque le pidas FAT32. No puede hacer otra cosa.
+
+**La tabla de montajes.** Diez variables globales con la geometria pasaron
+a ser una `struct volumen` que se pasa como argumento a casi todo. Se
+podria haber dejado un puntero global al "volumen actual" y ahorrarse el
+refactor -el servidor atiende una peticion cada vez, asi que seria
+correcto-, pero un estado global que hay que acordarse de poner antes de
+cada operacion es justo la clase de cosa que funciona hasta el dia que
+alguien anyade un camino nuevo y se olvida.
+
+Elegir volumen es quedarse con el punto de montaje **mas largo** que case,
+porque `/` casa con todo:
+
+```
+    /boot/config.txt  ->  volumen de arranque, "/config.txt"
+    /hola.txt         ->  volumen de datos,    "/hola.txt"
+```
+
+Y el punto tiene que terminar en barra o en fin de cadena, o
+`/bootcode.bin` se lo quedaria `/boot` y buscaria un `code.bin` que no
+existe. Es el mismo error que comparar prefijos de URL sin mirar el
+separador.
+
+**Un directorio que no esta en ningun disco.** Al listar `/`, el servidor
+ensenya `boot` como `<dir>` aunque ahi no hay ninguna entrada: sale de la
+tabla de montajes. Es la primera vez que este servidor ensenya algo que no
+ha leido de un sector.
+
+En Unix esto se hace al reves: el punto de montaje tiene que existir como
+directorio de verdad en el volumen de abajo, y al montar queda **tapado**.
+Tiene sus ventajas -no hay que inventar entradas- y una consecuencia
+famosa: si montas sobre un directorio que tenia cosas, dejan de verse sin
+haberse borrado. Aqui no hay tal directorio, asi que se anyade. Mas
+simple, y se ve mejor lo que es un montaje: un trozo de nombre que lleva a
+otro sitio.
+
+**El fallo, que fue de los de mirar donde no era.** `ls /boot` se listaba
+a si mismo: ensenyaba `boot <dir>` dentro de `/boot`. La causa no estaba
+en la tabla de montajes sino en que le pasaba la ruta **ya recortada**:
+`volumen_de()` le quita el punto de montaje, asi que la funcion que busca
+"que montajes cuelgan de aqui" recibia `/` y se encontraba a si misma. Una
+funcion correcta con el argumento equivocado.
+
+**La comprobacion que de verdad vale.** Que TinyOS lea lo que TinyOS
+escribe no prueba gran cosa: un sistema de ficheros mal escrito es
+perfectamente capaz de entenderse consigo mismo. Lo que hay que comprobar
+es que **lo entienda otro**:
+
+```
+    /nuevo $ cat /boot/aviso.txt > copia.txt     (lee FAT16, escribe FAT32)
+
+    $ ls -l /Volumes/DATA/NUEVO/
+    -rwx------  77  COPIA.TXT
+    $ cat /Volumes/DATA/NUEVO/COPIA.TXT
+      --- /boot/aviso.txt ---
+    Soy el de la particion de arranque.
+      --- fin ---
+```
+
+macOS lee el directorio que creo TinyOS y el fichero que escribio, byte
+por byte. Eso es lo que dice que las estructuras estan bien y no solo son
+consistentes con quien las puso.
+
+## /usr/bin, y un PATH de verdad
+
+Con la tarjeta organizada, los ejecutables dejan de estar tirados en el
+raiz y se van a `/usr/bin`. El shell los busca ahi:
+
+```c
+    static const char *PATH[] = { 0, "/usr/bin" };   /* el 0 es "donde estoy" */
+```
+
+Dos sitios: el directorio actual y `/usr/bin`. Es una lista escrita en el
+codigo y no una variable de entorno porque este sistema todavia no tiene
+entorno, pero la idea es la de siempre: **un programa se llama por su
+nombre y alguien decide donde se busca**.
+
+Que el directorio actual vaya primero es comodo, y en Unix **no** se hace:
+ahi `.` no esta en el PATH por defecto, porque entrar en un directorio
+ajeno y escribir `ls` podria ejecutar el `ls` que haya dejado el duenyo del
+directorio. Aqui no hay varios usuarios, asi que no hay a quien enganyar.
+
+Y cuando no lo encuentra, lo dice entero:
+
+```
+    /docs $ noexiste
+      NOEXISTE.ELF: no lo encuentro. He mirado en:
+        /docs
+        /usr/bin
+```
+
+Un "no encuentro" a secas manda a pensar que el fichero no esta; ensenyar
+la lista dice que quiza esta, pero en otro sitio.
+
+## Comillas, y quien parte una linea
+
+`cat "un nombre bastante largo.txt"` no funcionaba: el shell partia por
+espacios y el programa recibia `"un` como nombre.
+
+Arreglarlo tiene una pega de disenyo que conviene ver antes que el codigo.
+**En Unix el que parte la linea es el shell**, que le pasa al kernel un
+array de cadenas ya hecho; el kernel no sabe lo que es una comilla ni
+falta que le hace. Aqui el convenio es otro -`exec` recibe UNA cadena y la
+parte `build_args`- asi que el que tiene que entender las comillas es el
+kernel.
+
+No es lo ideal: mete politica de interfaz de usuario en un sitio donde no
+pinta nada. La alternativa es cambiar el convenio de `exec` y `spawn` para
+pasar un array, y eso es otro paso. Queda dicho en el codigo.
+
+Y hay una segunda pega, esta visible: la misma regla acaba escrita en
+**cuatro sitios**. El kernel para los argumentos, y el shell tres veces
+-el nombre del programa, el destino de `<` y el de `>`-. Cuatro sitios
+para una sola regla es de esas cosas que funcionan hasta el dia que
+alguien anyade un quinto y se olvida.
+
+**El fallo, que fue mio y de hoy.** La primera version compactaba la
+cadena **sobre si misma**: copiaba cada palabra sin comillas unos bytes
+mas atras, en el mismo buffer. Parecia seguro porque el que escribe nunca
+adelanta al que lee... salvo en un sitio. Al cerrar una palabra se escribe
+un cero, y en la primera palabra ese cero cae **exactamente encima del
+espacio que se iba a leer a continuacion**. A partir de ahi todo se
+descuadra en uno.
+
+El sintoma no se parecia en nada a la causa:
+
+```
+    / $ hello "dos palabras" tres
+      >> me han llamado con 2 argumento(s): [hello] []
+```
+
+La cura fue leer de un sitio y escribir en otro: la fuente es la cadena
+que llega, el destino es la pila del proceso nuevo. Dos buffers, y el
+problema desaparece en vez de esquivarse.
+
+```
+    / $ hello "dos palabras" tres
+      >> me han llamado con 3 argumento(s): [hello] [dos palabras] [tres]
+```
+
+**Y negarse en vez de apanyarselo.** Con comillas ya se podia escribir
+`cat hola.txt > "con espacios.txt"`, y el servidor lo creaba: `a_8_3()`
+convertia el nombre en `CON ESPATXT`, que ningun sistema sabe volver a
+escribir igual y que al listarlo sale como `CON.TXT`, porque `de_8_3()`
+para en el primer espacio. Un fichero que se crea con un nombre y aparece
+con otro.
+
+Los nombres largos se **leen** pero no se escriben -eso exigiria generar
+la cadena VFAT y, peor, inventar un nombre corto que no choque-, asi que
+lo correcto mientras tanto es un error:
+
+```
+    / $ cat hola.txt > "con espacios.txt"
+      no puedo escribir CON ESPACIOS.TXT
+      (los nombres nuevos tienen que caber en 8.3: sin espacios)
+```
+
+## El fallo mas caro de este paso no estaba en el codigo
+
+Estaba en el Makefile, y conviene contarlo porque es de los que no se ven
+en una revision.
+
+`make sdtest` crea la imagen de dos particiones y escribe en ellas. Las
+particiones se llaman BOOT y DATA, asi que el script escribia en
+`/Volumes/BOOT` y `/Volumes/DATA`. Parece razonable.
+
+Lo que pasa es que si hay **una tarjeta de verdad puesta en el Mac** -que
+es exactamente lo que pasa cuando estas trabajando en esto- ya hay un
+`/Volumes/DATA`, y es el de la tarjeta. macOS entonces monta la imagen
+como `/Volumes/DATA 1`. El script no se entera y escribe en la **tarjeta**.
+
+El sintoma fue que TinyOS arrancaba y no encontraba nada: la imagen estaba
+vacia porque todo habia ido a otro sitio. El sintoma no dijo nada del
+problema real, que era que una herramienta de construccion estaba
+escribiendo en un dispositivo que no era el suyo.
+
+La cura es no adivinar nunca un punto de montaje:
+
+```sh
+    B=$(diskutil info -plist ${DEV}s1 | plutil -extract MountPoint raw -)
+    D=$(diskutil info -plist ${DEV}s2 | plutil -extract MountPoint raw -)
+    case "$B$D" in /Volumes/*) ;; *) echo "puntos raros"; exit 1;; esac
+```
+
+Se pregunta por el **dispositivo**, que es lo unico que se sabe con
+certeza, y se comprueba la respuesta antes de usarla. Un nombre de volumen
+es una etiqueta que cualquiera puede repetir; el numero de disco no.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -2063,8 +2292,17 @@ las paginas del programa nuevo. `run` pierde ademas un array estatico de
 - Solo se puede pedir la interrupcion de la UART. La lista de fuentes que
   un proceso puede reclamar esta escrita a mano en `irq_register()`; un
   sistema serio la sacaria de un arbol de dispositivos.
-- El servidor de ficheros entiende FAT16 y nombres 8.3: nada de FAT32 ni
-  de nombres largos. Los `~1` que deja Windows o macOS se ven tal cual.
+- El servidor entiende FAT16 y FAT32, pero nada de FAT12 ni exFAT, y
+  escribe los nombres en 8.3.
+- El PATH es una lista en el codigo del shell (`.` y `/usr/bin`): no hay
+  variables de entorno que heredar en el `fork`.
+- Los montajes estan escritos a mano: la particion FAT32 es `/` y la
+  FAT16 es `/boot`, y no hay `mount` ni `/etc/fstab`. Con dos particiones
+  y una placa concreta, una tabla de dos entradas dice mas que un
+  mecanismo general sin usar.
+- Un punto de montaje se inventa al listar su padre, asi que no se puede
+  borrar ni entrar en el con `cd ..` desde dentro esperando encontrar una
+  entrada de verdad.
 - No hay `rmdir`, ni `mv`, ni borrado recursivo. Y `rm` sobre un
   directorio no lo comprueba: se puede dejar una entrada sin sus datos.
 - La ruta son 64 bytes y cada componente 8.3, o sea unos cinco niveles.
@@ -2087,8 +2325,10 @@ las paginas del programa nuevo. `run` pierde ademas un array estatico de
 - De los nombres largos solo se entiende el ASCII. Lo de fuera sale como
   '?', a proposito: un byte truncado al azar daria un nombre que parece
   bueno y no abre nada.
-- El shell parte la linea por espacios y no tiene comillas, asi que un
-  fichero cuyo nombre lleve espacios se puede listar pero no abrir.
+- Las comillas las entiende `build_args`, en el KERNEL, porque `exec`
+  recibe una cadena y no un array. La regla acaba repetida en cuatro
+  sitios. Lo limpio seria cambiar el convenio de `exec`.
+- No hay escapes (`\ `), ni comillas dentro de comillas, ni variables.
 - No hay diario ni nada que se le parezca: un corte de corriente a mitad de
   una escritura deja el volumen inconsistente, como en 1980.
 - Los ficheros nuevos no llevan fecha. FAT tiene campos para ella, pero la

@@ -1,6 +1,8 @@
 /* user/fs.c - Servidor de ficheros, en espacio de usuario
  *
- * Lee FAT16 de una tarjeta SD. No es parte del kernel: es un proceso de
+ * Lee FAT16 y FAT32 de una tarjeta SD, y monta las dos particiones: la de
+ * datos en "/" y la de arranque en "/boot". No es parte del kernel: es un
+ * proceso de
  * EL0 al que se le ha concedido la pagina de registros del controlador
  * EMMC, igual que al servidor de consola se le concede la de la PL011.
  * Si se cuelga, se cuelga el; el resto del sistema ni se entera.
@@ -21,24 +23,52 @@
 #include "sd.h"
 #include "fs_abi.h"
 
-/* --- Geometria del volumen, calculada al montar ----------------------- */
-static uint32_t part_lba;        /* donde empieza la particion            */
-static uint32_t fat_lba;         /* donde empieza la primera FAT          */
-static uint32_t root_lba;        /* donde empieza el directorio raiz      */
-static uint32_t data_lba;        /* donde empieza el primer cluster       */
-static uint32_t sec_per_clus;
-static uint32_t root_entries;
-static uint32_t num_fats;        /* copias de la FAT: hay que escribirlas todas */
-static uint32_t sec_por_fat;
-static uint32_t max_cluster;     /* el numero mas alto que existe en este volumen */
-static int      montado;
+/* --- Geometria de UN volumen -----------------------------------------
+ *
+ * Esto eran diez variables globales, y valia mientras hubiera un solo
+ * sistema de ficheros. Ahora hay dos -la particion de arranque y la de
+ * datos- asi que la geometria deja de ser "la del disco" y pasa a ser "la
+ * de este volumen". Se pasa como argumento a todo el que la necesite, que
+ * es casi todo.
+ *
+ * Podria haberse dejado un puntero global al "volumen actual" y ahorrarse
+ * el refactor: el servidor atiende una peticion cada vez, asi que seria
+ * correcto. Pero un estado global que hay que acordarse de poner antes de
+ * cada operacion es justo la clase de cosa que funciona hasta el dia que
+ * alguien anyade un camino nuevo y se olvida.
+ */
+struct volumen {
+    int      montado;
+    int      fat32;              /* 0 = FAT16, 1 = FAT32                  */
+
+    uint32_t part_lba;           /* donde empieza la particion            */
+    uint32_t fat_lba;            /* donde empieza la primera FAT          */
+    uint32_t root_lba;           /* FAT16: donde empieza el raiz fijo     */
+    uint32_t root_cluster;       /* FAT32: primer cluster del raiz        */
+    uint32_t data_lba;           /* donde empieza el primer cluster       */
+    uint32_t sec_per_clus;
+    uint32_t root_entries;       /* FAT16: cuantas caben en el raiz       */
+    uint32_t num_fats;           /* copias: hay que escribirlas todas     */
+    uint32_t sec_por_fat;
+    uint32_t max_cluster;        /* el numero mas alto que existe aqui    */
+    uint32_t eoc;                /* "fin de cadena" segun el tipo de FAT  */
+};
+
+/* Donde cuelga cada volumen. El orden importa al buscar: se prueba el
+ * punto mas largo primero, para que "/boot/x" no se lo quede "/". */
+#define MAX_MONTAJES 2
+
+struct montaje {
+    char           punto[16];    /* "/" o "/boot"; vacio = ranura libre   */
+    struct volumen vol;
+};
+
+static struct montaje montajes[MAX_MONTAJES];
 
 /* Un sector cacheado: leer de la SD es caro y casi todo son relecturas
  * del mismo sitio (el directorio, o la FAT). */
 static uint8_t  cache[512];
 static uint32_t cache_lba = 0xFFFFFFFF;
-
-static uint8_t  secbuf[512];     /* para lecturas que no queremos cachear */
 
 static int leer(uint32_t lba, uint8_t *dst)
 {
@@ -62,63 +92,198 @@ static uint32_t le32(const uint8_t *p)
 }
 
 /* --- Montar: del MBR a la geometria ----------------------------------- */
+/* --- Montar -----------------------------------------------------------
+ *
+ * FAT16 y FAT32 son el mismo formato con dos diferencias que importan:
+ *
+ *   1. En FAT16 el directorio raiz es una REGION FIJA detras de las FAT,
+ *      con un numero de entradas decidido al formatear. En FAT32 no
+ *      existe esa region: el raiz es una cadena de clusters como
+ *      cualquier directorio, y el BPB dice por cual empieza. Es mejor en
+ *      todo -crece, no tiene tope- y la unica razon de que FAT16 no lo
+ *      hiciera asi es que en 1983 habia que poder encontrarlo sin leer la
+ *      FAT.
+ *
+ *   2. Las casillas de la tabla miden 16 o 32 bits. De ahi los nombres, y
+ *      de ahi que un volumen FAT16 no pueda pasar de 65.525 clusters.
+ *
+ * Y una cosa que NO esta en el BPB: de que tipo es. No hay ningun campo
+ * que lo diga -el "FAT16   " que se ve en el sector es una etiqueta que
+ * nadie garantiza- y la forma oficial de averiguarlo es CONTAR LOS
+ * CLUSTERS. Menos de 4085 es FAT12, menos de 65525 es FAT16, y el resto
+ * FAT32. Literalmente: el tipo de un volumen FAT es una consecuencia de
+ * su tamanyo, no un dato.
+ */
+static int montar_particion(struct volumen *v, uint32_t lba)
+{
+    uint8_t bpb[512];
+
+    v->montado = 0;
+    if (leer(lba, bpb) < 0) return -1;
+    if (le16(bpb + 510) != 0xAA55) return -1;
+    if (le16(bpb + 11) != 512) return -1;          /* solo 512 b/sector */
+
+    v->part_lba     = lba;
+    v->sec_per_clus = bpb[13];
+    v->num_fats     = bpb[16];
+    v->root_entries = le16(bpb + 17);
+
+    uint32_t reservados = le16(bpb + 14);
+    v->sec_por_fat = le16(bpb + 22);
+    if (!v->sec_por_fat) v->sec_por_fat = le32(bpb + 36);   /* FAT32 */
+
+    if (!v->sec_per_clus || !v->num_fats || !v->sec_por_fat) return -1;
+
+    uint32_t total = le16(bpb + 19);
+    if (!total) total = le32(bpb + 32);
+    if (!total) return -1;
+
+    v->fat_lba  = lba + reservados;
+    v->root_lba = v->fat_lba + v->num_fats * v->sec_por_fat;
+
+    uint32_t sec_raiz = (v->root_entries * 32 + 511) / 512;
+    v->data_lba = v->root_lba + sec_raiz;
+
+    if (total <= (v->data_lba - lba)) return -1;
+
+    uint32_t clusters = (total - (v->data_lba - lba)) / v->sec_per_clus;
+
+    /* Aqui se decide el tipo, contando. */
+    v->fat32 = (clusters >= 65525);
+
+    if (v->fat32) {
+        if (v->root_entries) return -1;            /* FAT32 no tiene raiz fijo */
+        v->root_cluster = le32(bpb + 44);
+        if (v->root_cluster < 2) return -1;
+        v->eoc = 0x0FFFFFF8;
+    } else {
+        if (!v->root_entries) return -1;           /* FAT16 si lo tiene */
+        v->root_cluster = 0;
+        v->eoc = 0xFFF8;
+    }
+
+    v->max_cluster = clusters + 1;
+
+    /* Un tope duro: la FAT tiene 256 casillas de 16 bits por sector, o 128
+     * de 32. Por muchos clusters que diga el BPB no puede haber mas de los
+     * que caben en ella. Sin esto, un BPB raro haria que alloc_cluster
+     * escribiera PASADA la tabla, encima de los datos. Es exactamente el
+     * tipo de fallo que no avisa: la tarjeta sigue pareciendo correcta
+     * hasta que se pierde entera. */
+    uint32_t cabe = v->sec_por_fat * (v->fat32 ? 128 : 256);
+    if (cabe < 2) return -1;
+    if (v->max_cluster > cabe - 1) v->max_cluster = cabe - 1;
+
+    v->montado = 1;
+    return 0;
+}
+
+/* Poner un nombre a un montaje. */
+static void poner_punto(struct montaje *m, const char *punto)
+{
+    int i = 0;
+    for (; punto[i] && i < (int)sizeof(m->punto) - 1; i++) m->punto[i] = punto[i];
+    m->punto[i] = 0;
+}
+
+/* Recorrer la tabla de particiones y colocar cada una donde toca.
+ *
+ * La de datos (FAT32) es el raiz, y la de arranque (FAT16) cuelga de
+ * /boot. Si solo hay una, esa es el raiz: asi la imagen de pruebas de un
+ * solo volumen sigue valiendo.
+ *
+ * Se elige por TIPO y no por orden en la tabla porque el tipo se ha
+ * deducido leyendo el volumen, y el orden es solo lo que puso quien
+ * formateo. */
 static int montar(void)
 {
-    if (leer(0, secbuf) < 0) return -1;
-    if (le16(secbuf + 510) != 0xAA55) return -1;
+    uint8_t mbr[512];
 
-    /* La tabla de particiones son cuatro entradas de 16 bytes a partir del
-     * 446. Nos quedamos con la primera que sea FAT. */
-    part_lba = 0;
+    for (int i = 0; i < MAX_MONTAJES; i++) montajes[i].punto[0] = 0;
+
+    if (leer(0, mbr) < 0) return -1;
+    if (le16(mbr + 510) != 0xAA55) return -1;
+
+    struct volumen datos = { 0 }, arranque = { 0 };
+    int hay_datos = 0, hay_arranque = 0;
+
     for (int i = 0; i < 4; i++) {
-        const uint8_t *e = secbuf + 446 + i * 16;
+        const uint8_t *e = mbr + 446 + i * 16;
         uint8_t tipo = e[4];
-        if (tipo == 0x01 || tipo == 0x04 || tipo == 0x06 ||
-            tipo == 0x0B || tipo == 0x0C || tipo == 0x0E) {
-            part_lba = le32(e + 8);
-            break;
-        }
+        if (tipo == 0) continue;
+
+        uint32_t lba = le32(e + 8);
+        if (!lba) continue;
+
+        struct volumen v;
+        if (montar_particion(&v, lba) < 0) continue;
+
+        if (v.fat32 && !hay_datos)        { datos    = v; hay_datos    = 1; }
+        else if (!v.fat32 && !hay_arranque) { arranque = v; hay_arranque = 1; }
     }
-    if (!part_lba) return -1;
 
-    /* El primer sector de la particion es el BPB, que describe el resto. */
-    if (leer(part_lba, secbuf) < 0) return -1;
-    if (le16(secbuf + 510) != 0xAA55) return -1;
-    if (le16(secbuf + 11) != 512) return -1;      /* solo 512 b/sector */
+    int n = 0;
 
-    sec_per_clus          = secbuf[13];
-    uint32_t reservados   = le16(secbuf + 14);
-    num_fats              = secbuf[16];
-    root_entries          = le16(secbuf + 17);
-    sec_por_fat           = le16(secbuf + 22);
+    if (hay_datos) {
+        poner_punto(&montajes[n], "/");
+        montajes[n].vol = datos;
+        n++;
+        if (hay_arranque) {
+            poner_punto(&montajes[n], "/boot");
+            montajes[n].vol = arranque;
+            n++;
+        }
+    } else if (hay_arranque) {
+        /* Una sola particion: es el raiz. */
+        poner_punto(&montajes[n], "/");
+        montajes[n].vol = arranque;
+        n++;
+    }
 
-    if (!sec_per_clus || !num_fats || !root_entries || !sec_por_fat)
-        return -1;                                 /* esto seria FAT32 */
+    return n ? 0 : -1;
+}
 
-    fat_lba  = part_lba + reservados;
-    root_lba = fat_lba + num_fats * sec_por_fat;
-    data_lba = root_lba + (root_entries * 32 + 511) / 512;
+/* De una ruta absoluta al volumen que la sirve, y a lo que queda de ruta
+ * dentro de el.
+ *
+ * "/boot/config.txt" -> volumen de arranque, "/config.txt"
+ * "/hola.txt"        -> volumen de datos,    "/hola.txt"
+ *
+ * Se prueba el punto de montaje MAS LARGO primero, porque "/" casa con
+ * todo. Y el punto tiene que terminar en barra o en fin de cadena, o
+ * "/bootcode.bin" se lo quedaria "/boot" y buscaria un "code.bin" que no
+ * existe. */
+static struct volumen *volumen_de(const char *ruta, const char **resto)
+{
+    struct montaje *mejor = 0;
+    int mejor_largo = -1;
 
-    /* Cuantos clusters hay de verdad. Hace falta para no inventarse uno al
-     * buscar sitio libre: la FAT tiene mas casillas que clusters. */
-    uint32_t total = le16(secbuf + 19);
-    if (!total) total = le32(secbuf + 32);
-    if (total <= (data_lba - part_lba)) return -1;
+    for (int i = 0; i < MAX_MONTAJES; i++) {
+        struct montaje *m = &montajes[i];
+        if (!m->punto[0] || !m->vol.montado) continue;
 
-    max_cluster = (total - (data_lba - part_lba)) / sec_per_clus + 1;
+        int largo = 0;
+        while (m->punto[largo]) largo++;
 
-    /* Y un tope duro: la tabla FAT tiene 256 casillas por sector, asi que
-     * por muchos clusters que diga el BPB no puede haber mas de los que
-     * caben en ella. Sin esta linea, un BPB raro haria que alloc_cluster
-     * escribiera PASADA la tabla, encima del directorio raiz. Es
-     * exactamente el tipo de fallo que no avisa: la tarjeta sigue
-     * pareciendo correcta hasta que se pierde entera. */
-    uint32_t cabe = sec_por_fat * 256;
-    if (cabe < 2) return -1;
-    if (max_cluster > cabe - 1) max_cluster = cabe - 1;
+        int es_raiz = (largo == 1);              /* el punto "/" */
+        int casa = 1;
+        for (int k = 0; k < largo; k++)
+            if (ruta[k] != m->punto[k]) { casa = 0; break; }
 
-    montado = 1;
-    return 0;
+        if (!casa) continue;
+        if (!es_raiz && ruta[largo] != '/' && ruta[largo] != 0) continue;
+
+        if (largo > mejor_largo) { mejor = m; mejor_largo = largo; }
+    }
+
+    if (!mejor) return 0;
+
+    if (mejor_largo == 1) *resto = ruta;         /* "/" no se quita */
+    else {
+        *resto = ruta + mejor_largo;
+        if (!(*resto)[0]) *resto = "/";          /* "/boot" a secas */
+    }
+    return &mejor->vol;
 }
 
 /* ====================== ESCRITURA ==================================
@@ -211,7 +376,7 @@ static void lfn_add(struct lfn *l, const uint8_t *d)
 /* Las dos viven mas abajo, con la parte de lectura, porque las comparten
  * los dos lados. */
 static void     a_8_3(const char *nombre, char out[11]);
-static uint32_t siguiente_cluster(uint32_t c);
+static uint32_t siguiente_cluster(struct volumen *v, uint32_t c);
 
 /* Y estas tres tambien: las necesita el recorrido de directorios, que esta
  * antes, y se definen con el resto de la parte de lectura. */
@@ -235,18 +400,29 @@ static int escribir(uint32_t lba, const uint8_t *src)
  * volumen: perder los datos de un fichero es perder un fichero, perder la
  * FAT es perderlos todos. Escribir solo en la primera "funciona" hasta que
  * alguien repare el disco con la segunda. */
-static int fat_set(uint32_t c, uint16_t valor)
+static int fat_set(struct volumen *v, uint32_t c, uint32_t valor)
 {
-    if (c < 2 || c > max_cluster) return -1;
+    if (c < 2 || c > v->max_cluster) return -1;
 
-    uint32_t off = c * 2;
-    for (uint32_t copia = 0; copia < num_fats; copia++) {
-        uint32_t lba = fat_lba + copia * sec_por_fat + off / 512;
+    uint32_t ancho = v->fat32 ? 4 : 2;
+    uint32_t off   = c * ancho;
+
+    for (uint32_t copia = 0; copia < v->num_fats; copia++) {
+        uint32_t lba = v->fat_lba + copia * v->sec_por_fat + off / 512;
 
         uint8_t *b = cached(lba);
         if (!b) return -1;
-        b[off % 512]     = (uint8_t)(valor & 0xFF);
-        b[off % 512 + 1] = (uint8_t)(valor >> 8);
+
+        uint32_t o = off % 512;
+        b[o]     = (uint8_t)(valor & 0xFF);
+        b[o + 1] = (uint8_t)(valor >> 8);
+
+        if (v->fat32) {
+            /* Los cuatro bits de arriba son del volumen, no nuestros: se
+             * conservan tal cual estaban. */
+            b[o + 2] = (uint8_t)(valor >> 16);
+            b[o + 3] = (uint8_t)((b[o + 3] & 0xF0) | ((valor >> 24) & 0x0F));
+        }
 
         if (escribir(lba, b) < 0) return -1;
     }
@@ -256,22 +432,24 @@ static int fat_set(uint32_t c, uint16_t valor)
 /* Buscar un cluster libre y marcarlo como "fin de fichero". Devuelve su
  * numero, o 0 si el volumen esta lleno. El 0 vale de "no hay" porque los
  * clusters 0 y 1 estan reservados y nunca se reparten. */
-static uint32_t alloc_cluster(void)
+static uint32_t alloc_cluster(struct volumen *v)
 {
-    for (uint32_t c = 2; c <= max_cluster; c++) {
-        if (siguiente_cluster(c) == 0) {
-            if (fat_set(c, 0xFFFF) < 0) return 0;
+    for (uint32_t c = 2; c <= v->max_cluster; c++) {
+        if (siguiente_cluster(v, c) == 0) {
+            /* Marcarlo como "fin de fichero". El valor depende del tipo:
+             * 0xFFFF en FAT16 y 0x0FFFFFFF en FAT32. */
+            if (fat_set(v, c, v->fat32 ? 0x0FFFFFFF : 0xFFFF) < 0) return 0;
             return c;
         }
     }
     return 0;
 }
 
-static void free_chain(uint32_t c)
+static void free_chain(struct volumen *v, uint32_t c)
 {
-    while (c >= 2 && c < 0xFFF8) {
-        uint32_t sig = siguiente_cluster(c);
-        fat_set(c, 0);
+    while (c >= 2 && c < v->eoc) {
+        uint32_t sig = siguiente_cluster(v, c);
+        fat_set(v, c, 0);
         c = sig;
     }
 }
@@ -292,21 +470,27 @@ static void free_chain(uint32_t c)
  *
  * Que el raiz tenga un tope y los demas no es la razon de que en FAT16 se
  * pueda llenar el directorio raiz teniendo el disco medio vacio. */
-static int dir_sector(uint32_t dir, uint32_t n, uint32_t *lba)
+static int dir_sector(struct volumen *v, uint32_t dir, uint32_t n, uint32_t *lba)
 {
-    if (dir == 0) {                              /* el raiz */
-        uint32_t sectores = (root_entries * 32 + 511) / 512;
-        if (n >= sectores) return -1;
-        *lba = root_lba + n;
-        return 0;
+    if (dir == 0) {
+        /* En FAT16 el raiz es una region fija con tope. En FAT32 no hay
+         * tal region: el raiz es una cadena de clusters como cualquier
+         * directorio, y por eso puede crecer. */
+        if (!v->fat32) {
+            uint32_t sectores = (v->root_entries * 32 + 511) / 512;
+            if (n >= sectores) return -1;
+            *lba = v->root_lba + n;
+            return 0;
+        }
+        dir = v->root_cluster;
     }
 
     uint32_t c = dir;
-    for (uint32_t saltar = n / sec_per_clus; saltar; saltar--) {
-        c = siguiente_cluster(c);
-        if (c < 2 || c >= 0xFFF8) return -1;      /* se acabo la cadena */
+    for (uint32_t saltar = n / v->sec_per_clus; saltar; saltar--) {
+        c = siguiente_cluster(v, c);
+        if (c < 2 || c >= v->eoc) return -1;      /* se acabo la cadena */
     }
-    *lba = data_lba + (c - 2) * sec_per_clus + (n % sec_per_clus);
+    *lba = v->data_lba + (c - 2) * v->sec_per_clus + (n % v->sec_per_clus);
     return 0;
 }
 
@@ -317,7 +501,7 @@ static int dir_sector(uint32_t dir, uint32_t n, uint32_t *lba)
  * 'quiero': 0 solo ficheros, 1 solo directorios, -1 lo que sea. Hace
  * falta porque al recorrer una ruta las componentes de en medio TIENEN que
  * ser directorios, y la ultima no. */
-static int dir_lookup_en(uint32_t dir, const char *nombre, int quiero,
+static int dir_lookup_en(struct volumen *v, uint32_t dir, const char *nombre, int quiero,
                          uint32_t *lba, uint32_t *off)
 {
     char patron[11];
@@ -332,7 +516,7 @@ static int dir_lookup_en(uint32_t dir, const char *nombre, int quiero,
 
     for (uint32_t s = 0; ; s++) {
         uint32_t sl;
-        if (dir_sector(dir, s, &sl) < 0) return -1;
+        if (dir_sector(v, dir, s, &sl) < 0) return -1;
 
         uint8_t *b = cached(sl);
         if (!b) return -1;
@@ -385,15 +569,45 @@ static uint32_t entrada_cluster(uint32_t lba, uint32_t off)
  * estrenar.
  *
  * 'attr' es 0x20 para un fichero y 0x10 para un directorio. */
-static int dir_create_en(uint32_t dir, const char *nombre, uint8_t attr,
+/* ¿Cabe este nombre en 8.3?
+ *
+ * Los nombres largos se LEEN pero no se escriben: eso exigiria generar la
+ * cadena de entradas VFAT y, peor, inventar un nombre corto que no choque
+ * con ninguno de los que ya hay.
+ *
+ * Mientras no este, lo importante es NEGARSE en vez de apanyarselo.
+ * a_8_3() de un "con espacios.txt" da "CON ESPATXT", que es un nombre que
+ * ningun sistema sabe volver a escribir igual y que al listarlo sale como
+ * "CON.TXT" -de_8_3 para en el primer espacio-. O sea: un fichero que se
+ * crea con un nombre y aparece con otro. Mejor un error. */
+static int cabe_en_8_3(const char *n)
+{
+    int base = 0, ext = 0, punto = 0;
+
+    for (const char *p = n; *p; p++) {
+        if (*p == ' ') return 0;              /* un espacio no cabe */
+        if (*p == '.') {
+            if (punto) return 0;              /* ni dos puntos */
+            punto = 1;
+            continue;
+        }
+        if (punto) ext++; else base++;
+    }
+
+    return base >= 1 && base <= 8 && ext <= 3;
+}
+
+static int dir_create_en(struct volumen *v, uint32_t dir, const char *nombre, uint8_t attr,
                          uint32_t *lba, uint32_t *off)
 {
+    if (!cabe_en_8_3(nombre)) return -1;
+
     char patron[11];
     a_8_3(nombre, patron);
 
     for (uint32_t s = 0; ; s++) {
         uint32_t sl;
-        if (dir_sector(dir, s, &sl) < 0) return -1;   /* directorio lleno */
+        if (dir_sector(v, dir, s, &sl) < 0) return -1;   /* directorio lleno */
 
         uint8_t *b = cached(sl);
         if (!b) return -1;
@@ -436,7 +650,7 @@ static int dir_create_en(uint32_t dir, const char *nombre, uint8_t attr,
  *
  * Las rutas llegan siempre absolutas: el servidor no sabe que es un
  * directorio actual, y no quiere saberlo. Ver fs_abi.h. */
-static int resolver(const char *ruta, uint32_t *dir, char *ultimo)
+static int resolver(struct volumen *v, const char *ruta, uint32_t *dir, char *ultimo)
 {
     if (ruta[0] != '/') return -1;               /* tiene que ser absoluta */
 
@@ -463,26 +677,26 @@ static int resolver(const char *ruta, uint32_t *dir, char *ultimo)
 
         /* Componente de en medio: TIENE que ser un directorio. */
         uint32_t lba, off;
-        if (dir_lookup_en(actual, comp, 1, &lba, &off) < 0) return -1;
+        if (dir_lookup_en(v, actual, comp, 1, &lba, &off) < 0) return -1;
         actual = entrada_cluster(lba, off);
     }
 }
 
-/* Los dos de siempre, ahora encima de resolver(). */
-static int dir_lookup(const char *ruta, uint32_t *lba, uint32_t *off)
+/* Los dos de siempre, ahora encima de resolver(v). */
+static int dir_lookup(struct volumen *v, const char *ruta, uint32_t *lba, uint32_t *off)
 {
     uint32_t dir;
     char ultimo[FS_NAME_MAX];
-    if (resolver(ruta, &dir, ultimo) < 0) return -1;
-    return dir_lookup_en(dir, ultimo, 0, lba, off);
+    if (resolver(v, ruta, &dir, ultimo) < 0) return -1;
+    return dir_lookup_en(v, dir, ultimo, 0, lba, off);
 }
 
-static int dir_create(const char *ruta, uint32_t *lba, uint32_t *off)
+static int dir_create(struct volumen *v, const char *ruta, uint32_t *lba, uint32_t *off)
 {
     uint32_t dir;
     char ultimo[FS_NAME_MAX];
-    if (resolver(ruta, &dir, ultimo) < 0) return -1;
-    return dir_create_en(dir, ultimo, 0x20, lba, off);
+    if (resolver(v, ruta, &dir, ultimo) < 0) return -1;
+    return dir_create_en(v, dir, ultimo, 0x20, lba, off);
 }
 
 /* Leer y modificar un campo de la entrada de directorio. */
@@ -513,23 +727,23 @@ static void dir_read(uint32_t lba, uint32_t off, uint32_t *cluster, uint32_t *ta
  *
  * No se admiten agujeros: escribir mas alla del final obligaria a rellenar
  * con ceros lo de en medio, y eso son mas casos que valor. */
-static int fichero_escribir(const char *nombre, uint32_t offset,
+static int fichero_escribir(struct volumen *v, const char *nombre, uint32_t offset,
                             const uint8_t *datos, uint32_t n)
 {
     uint32_t dlba, doff;
-    if (dir_lookup(nombre, &dlba, &doff) < 0) {
-        if (dir_create(nombre, &dlba, &doff) < 0) return -1;
+    if (dir_lookup(v, nombre, &dlba, &doff) < 0) {
+        if (dir_create(v, nombre, &dlba, &doff) < 0) return -1;
     }
 
     uint32_t primero, tam;
     dir_read(dlba, doff, &primero, &tam);
     if (offset > tam) return -1;
 
-    uint32_t bytes_por_clus = sec_per_clus * 512;
+    uint32_t bytes_por_clus = v->sec_per_clus * 512;
 
     /* Un fichero recien creado no tiene ni un cluster. */
     if (!primero) {
-        primero = alloc_cluster();
+        primero = alloc_cluster(v);
         if (!primero) return -1;
         if (dir_update(dlba, doff, primero, tam) < 0) return -1;
     }
@@ -537,11 +751,11 @@ static int fichero_escribir(const char *nombre, uint32_t offset,
     /* Llegar hasta el cluster donde cae 'offset', creando los que falten. */
     uint32_t c = primero;
     for (uint32_t saltar = offset / bytes_por_clus; saltar; saltar--) {
-        uint32_t sig = siguiente_cluster(c);
-        if (sig < 2 || sig >= 0xFFF8) {
-            sig = alloc_cluster();
+        uint32_t sig = siguiente_cluster(v, c);
+        if (sig < 2 || sig >= v->eoc) {
+            sig = alloc_cluster(v);
             if (!sig) return -1;
-            if (fat_set(c, (uint16_t)sig) < 0) return -1;
+            if (fat_set(v, c, (uint32_t)sig) < 0) return -1;
         }
         c = sig;
     }
@@ -550,7 +764,7 @@ static int fichero_escribir(const char *nombre, uint32_t offset,
     uint32_t hechos = 0;
 
     while (hechos < n) {
-        uint32_t lba = data_lba + (c - 2) * sec_per_clus + dentro / 512;
+        uint32_t lba = v->data_lba + (c - 2) * v->sec_per_clus + dentro / 512;
         uint32_t en_sector = 512 - (dentro % 512);
         uint32_t trozo = n - hechos;
         if (trozo > en_sector) trozo = en_sector;
@@ -568,11 +782,11 @@ static int fichero_escribir(const char *nombre, uint32_t offset,
         dentro += trozo;
 
         if (dentro >= bytes_por_clus && hechos < n) {
-            uint32_t sig = siguiente_cluster(c);
-            if (sig < 2 || sig >= 0xFFF8) {
-                sig = alloc_cluster();
+            uint32_t sig = siguiente_cluster(v, c);
+            if (sig < 2 || sig >= v->eoc) {
+                sig = alloc_cluster(v);
                 if (!sig) return -1;
-                if (fat_set(c, (uint16_t)sig) < 0) return -1;
+                if (fat_set(v, c, (uint32_t)sig) < 0) return -1;
             }
             c = sig;
             dentro = 0;
@@ -587,27 +801,27 @@ static int fichero_escribir(const char *nombre, uint32_t offset,
 }
 
 /* Crear vacio, o vaciar lo que hubiera. */
-static int fichero_crear(const char *nombre)
+static int fichero_crear(struct volumen *v, const char *nombre)
 {
     uint32_t dlba, doff;
 
-    if (dir_lookup(nombre, &dlba, &doff) == 0) {
+    if (dir_lookup(v, nombre, &dlba, &doff) == 0) {
         uint32_t primero, tam;
         dir_read(dlba, doff, &primero, &tam);
-        if (primero) free_chain(primero);
+        if (primero) free_chain(v, primero);
         return dir_update(dlba, doff, 0, 0);
     }
-    return dir_create(nombre, &dlba, &doff);
+    return dir_create(v, nombre, &dlba, &doff);
 }
 
-static int fichero_borrar(const char *nombre)
+static int fichero_borrar(struct volumen *v, const char *nombre)
 {
     uint32_t dlba, doff;
-    if (dir_lookup(nombre, &dlba, &doff) < 0) return -1;
+    if (dir_lookup(v, nombre, &dlba, &doff) < 0) return -1;
 
     uint32_t primero, tam;
     dir_read(dlba, doff, &primero, &tam);
-    if (primero) free_chain(primero);
+    if (primero) free_chain(v, primero);
 
     /* Borrar en FAT es poner un 0xE5 en la primera letra del nombre. El
      * resto de la entrada se queda ahi, y por eso se pueden recuperar
@@ -683,7 +897,7 @@ static int igual_sin_caja(const char *a, const char *b)
 }
 
 /* Localizar lo que nombra una ruta: fichero o directorio, da igual. */
-static int buscar(const char *ruta, uint32_t *cluster, uint32_t *tam,
+static int buscar(struct volumen *v, const char *ruta, uint32_t *cluster, uint32_t *tam,
                   uint32_t *flags)
 {
     /* El raiz no tiene entrada de directorio en ninguna parte: no es hijo
@@ -704,10 +918,10 @@ static int buscar(const char *ruta, uint32_t *cluster, uint32_t *tam,
 
     uint32_t dir;
     char ultimo[FS_NAME_MAX];
-    if (resolver(ruta, &dir, ultimo) < 0) return -1;
+    if (resolver(v, ruta, &dir, ultimo) < 0) return -1;
 
     uint32_t lba, off;
-    if (dir_lookup_en(dir, ultimo, -1, &lba, &off) < 0) return -1;
+    if (dir_lookup_en(v, dir, ultimo, -1, &lba, &off) < 0) return -1;
 
     uint8_t *b = cached(lba);
     if (!b) return -1;
@@ -721,12 +935,12 @@ static int buscar(const char *ruta, uint32_t *cluster, uint32_t *tam,
 /* El cluster de un directorio dado por su ruta. La raiz es el caso
  * especial y por eso se mira aparte: "/" no tiene ultima componente que
  * buscar, y el cluster 0 no se corresponde con ningun dato del disco. */
-static int resolver_dir(const char *ruta, uint32_t *dir)
+static int resolver_dir(struct volumen *v, const char *ruta, uint32_t *dir)
 {
     if (ruta[0] != '/') return -1;
 
     uint32_t cluster, tam, flags;
-    if (buscar(ruta, &cluster, &tam, &flags) < 0) return -1;
+    if (buscar(v, ruta, &cluster, &tam, &flags) < 0) return -1;
     if (!(flags & FS_ES_DIR)) return -1;
     *dir = cluster;
     return 0;
@@ -746,7 +960,7 @@ static int resolver_dir(const char *ruta, uint32_t *dir)
  * resultado en los dos casos. Es un recordatorio util: en FAT los
  * atributos son una sugerencia que cada sistema rellena a su gusto, y
  * apoyarse en ellos para decidir QUE es algo sale caro. */
-static int listar(uint32_t dir, uint32_t indice, struct fs_info *out)
+static int listar(struct volumen *v, uint32_t dir, uint32_t indice, struct fs_info *out)
 {
     uint32_t vistas = 0;
 
@@ -755,7 +969,7 @@ static int listar(uint32_t dir, uint32_t indice, struct fs_info *out)
 
     for (uint32_t s = 0; ; s++) {
         uint32_t lba;
-        if (dir_sector(dir, s, &lba) < 0) return -1;
+        if (dir_sector(v, dir, s, &lba) < 0) return -1;
 
         uint8_t *b = cached(lba);
         if (!b) return -1;
@@ -791,6 +1005,60 @@ static int listar(uint32_t dir, uint32_t indice, struct fs_info *out)
     }
 }
 
+/* Cuantas entradas de verdad tiene un directorio. Hace falta para saber
+ * donde empiezan los puntos de montaje en el listado. */
+static uint32_t cuantas_entradas(struct volumen *v, uint32_t dir)
+{
+    struct fs_info tmp;
+    uint32_t n = 0;
+    while (listar(v, dir, n, &tmp) == 0) n++;
+    return n;
+}
+
+/* El punto de montaje numero 'i' que cuelga DIRECTAMENTE de 'padre'.
+ *
+ * "cuelga directamente" quiere decir que su punto empieza por la ruta del
+ * padre y lo que sobra no lleva mas barras: /boot cuelga de /, pero
+ * /a/b no colgaria de /. */
+static int montaje_bajo(const char *padre, uint32_t i, struct fs_info *out)
+{
+    int largo_padre = 0;
+    while (padre[largo_padre]) largo_padre++;
+    int raiz = (largo_padre == 1 && padre[0] == '/');
+
+    uint32_t vistos = 0;
+
+    for (int k = 0; k < MAX_MONTAJES; k++) {
+        struct montaje *m = &montajes[k];
+        if (!m->punto[0] || !m->vol.montado) continue;
+        if (m->punto[1] == 0) continue;              /* el raiz no cuelga */
+
+        int desde = raiz ? 1 : largo_padre + 1;
+
+        if (!raiz) {
+            int casa = 1;
+            for (int j = 0; j < largo_padre; j++)
+                if (m->punto[j] != padre[j]) { casa = 0; break; }
+            if (!casa || m->punto[largo_padre] != '/') continue;
+        }
+
+        const char *nom = m->punto + desde;
+        int hay_barra = 0;
+        for (const char *p = nom; *p; p++) if (*p == '/') hay_barra = 1;
+        if (hay_barra || !*nom) continue;
+
+        if (vistos++ != i) continue;
+
+        out->size  = 0;
+        out->flags = FS_ES_DIR;
+        int o = 0;
+        for (; nom[o] && o < FS_NAME_MAX - 1; o++) out->name[o] = nom[o];
+        out->name[o] = 0;
+        return 0;
+    }
+    return -1;
+}
+
 /* Crear un directorio.
  *
  * Un directorio es un fichero cuyo contenido son entradas de 32 bytes, asi
@@ -802,27 +1070,27 @@ static int listar(uint32_t dir, uint32_t indice, struct fs_info *out)
  * Ese ".." es la unica forma que tiene FAT de subir un nivel: no hay
  * indice de padres en ningun sitio, esta escrito en cada hijo. Y el del
  * primer nivel apunta al cluster 0, que es como se dice "el raiz". */
-static int dir_nuevo(const char *ruta)
+static int dir_nuevo(struct volumen *v, const char *ruta)
 {
     uint32_t padre;
     char nombre[FS_NAME_MAX];
-    if (resolver(ruta, &padre, nombre) < 0) return -1;
+    if (resolver(v, ruta, &padre, nombre) < 0) return -1;
 
     uint32_t lba, off;
-    if (dir_lookup_en(padre, nombre, -1, &lba, &off) == 0) return -1;  /* ya existe */
+    if (dir_lookup_en(v, padre, nombre, -1, &lba, &off) == 0) return -1;  /* ya existe */
 
-    uint32_t c = alloc_cluster();
+    uint32_t c = alloc_cluster(v);
     if (!c) return -1;
 
     /* A ceros, entero. Un cluster reciclado trae la basura del fichero
      * anterior, y esa basura se leeria como entradas de directorio. */
     uint8_t vacio[512];
     for (int i = 0; i < 512; i++) vacio[i] = 0;
-    for (uint32_t s = 0; s < sec_per_clus; s++)
-        if (escribir(data_lba + (c - 2) * sec_per_clus + s, vacio) < 0) return -1;
+    for (uint32_t s = 0; s < v->sec_per_clus; s++)
+        if (escribir(v->data_lba + (c - 2) * v->sec_per_clus + s, vacio) < 0) return -1;
 
     /* "." y "..", a mano, en el primer sector. */
-    uint8_t *b = cached(data_lba + (c - 2) * sec_per_clus);
+    uint8_t *b = cached(v->data_lba + (c - 2) * v->sec_per_clus);
     if (!b) return -1;
 
     for (int i = 0; i < 11; i++) b[i] = ' ';
@@ -837,50 +1105,57 @@ static int dir_nuevo(const char *ruta)
     b[58] = (uint8_t)(padre & 0xFF);
     b[59] = (uint8_t)(padre >> 8);
 
-    if (escribir(data_lba + (c - 2) * sec_per_clus, b) < 0) return -1;
+    if (escribir(v->data_lba + (c - 2) * v->sec_per_clus, b) < 0) return -1;
 
     /* Y ahora si, la entrada en el padre. La ultima, para que un fallo a
      * mitad no deje un directorio que se ve pero esta sin estrenar. */
-    if (dir_create_en(padre, nombre, 0x10, &lba, &off) < 0) return -1;
+    if (dir_create_en(v, padre, nombre, 0x10, &lba, &off) < 0) return -1;
     return dir_update(lba, off, c, 0);           /* los directorios miden 0 */
 }
 
 /* --- Seguir la cadena de clusters ------------------------------------- */
 /* La tabla FAT es un array de enteros de 16 bits, uno por cluster: en la
  * casilla N esta el numero del cluster que va DESPUES del N. Un valor
- * >= 0xFFF8 significa "aqui se acaba el fichero". */
-static uint32_t siguiente_cluster(uint32_t c)
+ * >= v->eoc significa "aqui se acaba el fichero". */
+static uint32_t siguiente_cluster(struct volumen *v, uint32_t c)
 {
-    uint32_t off = c * 2;
-    uint8_t *b = cached(fat_lba + off / 512);
-    if (!b) return 0xFFFF;
-    return le16(b + (off % 512));
+    uint32_t off = c * (v->fat32 ? 4 : 2);
+    uint8_t *b = cached(v->fat_lba + off / 512);
+    if (!b) return v->eoc;
+
+    if (!v->fat32) return le16(b + (off % 512));
+
+    /* Los cuatro bits de arriba de una casilla FAT32 estan RESERVADOS y no
+     * son parte del numero. Hay que enmascararlos: si no, un volumen que
+     * los traiga a uno da clusters astronomicos y la cadena se va a paseo.
+     * Es el detalle que mas veces se olvida de FAT32. */
+    return le32(b + (off % 512)) & 0x0FFFFFFF;
 }
 
 /* Leer hasta 'n' bytes del fichero que empieza en 'primero', saltandose
  * los primeros 'offset'. Devuelve cuantos ha leido. */
-static int leer_fichero(uint32_t primero, uint32_t tam,
+static int leer_fichero(struct volumen *v, uint32_t primero, uint32_t tam,
                         uint32_t offset, uint8_t *dst, uint32_t n)
 {
     if (offset >= tam) return 0;
     if (offset + n > tam) n = tam - offset;
 
-    uint32_t bytes_por_clus = sec_per_clus * 512;
+    uint32_t bytes_por_clus = v->sec_per_clus * 512;
     uint32_t c = primero;
 
     /* Saltar clusters enteros siguiendo la cadena. */
     for (uint32_t saltar = offset / bytes_por_clus; saltar; saltar--) {
-        c = siguiente_cluster(c);
-        if (c < 2 || c >= 0xFFF8) return 0;
+        c = siguiente_cluster(v, c);
+        if (c < 2 || c >= v->eoc) return 0;
     }
 
     uint32_t dentro = offset % bytes_por_clus;
     uint32_t hechos = 0;
 
     while (hechos < n) {
-        if (c < 2 || c >= 0xFFF8) break;
+        if (c < 2 || c >= v->eoc) break;
 
-        uint32_t lba = data_lba + (c - 2) * sec_per_clus + dentro / 512;
+        uint32_t lba = v->data_lba + (c - 2) * v->sec_per_clus + dentro / 512;
         uint8_t *b = cached(lba);
         if (!b) break;
 
@@ -896,7 +1171,7 @@ static int leer_fichero(uint32_t primero, uint32_t tam,
 
         if (dentro >= bytes_por_clus) {
             dentro = 0;
-            c = siguiente_cluster(c);
+            c = siguiente_cluster(v, c);
         }
     }
     return (int)hechos;
@@ -957,7 +1232,14 @@ int main(int argc, char **argv)
     }
 
     printf("  [fs] tarjeta a %lu Hz\n", (uint64_t)sd_sd_clock());
-    printf("  [fs] FAT16 montada\n");
+    for (int i = 0; i < MAX_MONTAJES; i++) {
+        struct montaje *m = &montajes[i];
+        if (!m->punto[0]) continue;
+        printf("  [fs] %-5s  FAT%d  %lu sectores/cluster  %lu clusters\n",
+               m->punto, m->vol.fat32 ? 32 : 16,
+               (uint64_t)m->vol.sec_per_clus,
+               (uint64_t)m->vol.max_cluster);
+    }
 
     for (;;) {
         if (msg_recv(PORT_FILES, &pet) < 0) continue;
@@ -968,10 +1250,19 @@ int main(int argc, char **argv)
 
         r->name[FS_PATH_MAX - 1] = 0;         /* venga de donde venga */
 
+        /* Lo PRIMERO es decidir en que volumen cae la ruta, y quedarse con
+         * lo que sobra del punto de montaje. A partir de aqui todo lo
+         * demas trabaja dentro de un solo sistema de ficheros y no sabe
+         * que hay otro. */
+        const char *ruta = r->name;
+        struct volumen *v = volumen_de(r->name, &ruta);
+
+        if (!v) { responder(quien, FS_ERROR, "", 0); continue; }
+
         switch (pet.type) {
 
         case FS_SIZE:
-            if (buscar(r->name, &cluster, &tam, &flags) < 0) {
+            if (buscar(v, ruta, &cluster, &tam, &flags) < 0) {
                 responder(quien, FS_ERROR, "", 0);
             } else {
                 struct fs_info info;
@@ -982,20 +1273,20 @@ int main(int argc, char **argv)
                  * "/DOCS/A.TXT" ya sabe la ruta, lo que no sabe es como
                  * quedo el nombre despues de pasar por 8.3. */
                 uint32_t dir;
-                if (resolver(r->name, &dir, info.name) < 0) info.name[0] = 0;
+                if (resolver(v, ruta, &dir, info.name) < 0) info.name[0] = 0;
 
                 responder(quien, FS_OK, &info, sizeof(info));
             }
             break;
 
         case FS_READ: {
-            if (buscar(r->name, &cluster, &tam, &flags) < 0 ||
+            if (buscar(v, ruta, &cluster, &tam, &flags) < 0 ||
                 (flags & FS_ES_DIR)) {
                 responder(quien, FS_ERROR, "", 0);
                 break;
             }
             uint8_t trozo[FS_CHUNK];
-            int n = leer_fichero(cluster, tam, (uint32_t)r->arg,
+            int n = leer_fichero(v, cluster, tam, (uint32_t)r->arg,
                                  trozo, FS_CHUNK);
             if (n <= 0) responder(quien, FS_EOF, "", 0);
             else        responder(quien, FS_OK, trozo, (uint64_t)n);
@@ -1007,24 +1298,49 @@ int main(int argc, char **argv)
         case FS_LIST: {
             uint32_t dir;
             struct fs_info info;
-            if (resolver_dir(r->name, &dir) < 0)
+
+            if (resolver_dir(v, ruta, &dir) < 0) {
                 responder(quien, FS_ERROR, "", 0);
-            else if (listar(dir, (uint32_t)r->arg, &info) < 0)
-                responder(quien, FS_EOF, "", 0);
-            else
+                break;
+            }
+
+            if (listar(v, dir, (uint32_t)r->arg, &info) == 0) {
                 responder(quien, FS_OK, &info, sizeof(info));
+                break;
+            }
+
+            /* Se acabaron las entradas de verdad. Quedan los PUNTOS DE
+             * MONTAJE que cuelgan de este directorio, que no estan en el
+             * disco de nadie: son de la tabla de montajes.
+             *
+             * Es la primera vez que este servidor ensenya algo que no ha
+             * leido de un sector. En Unix el punto de montaje tiene que
+             * existir como directorio en el volumen de abajo y queda
+             * tapado; aqui no hay tal directorio, asi que se anyade. Mas
+             * simple, y se ve mejor lo que es un montaje: un trozo de
+             * nombre que lleva a otro sitio. */
+            uint32_t vistas = cuantas_entradas(v, dir);
+            uint32_t i = (uint32_t)r->arg - vistas;
+
+            /* La ruta ENTERA, no la recortada. 'ruta' ya viene sin el
+             * punto de montaje, asi que listar /boot preguntaria por los
+             * montajes que cuelgan de "/" y se encontraria a si mismo. */
+            if (montaje_bajo(r->name, i, &info) == 0)
+                responder(quien, FS_OK, &info, sizeof(info));
+            else
+                responder(quien, FS_EOF, "", 0);
             break;
         }
 
         case FS_MKDIR:
-            responder(quien, dir_nuevo(r->name) < 0 ? FS_ERROR : FS_OK,
+            responder(quien, dir_nuevo(v, ruta) < 0 ? FS_ERROR : FS_OK,
                       "", 0);
             break;
 
         case FS_WRITE: {
             uint32_t n = (uint32_t)pet.len;
             if (n > FS_CHUNK) n = FS_CHUNK;
-            if (fichero_escribir(r->name, (uint32_t)r->arg,
+            if (fichero_escribir(v, ruta, (uint32_t)r->arg,
                                  (const uint8_t *)r->data, n) < 0)
                 responder(quien, FS_ERROR, "", 0);
             else
@@ -1033,12 +1349,12 @@ int main(int argc, char **argv)
         }
 
         case FS_CREATE:
-            responder(quien, fichero_crear(r->name) < 0 ? FS_ERROR : FS_OK,
+            responder(quien, fichero_crear(v, ruta) < 0 ? FS_ERROR : FS_OK,
                       "", 0);
             break;
 
         case FS_DELETE:
-            responder(quien, fichero_borrar(r->name) < 0 ? FS_ERROR : FS_OK,
+            responder(quien, fichero_borrar(v, ruta) < 0 ? FS_ERROR : FS_OK,
                       "", 0);
             break;
 

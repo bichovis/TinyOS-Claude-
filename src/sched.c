@@ -1284,30 +1284,71 @@ static void build_args(uint64_t ustack_pa, const char *args,
     char    *k    = (char *)phys_to_virt(ustack_pa);   /* la pagina, en kernel */
     uint64_t base = USER_STACK_TOP - PAGE_SIZE;        /* la misma, en usuario */
 
-    /* 1. La cadena, arriba del todo. */
+    /* 1. Sitio arriba del todo para las palabras ya partidas.
+     *
+     * Nunca ocupan mas que la cadena original: quitar comillas resta, y
+     * cada separador se convierte en un cero, uno por uno. El +1 es el
+     * cero de la ultima palabra, que en la original podia no tener
+     * separador detras. */
     uint64_t len = 0;
     if (args) while (args[len] && len < ARGS_BYTES - 1) len++;
 
     uint64_t o_str = PAGE_SIZE - (len + 1);
-    for (uint64_t i = 0; i < len; i++) k[o_str + i] = args[i];
-    k[o_str + len] = 0;
 
-    /* 2. Partirla por los espacios, ahi mismo. Cada palabra queda como una
-     *    cadena independiente porque el separador pasa a ser un cero. */
+    /* 2. Partirla, ahi mismo. Cada palabra queda como una cadena
+     *    independiente porque el separador pasa a ser un cero.
+     *
+     * LAS COMILLAS SE TRATAN AQUI, Y ESO ES RARO. En un Unix de verdad el
+     * que parte la linea es el SHELL, que le pasa al kernel un array de
+     * cadenas ya hecho; el kernel no sabe lo que es una comilla ni falta
+     * que le hace. Aqui el convenio es otro -exec recibe UNA cadena- asi
+     * que el que parte es el kernel, y por tanto el que tiene que entender
+     * las comillas es el kernel.
+     *
+     * No es lo ideal: mete politica de interfaz de usuario en un sitio
+     * donde no pinta nada. Pero la alternativa es cambiar el convenio de
+     * exec y spawn para pasar un array, y eso es otro paso.
+     *
+     * SE LEE DE 'args' Y SE ESCRIBE EN LA PILA: dos buffers distintos, y
+     * eso no es un detalle de estilo.
+     *
+     * La primera version copiaba la cadena a la pila y la compactaba ahi
+     * mismo, sobre si misma. Parecia seguro porque el que escribe nunca
+     * adelanta al que lee... salvo en un sitio: al cerrar una palabra se
+     * escribe un cero, y en la primera palabra ese cero cae EXACTAMENTE
+     * encima del espacio que se iba a leer a continuacion. A partir de
+     * ahi todo se descuadra en uno. El sintoma fue un argv[1] vacio, que
+     * no se parece en nada a la causa. */
     uint64_t off[MAX_ARGS];
     uint64_t argc = 0;
-    int      dentro = 0;
 
-    for (uint64_t i = 0; i <= len; i++) {
-        char c = k[o_str + i];
-        if (c == ' ' || c == 0) {
-            k[o_str + i] = 0;
-            dentro = 0;
-        } else if (!dentro) {
-            dentro = 1;
-            if (argc < MAX_ARGS) off[argc++] = o_str + i;
+    uint64_t lee = 0, escribe = 0;
+
+    while (lee < len) {
+        while (lee < len && args[lee] == ' ') lee++;        /* espacios */
+        if (lee >= len) break;
+
+        if (argc < MAX_ARGS) off[argc++] = o_str + escribe;
+
+        char comilla = 0;
+        while (lee < len) {
+            char c = args[lee];
+
+            if (comilla) {
+                if (c == comilla) { comilla = 0; lee++; continue; }
+            } else {
+                if (c == ' ') break;
+                if (c == '"' || c == '\'') { comilla = c; lee++; continue; }
+            }
+
+            k[o_str + escribe++] = c;
+            lee++;
         }
+
+        k[o_str + escribe++] = 0;        /* cerrar esta palabra */
     }
+
+    while (escribe <= len) k[o_str + escribe++] = 0;
 
     /* 3. El array de punteros, debajo, y alineado a 16 porque el ABI de
      *    AArch64 exige que la pila lo este. */
