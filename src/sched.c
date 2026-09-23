@@ -1275,83 +1275,40 @@ static int load_elf(uint64_t *pgd, const uint8_t *img, uint64_t size,
  * Se escribe por el mapa lineal del kernel, no por la direccion de
  * usuario: esa pagina todavia no esta en ningun TTBR0 activo.
  */
-#define MAX_ARGS   8
-#define ARGS_BYTES 128
 
-static void build_args(uint64_t ustack_pa, const char *args,
+static void build_args(uint64_t ustack_pa, const struct args *a,
                        uint64_t *argc_out, uint64_t *argv_out, uint64_t *sp_out)
 {
     char    *k    = (char *)phys_to_virt(ustack_pa);   /* la pagina, en kernel */
     uint64_t base = USER_STACK_TOP - PAGE_SIZE;        /* la misma, en usuario */
 
-    /* 1. Sitio arriba del todo para las palabras ya partidas.
+    /* Aqui ya no se parte nada: los argumentos vienen troceados. Esta
+     * funcion solo los COPIA a la pila del proceso nuevo y monta el array
+     * de punteros. Lo que antes eran treinta lineas de comillas y estados
+     * son ahora dos bucles.
      *
-     * Nunca ocupan mas que la cadena original: quitar comillas resta, y
-     * cada separador se convierte en un cero, uno por uno. El +1 es el
-     * cero de la ultima palabra, que en la original podia no tener
-     * separador detras. */
-    uint64_t len = 0;
-    if (args) while (args[len] && len < ARGS_BYTES - 1) len++;
-
-    uint64_t o_str = PAGE_SIZE - (len + 1);
-
-    /* 2. Partirla, ahi mismo. Cada palabra queda como una cadena
-     *    independiente porque el separador pasa a ser un cero.
-     *
-     * LAS COMILLAS SE TRATAN AQUI, Y ESO ES RARO. En un Unix de verdad el
-     * que parte la linea es el SHELL, que le pasa al kernel un array de
-     * cadenas ya hecho; el kernel no sabe lo que es una comilla ni falta
-     * que le hace. Aqui el convenio es otro -exec recibe UNA cadena- asi
-     * que el que parte es el kernel, y por tanto el que tiene que entender
-     * las comillas es el kernel.
-     *
-     * No es lo ideal: mete politica de interfaz de usuario en un sitio
-     * donde no pinta nada. Pero la alternativa es cambiar el convenio de
-     * exec y spawn para pasar un array, y eso es otro paso.
-     *
-     * SE LEE DE 'args' Y SE ESCRIBE EN LA PILA: dos buffers distintos, y
-     * eso no es un detalle de estilo.
-     *
-     * La primera version copiaba la cadena a la pila y la compactaba ahi
-     * mismo, sobre si misma. Parecia seguro porque el que escribe nunca
-     * adelanta al que lee... salvo en un sitio: al cerrar una palabra se
-     * escribe un cero, y en la primera palabra ese cero cae EXACTAMENTE
-     * encima del espacio que se iba a leer a continuacion. A partir de
-     * ahi todo se descuadra en uno. El sintoma fue un argv[1] vacio, que
-     * no se parece en nada a la causa. */
-    uint64_t off[MAX_ARGS];
-    uint64_t argc = 0;
-
-    uint64_t lee = 0, escribe = 0;
-
-    while (lee < len) {
-        while (lee < len && args[lee] == ' ') lee++;        /* espacios */
-        if (lee >= len) break;
-
-        if (argc < MAX_ARGS) off[argc++] = o_str + escribe;
-
-        char comilla = 0;
-        while (lee < len) {
-            char c = args[lee];
-
-            if (comilla) {
-                if (c == comilla) { comilla = 0; lee++; continue; }
-            } else {
-                if (c == ' ') break;
-                if (c == '"' || c == '\'') { comilla = c; lee++; continue; }
-            }
-
-            k[o_str + escribe++] = c;
-            lee++;
-        }
-
-        k[o_str + escribe++] = 0;        /* cerrar esta palabra */
+     * Quien trocea es el shell, que es su trabajo. El kernel no tiene por
+     * que saber lo que es una comilla. */
+    uint64_t total = 0;
+    for (int i = 0; i < a->n; i++) {
+        const char *s = a->buf + a->off[i];
+        while (*s++) total++;
+        total++;                              /* el cero de cada uno */
     }
 
-    while (escribe <= len) k[o_str + escribe++] = 0;
+    uint64_t o_str = PAGE_SIZE - total;
+    uint64_t off[MAX_ARGS];
+    uint64_t escribe = 0;
 
-    /* 3. El array de punteros, debajo, y alineado a 16 porque el ABI de
-     *    AArch64 exige que la pila lo este. */
+    for (int i = 0; i < a->n; i++) {
+        off[i] = o_str + escribe;
+        const char *s = a->buf + a->off[i];
+        do { k[o_str + escribe++] = *s; } while (*s++);
+    }
+
+    /* El array de punteros, debajo, y alineado a 16 porque el ABI de
+     * AArch64 exige que la pila lo este. */
+    uint64_t argc   = (uint64_t)a->n;
     uint64_t o_argv = (o_str - (argc + 1) * 8) & ~15UL;
     uint64_t *argv  = (uint64_t *)(k + o_argv);
 
@@ -1364,20 +1321,54 @@ static void build_args(uint64_t ustack_pa, const char *args,
     *sp_out   = base + o_argv;
 }
 
+/* Comodidad para el menu del kernel, que arranca programas con
+ * argumentos literales: "cat HOLA.TXT" y cosas asi. */
+int task_create_user_str(const char *name, const uint8_t *image, uint64_t size,
+                         uint64_t mmio_pa, const char *cadena)
+{
+    struct args a;
+    args_de_cadena(&a, cadena);
+    return task_create_user(name, image, size, mmio_pa, &a);
+}
+
+/* Partir una cadena por espacios. Sin comillas: esto es para los caminos
+ * internos del kernel -el menu- donde los argumentos son literales que
+ * escribimos nosotros. */
+void args_de_cadena(struct args *a, const char *s)
+{
+    a->n = 0;
+    uint64_t escribe = 0;
+
+    if (!s) return;
+
+    while (*s && a->n < MAX_ARGS) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+
+        a->off[a->n++] = (uint16_t)escribe;
+        while (*s && *s != ' ' && escribe < ARGS_BYTES - 1)
+            a->buf[escribe++] = *s++;
+        while (*s && *s != ' ') s++;          /* por si no cabia */
+        a->buf[escribe++] = 0;
+    }
+}
+
 /* Como se llama un proceso que arranca otro proceso.
  *
  * El nombre no puede ser un puntero a la memoria del que llama: ese espacio
  * de direcciones puede desaparecer antes que la tarea. Se copia la primera
  * palabra de sus argumentos, que es justo como se llama a si mismo. */
-static void nombre_de_args(struct task *t, const char *args)
+/* El nombre del proceso sale de argv[0], como en cualquier Unix. Ya no
+ * hay que buscar el primer espacio: viene troceado. */
+static void nombre_de_args(struct task *t, const struct args *a)
 {
     uint64_t o = 0;
-    if (args) {
-        while (*args == ' ') args++;
-        while (*args && *args != ' ' && o < sizeof(t->namebuf) - 1)
-            t->namebuf[o++] = *args++;
+
+    if (a && a->n > 0) {
+        const char *s = a->buf + a->off[0];
+        while (*s && o < sizeof(t->namebuf) - 1) t->namebuf[o++] = *s++;
     }
-    if (!o) { t->namebuf[o++] = '?'; }
+    if (!o) t->namebuf[o++] = '?';
     t->namebuf[o] = 0;
     t->name = t->namebuf;
 }
@@ -1404,7 +1395,7 @@ static void nombre_de_args(struct task *t, const char *args)
  * "f->x[0] = ret" al terminar, que es exactamente donde el programa nuevo
  * espera encontrar su argc.
  */
-int task_exec(const uint8_t *image, uint64_t size, const char *args,
+int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
               struct trap_frame *f)
 {
     struct task *t = current;
@@ -1635,7 +1626,7 @@ fail:
 }
 
 int task_create_user(const char *name, const uint8_t *image, uint64_t size,
-                     uint64_t mmio_pa, const char *args)
+                     uint64_t mmio_pa, const struct args *args)
 {
     /* Coger una ranura y soltar el cerrojo enseguida.
      *

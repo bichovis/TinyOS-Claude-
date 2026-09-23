@@ -51,14 +51,14 @@ struct message {
 #define SYS_send          8    /* (puerto, struct message *) -> 0 | -1     */
 #define SYS_recv          9    /* (puerto, struct message *) -> 0 | -1     */
 #define SYS_mmio_base    10    /* () -> VA del MMIO concedido, 0 si ninguno*/
-#define SYS_spawn        11    /* (buffer, bytes, args) -> pid | -1        */
+#define SYS_spawn        11    /* (buffer, bytes, argv[]) -> pid | -1      */
 #define SYS_clock_rate   12    /* (id) -> Hz de un reloj de la placa        */
 #define SYS_read         13    /* (fd, buffer, bytes) -> leidos | 0 | -1    */
 #define SYS_waitpid      14    /* (pid) -> 0 cuando ese proceso termina     */
 #define SYS_sbrk         15    /* (delta) -> tope viejo del monton          */
 #define SYS_fork         16    /* () -> pid del hijo en el padre, 0 en el hijo */
 #define SYS_freepages    17    /* () -> paginas de 4 KB libres en el sistema */
-#define SYS_exec         18    /* (buffer, bytes, args) -> no vuelve         */
+#define SYS_exec         18    /* (buffer, bytes, argv[]) -> no vuelve       */
 #define SYS_kill         19    /* (pid, senyal) -> 0 | -1                    */
 #define SYS_signal       20    /* (senyal, manejador, trampolin) -> 0 | -1   */
 #define SYS_sigreturn    21    /* lo llama el trampolin, no el programa      */

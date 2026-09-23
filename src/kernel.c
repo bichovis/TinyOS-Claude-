@@ -631,14 +631,14 @@ static void command(char c)
     case 's': {
         uart_puts("\n  [kernel] arrancando el driver de consola en EL0,\n");
         uart_puts("           con la pagina de la PL011 mapeada en su espacio\n");
-        int pid = task_create_user("conserver", user_conserver,
+        int pid = task_create_user_str("conserver", user_conserver,
                                    user_conserver_size, UART0_PHYS, "conserver");
         if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'n': {
-        int pid = task_create_user("client", user_client, user_client_size, 0, "client");
+        int pid = task_create_user_str("client", user_client, user_client_size, 0, "client");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         else {
             uart_puts("\n  [kernel] cliente creado, pid ");
@@ -656,7 +656,7 @@ static void command(char c)
         uart_puts("\n  [kernel] cargando ");
         uart_dec(user_hello_size);
         uart_puts(" bytes en un espacio de direcciones nuevo...\n");
-        int pid = task_create_user("hello", user_hello, user_hello_size, 0,
+        int pid = task_create_user_str("hello", user_hello, user_hello_size, 0,
                                    "hello uno dos");
         if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
         else {
@@ -690,7 +690,7 @@ static void command(char c)
             uart_puts("\n  [kernel] ya hay un interprete\n");
             break;
         }
-        int pid = task_create_user("sh", user_sh, user_sh_size, 0, "sh");
+        int pid = task_create_user_str("sh", user_sh, user_sh_size, 0, "sh");
         if (pid < 0) {
             uart_puts("\n  [kernel] no he podido crearlo\n");
         } else {
@@ -707,25 +707,25 @@ static void command(char c)
         sd_route_pins();
         uart_puts("  [kernel] arrancando el servidor de ficheros en EL0,\n");
         uart_puts("           con la pagina del EMMC mapeada en su espacio\n");
-        int pid = task_create_user("fs", user_fs, user_fs_size, EMMC_PHYS, "fs");
+        int pid = task_create_user_str("fs", user_fs, user_fs_size, EMMC_PHYS, "fs");
         if (pid < 0) uart_puts("  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'o': {
-        int pid = task_create_user("ls", user_ls, user_ls_size, 0, "ls");
+        int pid = task_create_user_str("ls", user_ls, user_ls_size, 0, "ls");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'a': {
-        int pid = task_create_user("cat", user_cat, user_cat_size, 0, "cat HOLA.TXT");
+        int pid = task_create_user_str("cat", user_cat, user_cat_size, 0, "cat HOLA.TXT");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }
 
     case 'e': {
-        int pid = task_create_user("run", user_run, user_run_size, 0, "run HELLO.ELF");
+        int pid = task_create_user_str("run", user_run, user_run_size, 0, "run HELLO.ELF");
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }

@@ -90,6 +90,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 33   | mmap: el kernel pide y un proceso contesta  | hecho  |
 | 34   | exec por mmap: comprobar pasa a ser traer   | hecho  |
 | 35   | Dos particiones, /boot, /usr/bin y comillas | hecho  |
+| 36   | exec con argv[]: cada uno a lo suyo         | hecho  |
 
 ## Estructura
 
@@ -2259,6 +2260,88 @@ Se pregunta por el **dispositivo**, que es lo unico que se sabe con
 certeza, y se comprueba la respuesta antes de usarla. Un nombre de volumen
 es una etiqueta que cualquiera puede repetir; el numero de disco no.
 
+## exec con argv[], o devolver cada cosa a su sitio
+
+El paso anterior dejo una costura fea y a la vista. `exec` recibia UNA
+cadena y la partia el kernel, asi que el kernel tenia que entender
+comillas -politica de interfaz de usuario en un sitio donde no pinta
+nada- y la misma regla acababa escrita en cuatro sitios: el kernel, y el
+shell tres veces (el nombre del programa, el destino de `<` y el de `>`).
+
+Ahora `exec` y `spawn` reciben un **array de punteros terminado en cero**,
+igual que el que recibe `main`. La diferencia es exactamente la que hay
+entre *"aqui tienes una linea, apanyate"* y *"aqui tienes los
+argumentos"*.
+
+**Lo que adelgaza en el kernel.** `build_args` era treinta lineas de
+comillas y estados; ahora son dos bucles que copian. Y lo que el kernel
+gana no es brevedad, es **no saber**: `grep comilla src/` ya solo encuentra
+comentarios.
+
+**Lo que aparece en el kernel.** Traerse un `argv[]` son dos niveles de
+indireccion en memoria ajena: el array de punteros, y detras de cada
+puntero una cadena. Cada uno hay que comprobarlo por separado, porque el
+array puede salirse de lo mapeado a mitad y cada cadena tambien. Por eso
+`copiar_args` mira pagina a pagina mientras copia, en vez de fiarse de un
+tamanyo que el proceso no ha dicho.
+
+**Y lo que desaparece en `run`.** Tenia una funcion que juntaba
+`argv[1..]` en una cadena separada por espacios... para que el kernel la
+volviera a separar. Ahora es esto:
+
+```c
+    int64_t pid = spawn(imagen, total, argv + 1);
+```
+
+El propio `argv` ya viene terminado en cero, asi que saltarse el nombre de
+`run` deja exactamente los argumentos del hijo. Cuando un cambio hace
+DESAPARECER codigo en vez de moverlo, suele ser senyal de que el problema
+estaba mal planteado.
+
+## Un troceador, y solo uno
+
+Devolver el troceo al shell no bastaba: alli seguia habiendo tres trozos
+de codigo que tenian que saber lo que es una comilla, y tres reglas
+iguales escritas aparte son tres reglas que pueden discrepar.
+
+La cura fue que el troceador emita `<` y `>` **como fichas sueltas**,
+aunque vayan pegadas a una palabra:
+
+```
+    cat hola.txt>pegado.txt   ->   [cat] [hola.txt] [>] [pegado.txt]
+```
+
+Con eso, la redireccion se resuelve mirando el **array** en vez de
+cortando la cadena: se busca la ficha, se coge la siguiente como nombre, y
+las dos salen de `argv`. El programa no llega a ver ni el `>` ni el
+fichero, que es lo correcto.
+
+De cuatro sitios que sabian de comillas se pasa a uno. Y salen gratis dos
+cosas que antes no funcionaban: la redireccion pegada sin espacios, y un
+error decente cuando falta el nombre.
+
+```
+    / $ cat hola.txt >
+      falta el fichero despues de >
+```
+
+**Una estructura por orden, con su texto dentro.** Cada orden preparada
+lleva su propio almacen:
+
+```c
+    struct orden {
+        char *argv[MAX_ARGV + 1];
+        char  texto[MAX_LINEA];
+        char  ent[FS_PATH_MAX], sal[FS_PATH_MAX];
+        int   hay;
+    };
+```
+
+No es por comodidad: una tuberia son **dos ordenes vivas a la vez**, y con
+un buffer compartido la segunda pisaria a la primera. Es el mismo error de
+aliasing de ayer -escribir donde se lee- visto desde otro angulo, y esta
+vez evitado por construccion en vez de por cuidado.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -2309,8 +2392,8 @@ es una etiqueta que cualquiera puede repetir; el numero de disco no.
 - El anillo de entrada de la consola son 64 bytes y lo que no cabe se
   pierde. Ahora al menos lo dice; un terminal de verdad tendria control de
   flujo (XON/XOFF o RTS/CTS) y no perderia nada.
-- Los ficheros mapeados son de solo lectura y no hay `munmap`: se sueltan
-  al morir el proceso o al hacer `exec`. Un proceso puede tener cuatro.
+- Los ficheros mapeados son de solo lectura: no hay nada que devuelva los
+  cambios al disco. Un proceso puede tener cuatro a la vez.
 - Llenar una pagina mapeada son 24 mensajes al servidor (176 bytes cada
   uno). Funciona, y es lento.
 - El kernel trae las paginas mapeadas ANTES de leerlas (`user_touch_r`), no
@@ -2325,10 +2408,11 @@ es una etiqueta que cualquiera puede repetir; el numero de disco no.
 - De los nombres largos solo se entiende el ASCII. Lo de fuera sale como
   '?', a proposito: un byte truncado al azar daria un nombre que parece
   bueno y no abre nada.
-- Las comillas las entiende `build_args`, en el KERNEL, porque `exec`
-  recibe una cadena y no un array. La regla acaba repetida en cuatro
-  sitios. Lo limpio seria cambiar el convenio de `exec`.
-- No hay escapes (`\ `), ni comillas dentro de comillas, ni variables.
+- No hay escapes (`\ `), ni comillas dentro de comillas, ni variables de
+  entorno. El `PATH` sigue escrito en el codigo del shell porque no hay
+  entorno que heredar en el `fork`.
+- Un programa puede recibir 16 argumentos y 256 bytes de texto entre
+  todos.
 - No hay diario ni nada que se le parezca: un corte de corriente a mitad de
   una escritura deja el volumen inconsistente, como en 1980.
 - Los ficheros nuevos no llevan fecha. FAT tiene campos para ella, pero la
@@ -2336,11 +2420,9 @@ es una etiqueta que cualquiera puede repetir; el numero de disco no.
   honesto que una fecha inventada.
 - La linea de ordenes son 128 caracteres, asi que `write` no puede crear
   ficheros de mas de un centenar de bytes. Para mover volumen esta `cp`.
-- El reloj base del EMMC esta puesto a mano (41.666 MHz, el de la placa).
-  Lo suyo seria preguntarselo a la GPU por el buzon, pero el buzon es del
-  kernel y el driver vive en EL0.
-- Un mensaje lleva 48 bytes, asi que cargar un programa de 4 KB son 86
-  idas y venidas por el IPC. Funciona y se nota.
+- Un mensaje lleva 256 bytes, de los que 176 son datos utiles, asi que
+  cargar un programa de 12 KB son unas 70 idas y venidas por el IPC.
+  Funciona y se nota.
 - El monton busca el primer hueco que valga, recorriendo la lista: es O(n)
   y basta a esta escala. Lo siguiente serian listas por tamanyos.
 - El monton del kernel nunca le devuelve paginas al PMM. Crece y no encoge.

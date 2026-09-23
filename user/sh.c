@@ -229,75 +229,8 @@ static char *limpiar(char *s)
  * Los nombres los pone el que llama en buffers suyos, y no en 'nombre',
  * que lo usa cargar() para el ejecutable: en "cat < a > b" hay tres
  * ficheros en juego a la vez. */
-/* Copiar UNA palabra, quitandole las comillas. Devuelve donde se quedo,
- * para poder seguir leyendo detras.
- *
- * Las comillas se tratan en tres sitios de este shell -el nombre del
- * programa, y los destinos de < y >- mas un cuarto en el kernel, que es
- * quien parte los argumentos. Cuatro sitios para la misma regla es uno de
- * esos olores que acaban en un fallo: el dia que alguien anyada un quinto
- * sitio y se olvide, saldra un "no existe" sobre un fichero que si esta.
- * La cura de verdad seria que exec recibiera un array ya partido, y eso
- * es otro paso. */
-static const char *una_palabra(char *dst, const char *s, uint64_t max)
-{
-    uint64_t o = 0;
-    char comilla = 0;
 
-    while (*s == ' ') s++;
 
-    while (*s) {
-        if (comilla) {
-            if (*s == comilla) { comilla = 0; s++; continue; }
-        } else {
-            if (*s == ' ') break;
-            if (*s == '"' || *s == '\'') { comilla = *s++; continue; }
-        }
-        if (o < max - 1) dst[o++] = *s;
-        s++;
-    }
-
-    dst[o] = 0;
-    return s;
-}
-
-static void mayusculas(char *dst, const char *s, uint64_t max)
-{
-    una_palabra(dst, s, max);
-    for (uint64_t i = 0; dst[i]; i++)
-        if (dst[i] >= 'a' && dst[i] <= 'z') dst[i] = (char)(dst[i] - 32);
-}
-
-/* Devuelve: bit 0 si hay "<", bit 1 si hay ">".
- *
- * El final de la cadena se mide ANTES de tocarla. Despues del primer corte
- * hay un cero en medio, y buscar el segundo signo mirando "hasta el cero"
- * no encontraria nada: en "cat < a > b" el ">" queda detras. */
-static int redirecciones(char *orden, char *ent, char *sal)
-{
-    int hay = 0;
-    ent[0] = sal[0] = 0;
-
-    uint64_t fin = strlen(orden);
-    char comilla = 0;
-
-    for (uint64_t i = 0; i < fin; i++) {
-        /* Un < o un > DENTRO de comillas es parte del nombre, no una
-         * redireccion. Sin esto, "cat > mayor>que.txt" cortaria dos
-         * veces y el segundo trozo seria el nombre. */
-        if (comilla) { if (orden[i] == comilla) comilla = 0; continue; }
-        if (orden[i] == '"' || orden[i] == '\'') { comilla = orden[i]; continue; }
-
-        if (orden[i] != '<' && orden[i] != '>') continue;
-
-        char cual = orden[i];
-        orden[i] = 0;                    /* la orden termina aqui */
-
-        if (cual == '<') { mayusculas(ent, orden + i + 1, FS_PATH_MAX); hay |= 1; }
-        else             { mayusculas(sal, orden + i + 1, FS_PATH_MAX); hay |= 2; }
-    }
-    return hay;
-}
 
 /* Aplicar la redireccion. Se llama YA EN EL HIJO, despues del fork y antes
  * del exec: si se hiciera en el padre, el shell se quedaria con el 0 o el
@@ -323,15 +256,124 @@ static int aplicar(int hay, const char *ent, const char *sal)
     return 0;
 }
 
-static int fichero_de(const char *orden)
-{
-    char palabra[FS_PATH_MAX];
-    una_palabra(palabra, orden, sizeof(palabra));
+/* Trocear una orden en argumentos, quitando las comillas.
+ *
+ * Esto es lo que antes hacia el KERNEL, y estaba mal puesto: partir una
+ * linea escrita por una persona es trabajo del interprete, no del sistema
+ * operativo. Desde que exec recibe un array, cada uno hace lo suyo.
+ *
+ * Se escribe en un buffer APARTE y no sobre la propia linea. Compactar
+ * sobre uno mismo parece seguro -el que escribe nunca adelanta al que
+ * lee- hasta que te das cuenta de que el cero que cierra una palabra cae
+ * justo encima del espacio que ibas a leer. Costo un argv[1] vacio.
+ *
+ * Deja argv terminado en 0, como manda el convenio, y devuelve cuantos
+ * hay. */
+#define MAX_ARGV  16
 
-    if (!palabra[0]) return 0;
-    nombre_de(palabra);
-    return 1;
+/* Copiar una cadena con tope, que hace falta en varios sitios. */
+static void ucopiar(char *dst, const char *src, uint64_t max)
+{
+    uint64_t i = 0;
+    while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
 }
+
+/* Una orden ya preparada: sus argumentos, y a donde van su entrada y su
+ * salida. Todo en la misma estructura porque todo sale del mismo troceo.
+ *
+ * Tiene su propio almacen de texto, y eso hace falta: una tuberia son dos
+ * ordenes vivas a la vez, y con un buffer compartido la segunda pisaria a
+ * la primera. */
+struct orden {
+    char *argv[MAX_ARGV + 1];
+    char  texto[MAX_LINEA];
+    char  ent[FS_PATH_MAX];        /* fichero para "<", vacio si no hay */
+    char  sal[FS_PATH_MAX];        /* fichero para ">"                  */
+    int   hay;                     /* bit 0 = hay "<", bit 1 = hay ">"  */
+};
+
+/* Trocear, con dos reglas: las comillas agrupan, y "<" y ">" son fichas
+ * SUELTAS aunque vayan pegadas a una palabra.
+ *
+ * Esa segunda regla es la que permite que la redireccion se resuelva
+ * mirando el array en vez de cortando la cadena. Antes habia tres trozos
+ * de codigo distintos que tenian que saber lo que es una comilla -este,
+ * el que buscaba el < o el >, y el que copiaba el nombre de detras- y los
+ * tres podian discrepar. Ahora la regla esta una vez.
+ *
+ * Se escribe en un buffer APARTE y no sobre la propia linea. Compactar
+ * sobre uno mismo parece seguro -el que escribe nunca adelanta al que
+ * lee- hasta que te das cuenta de que el cero que cierra una palabra cae
+ * justo encima del espacio que ibas a leer. Costo un argv[1] vacio. */
+static int trocear(const char *s, char **argv, char *texto, uint64_t max)
+{
+    uint64_t escribe = 0;
+    int n = 0;
+
+    while (*s && n < MAX_ARGV) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+
+        argv[n++] = texto + escribe;
+
+        if (*s == '<' || *s == '>') {          /* ficha de un solo signo */
+            if (escribe + 2 < max) { texto[escribe++] = *s; texto[escribe++] = 0; }
+            s++;
+            continue;
+        }
+
+        char comilla = 0;
+        while (*s) {
+            if (comilla) {
+                if (*s == comilla) { comilla = 0; s++; continue; }
+            } else {
+                if (*s == ' ' || *s == '<' || *s == '>') break;
+                if (*s == '"' || *s == '\'') { comilla = *s++; continue; }
+            }
+            if (escribe < max - 1) texto[escribe++] = *s;
+            s++;
+        }
+        if (escribe < max) texto[escribe++] = 0;
+    }
+
+    argv[n] = 0;
+    return n;
+}
+
+/* Sacar del array las fichas de redireccion y lo que venga detras.
+ *
+ * El programa no llega a ver ni el ">" ni el nombre, y eso es lo
+ * correcto: la redireccion es un acuerdo entre el shell y el kernel sobre
+ * que hay detras del 0 y del 1, no asunto del programa. */
+static int preparar(struct orden *o, const char *linea)
+{
+    int n = trocear(linea, o->argv, o->texto, sizeof(o->texto));
+
+    o->hay = 0;
+    o->ent[0] = o->sal[0] = 0;
+
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        char *t = o->argv[i];
+
+        if ((t[0] == '<' || t[0] == '>') && t[1] == 0) {
+            char *destino = (t[0] == '<') ? o->ent : o->sal;
+
+            if (i + 1 >= n) {
+                printf("  falta el fichero despues de %s\n", t);
+                return 0;
+            }
+            ucopiar(destino, o->argv[++i], FS_PATH_MAX);
+            o->hay |= (t[0] == '<') ? 1 : 2;
+            continue;
+        }
+        o->argv[w++] = t;
+    }
+    o->argv[w] = 0;
+    return w;
+}
+
 
 static void quejarse(const char *que)
 {
@@ -372,13 +414,12 @@ static int interna(char *orden, const char *der)
 
 static void una(char *orden)
 {
-    /* Primero se recorta la redireccion: lo que quede es la orden de
-     * verdad, y es eso lo que se busca en la tarjeta y lo que recibe el
-     * programa como argumentos. */
-    char ent[FS_PATH_MAX], sal[FS_PATH_MAX];
-    int  hay = redirecciones(orden, ent, sal);
+    /* Un solo troceo, del que sale todo: los argumentos, el nombre del
+     * programa y a donde van la entrada y la salida. */
+    static struct orden o;
+    if (preparar(&o, orden) < 1) return;
 
-    if (!fichero_de(orden)) return;
+    nombre_de(o.argv[0]);
 
     unsigned char *img;
     char ruta[FS_PATH_MAX];
@@ -389,8 +430,8 @@ static void una(char *orden)
 
     int64_t pid = fork();
     if (pid == 0) {
-        if (aplicar(hay, ent, sal) < 0) exit(1);
-        exec(img, bytes, orden);
+        if (aplicar(o.hay, o.ent, o.sal) < 0) exit(1);
+        exec(img, bytes, o.argv);
         printf("  no he podido convertirme en el programa\n");
         exit(1);
     }
@@ -419,15 +460,16 @@ static void una(char *orden)
  */
 static void tuberia(char *izq, char *der)
 {
-    char ent1[FS_PATH_MAX], sal1[FS_PATH_MAX];
-    char ent2[FS_PATH_MAX], sal2[FS_PATH_MAX];
-    int  hay1 = redirecciones(izq, ent1, sal1);
-    int  hay2 = redirecciones(der, ent2, sal2);
+    /* Dos ordenes preparadas a la vez, cada una con su propio almacen de
+     * texto. De ahi que 'struct orden' lo lleve dentro y no comparta
+     * buffer con nadie. */
+    static struct orden o1, o2;
+    if (preparar(&o1, izq) < 1) return;
+    if (preparar(&o2, der) < 1) return;
 
-    if (!fichero_de(izq)) return;
-
-    char nombre_izq[32];
-    memcpy(nombre_izq, nombre, strlen(nombre) + 1);
+    char nombre_izq[FS_PATH_MAX];
+    nombre_de(o1.argv[0]);
+    ucopiar(nombre_izq, nombre, sizeof(nombre_izq));
 
     unsigned char *img1;
     char ruta1[FS_PATH_MAX];
@@ -436,7 +478,7 @@ static void tuberia(char *izq, char *der)
     uint64_t b1 = cargar(ruta1, &img1);
     if (!b1) { quejarse(ruta1); return; }
 
-    if (!fichero_de(der)) { munmap((const char *)img1); return; }
+    nombre_de(o2.argv[0]);
 
     unsigned char *img2;
     char ruta2[FS_PATH_MAX];
@@ -461,8 +503,8 @@ static void tuberia(char *izq, char *der)
          * "a > f | b", la salida de a acaba en el fichero y b no ve nada.
          * Es lo que hace cualquier shell, y sale solo de respetar el
          * orden en que se escribieron las dos cosas. */
-        if (aplicar(hay1, ent1, sal1) < 0) exit(1);
-        exec(img1, b1, izq);
+        if (aplicar(o1.hay, o1.ent, o1.sal) < 0) exit(1);
+        exec(img1, b1, o1.argv);
         exit(1);
     }
 
@@ -471,8 +513,8 @@ static void tuberia(char *izq, char *der)
         dup2(fds[0], 0);                 /* mi entrada es la tuberia */
         closefd(fds[0]);
         closefd(fds[1]);
-        if (aplicar(hay2, ent2, sal2) < 0) exit(1);
-        exec(img2, b2, der);
+        if (aplicar(o2.hay, o2.ent, o2.sal) < 0) exit(1);
+        exec(img2, b2, o2.argv);
         exit(1);
     }
 

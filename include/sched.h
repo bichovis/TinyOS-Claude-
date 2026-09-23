@@ -11,6 +11,35 @@ struct trap_frame;
 
 #define MAX_TASKS     24
 #define MAX_MAPEOS     4      /* ficheros mapeados a la vez por proceso */
+
+#define MAX_ARGS      16      /* argumentos de un programa           */
+#define ARGS_BYTES   256      /* y bytes de texto entre todos        */
+
+/* Los argumentos de un programa, ya troceados.
+ *
+ * Hasta el paso 36 exec recibia UNA cadena y la partia el kernel. Eso
+ * obligaba al kernel a entender comillas, que es politica de interfaz de
+ * usuario en un sitio donde no pinta nada, y hacia que la misma regla
+ * acabara escrita en cuatro sitios.
+ *
+ * Ahora el que trocea es el shell, que es su trabajo, y el kernel solo
+ * COPIA lo que le den. La diferencia es exactamente la que hay entre
+ * "aqui tienes una linea, apanyate" y "aqui tienes los argumentos". */
+struct args {
+    int      n;                      /* cuantos hay */
+    uint16_t off[MAX_ARGS];          /* donde empieza cada uno en buf */
+    char     buf[ARGS_BYTES];        /* las cadenas, con sus ceros    */
+};
+
+/* Construir unos argumentos a partir de una cadena suelta, partiendo por
+ * espacios. Lo usan los caminos internos del kernel -el menu- donde los
+ * argumentos son literales y no hay comillas que valgan. */
+void args_de_cadena(struct args *a, const char *s);
+
+/* La version comoda para el menu del kernel: parte la cadena por espacios
+ * y arranca el programa. */
+int  task_create_user_str(const char *name, const uint8_t *image, uint64_t size,
+                          uint64_t mmio_pa, const char *cadena);
 #define TASK_QUANTUM  5       /* ticks seguidos que puede correr un hilo    */
 #define STACK_MAGIC   0x5441534B5F4F4B21UL   /* "TASK_OK!" al fondo de la pila */
 
@@ -156,7 +185,7 @@ void     schedule_locked(void);
 void     sched_unlock_new_task(void);
 int  task_create(const char *name, void (*fn)(void *), void *arg);
 int  task_create_user(const char *name, const uint8_t *image, uint64_t size,
-                      uint64_t mmio_pa, const char *args);
+                      uint64_t mmio_pa, const struct args *args);
 void schedule(void);
 void scheduler_tick(void);       /* lo llama el timer                       */
 void task_yield(void);           /* ceder la CPU voluntariamente            */
@@ -166,7 +195,7 @@ void task_exit_con(int64_t codigo);   /* y apunta lo que devolvio */
 int  task_wait(uint64_t pid, int64_t *codigo);  /* espera y recoge su salida */
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
-int  task_exec(const uint8_t *image, uint64_t size, const char *args,
+int  task_exec(const uint8_t *image, uint64_t size, const struct args *args,
                struct trap_frame *f);   /* y lo sustituye por otro programa  */
 
 /* Un fallo de traduccion en EL0 puede no ser un error: si cae justo debajo

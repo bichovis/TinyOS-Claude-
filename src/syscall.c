@@ -49,6 +49,46 @@ static int user_readable(uint64_t va, uint64_t len) { return user_range_ok(va, l
  * llenarse, y devuelve -1 si no habia nada legible: un puntero invalido
  * tiene que ser un error, no una ruta vacia que luego signifique el
  * raiz. */
+/* Traerse el argv[] de un proceso: un array de punteros terminado en
+ * cero, y detras de cada puntero una cadena.
+ *
+ * Son DOS niveles de indireccion en memoria ajena, y cada uno hay que
+ * comprobarlo por separado: el array puede salirse de lo mapeado a mitad,
+ * y cada cadena tambien. Por eso se mira pagina a pagina mientras se
+ * copia, en vez de fiarse de un tamanyo que el proceso no ha dicho.
+ *
+ * Devuelve -1 si algo no cuadra; 0 con a->n = 0 si no hay argumentos. */
+static int copiar_args(struct args *a, uint64_t uargv)
+{
+    a->n = 0;
+    if (!uargv) return 0;
+
+    uint64_t escribe = 0;
+
+    for (int i = 0; i < MAX_ARGS; i++) {
+        uint64_t pos = uargv + (uint64_t)i * 8;
+        if (!user_readable(pos, 8)) return -1;
+
+        uint64_t p = *(const uint64_t *)pos;
+        if (!p) break;                        /* el cero final */
+
+        a->off[a->n] = (uint16_t)escribe;
+
+        for (;;) {
+            if (escribe >= ARGS_BYTES - 1) return -1;   /* no cabe */
+            if ((p & (PAGE_SIZE - 1)) == 0 || escribe == a->off[a->n])
+                if (!user_readable(p, 1)) return -1;
+
+            char c = *(const char *)p;
+            a->buf[escribe++] = c;
+            if (!c) break;
+            p++;
+        }
+        a->n++;
+    }
+    return 0;
+}
+
 static int copiar_ruta(char *dst, uint64_t uva)
 {
     if (!user_readable(uva, 1)) return -1;
@@ -176,22 +216,10 @@ void syscall_dispatch(struct trap_frame *f)
         if (len == 0 || len > 256 * 1024) { ret = -1; break; }
         if (!user_readable(buf, len))     { ret = -1; break; }
 
-        /* La linea de argumentos se copia a una variable nuestra antes de
-         * usarla. Comprobar pagina a pagina mientras se copia, porque una
-         * cadena puede acabarse en cualquier sitio y el proceso podria
-         * habernos dado un puntero que se sale a mitad. */
-        char args[128];
-        uint64_t i = 0;
-        for (; i < sizeof(args) - 1; i++) {
-            if (i == 0 || ((uargs + i) & (PAGE_SIZE - 1)) == 0)
-                if (!uargs || !user_readable(uargs + i, 1)) break;
-            char c = ((const char *)uargs)[i];
-            if (!c) break;
-            args[i] = c;
-        }
-        args[i] = 0;
+        struct args args;
+        if (copiar_args(&args, uargs) < 0) { ret = -1; break; }
 
-        ret = task_create_user(0, (const uint8_t *)buf, len, 0, args);
+        ret = task_create_user(0, (const uint8_t *)buf, len, 0, &args);
         break;
     }
 
@@ -253,18 +281,13 @@ void syscall_dispatch(struct trap_frame *f)
         if (len == 0 || len > 1024 * 1024) { ret = -1; break; }
         if (!user_readable(buf, len))      { ret = -1; break; }
 
-        char args[128];
-        uint64_t i = 0;
-        for (; i < sizeof(args) - 1; i++) {
-            if (i == 0 || ((uargs + i) & (PAGE_SIZE - 1)) == 0)
-                if (!uargs || !user_readable(uargs + i, 1)) break;
-            char c = ((const char *)uargs)[i];
-            if (!c) break;
-            args[i] = c;
-        }
-        args[i] = 0;
+        /* Los argumentos se copian ANTES de tocar nada del proceso, que
+         * es lo unico que hace segura esta llamada: exec destruye el
+         * espacio de direcciones de donde salen. */
+        struct args args;
+        if (copiar_args(&args, uargs) < 0) { ret = -1; break; }
 
-        ret = task_exec((const uint8_t *)buf, len, args, f);
+        ret = task_exec((const uint8_t *)buf, len, &args, f);
         break;
     }
 

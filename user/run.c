@@ -22,18 +22,6 @@
 /* Rehacer la linea de argumentos para el hijo: todo lo que venga despues
  * de "run". Asi "run HELLO.ELF uno dos" arranca HELLO.ELF viendose a si
  * mismo como argv[0] y con "uno dos" detras. */
-static char args_hijo[128];
-
-static void juntar_args(int argc, char **argv)
-{
-    uint64_t o = 0;
-    for (int i = 1; i < argc; i++) {
-        if (o && o < sizeof(args_hijo) - 1) args_hijo[o++] = ' ';
-        for (const char *s = argv[i]; *s && o < sizeof(args_hijo) - 1; s++)
-            args_hijo[o++] = *s;
-    }
-    args_hijo[o] = 0;
-}
 
 int main(int argc, char **argv)
 {
@@ -44,8 +32,6 @@ int main(int argc, char **argv)
     char ruta[FS_PATH_MAX];
     if (realpath(argv[1], ruta) < 0) { printf("  [run] ruta imposible\n"); exit(1); }
     const char *programa = ruta;
-    juntar_args(argc, argv);
-
     /* Esto eran treinta lineas de pedirle trozos al servidor y meterlos en
      * un array de 32 KB. Ahora es una llamada, y el array ha desaparecido:
      * ni se reserva ni se llena. El kernel traera las paginas que necesite
@@ -59,7 +45,11 @@ int main(int argc, char **argv)
 
     printf("\n  [run] %s mapeado, %lu bytes\n", programa, total);
 
-    int64_t pid = spawn(imagen, total, args_hijo);
+    /* argv + 1 y ya esta: nuestro propio argv ya viene terminado en cero,
+     * asi que saltarse el nombre de "run" deja exactamente los argumentos
+     * del hijo. Aqui habia una funcion que los juntaba todos en una
+     * cadena con espacios para que el kernel los volviera a separar. */
+    int64_t pid = spawn(imagen, total, argv + 1);
     if (pid < 0) printf("  [run] el kernel no lo ha querido\n");
     else         printf("  [run] arrancado como pid %lu\n", (uint64_t)pid);
 

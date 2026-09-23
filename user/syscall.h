@@ -66,9 +66,13 @@ int signal(int sig, void (*manejador)(int));
 static inline int64_t kill(uint64_t pid, int sig)
 { return syscall2(SYS_kill, pid, (uint64_t)sig); }
 
-/* Convertirse en otro programa. Si sale bien no vuelve; si vuelve, fallo. */
-static inline int64_t exec(const void *imagen, uint64_t bytes, const char *args)
-{ return syscall3(SYS_exec, (uint64_t)imagen, bytes, (uint64_t)args); }
+/* Convertirse en otro programa. Si sale bien no vuelve; si vuelve, fallo.
+ *
+ * argv es un array de punteros terminado en cero, como el que recibe
+ * main(). El kernel lo COPIA; no lo parte. Quien trocea la linea es el
+ * shell, que es su trabajo. */
+static inline int64_t exec(const void *imagen, uint64_t bytes, char *const argv[])
+{ return syscall3(SYS_exec, (uint64_t)imagen, bytes, (uint64_t)argv); }
 
 /* Duplicarse. Devuelve el pid del hijo al padre, y 0 al hijo. */
 static inline int64_t fork(void)          { return syscall2(SYS_fork, 0, 0); }
@@ -148,6 +152,6 @@ static inline int64_t console_int(void)   { return syscall2(SYS_console_int, 0, 
 static inline uint64_t clock_rate(uint64_t id)
 { int64_t r = syscall2(SYS_clock_rate, id, 0); return r < 0 ? 0 : (uint64_t)r; }
 
-static inline int64_t spawn(const void *imagen, uint64_t bytes, const char *args)
-{ return syscall3(SYS_spawn, (uint64_t)imagen, bytes, (uint64_t)args); }
+static inline int64_t spawn(const void *imagen, uint64_t bytes, char *const argv[])
+{ return syscall3(SYS_spawn, (uint64_t)imagen, bytes, (uint64_t)argv); }
 
