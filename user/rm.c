@@ -37,15 +37,19 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    if (m.type != FS_OK) {
-        printf("\n  ");
-        printf("%s", argv[1]);
-        printf(": no esta en la tarjeta\n");
+    /* "no esta en la tarjeta" era verdad a medias cuando le dabas un
+     * directorio: el fichero SI esta, lo que pasa es que no es un
+     * fichero. Y mandaba a buscar donde no era. */
+    if (m.type == FS_ES_DIRECTORIO) {
+        printf("\n  %s es un directorio: usa rmdir\n", argv[1]);
         exit(1);
     }
 
-    printf("\n  borrado ");
-    printf("%s", argv[1]);
-    printf("\n");
-    exit(0);
+    if (m.type != FS_OK) {
+        printf("\n  %s: no esta en la tarjeta\n", argv[1]);
+        exit(1);
+    }
+
+    printf("\n  borrado %s\n", argv[1]);
+    return 0;
 }

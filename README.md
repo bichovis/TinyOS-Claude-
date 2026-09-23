@@ -92,6 +92,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 35   | Dos particiones, /boot, /usr/bin y comillas | hecho  |
 | 36   | exec con argv[]: cada uno a lo suyo         | hecho  |
 | 37   | Las senyales guardan la coma flotante       | hecho  |
+| 38   | rmdir y mv, o deshacer lo que se hizo       | hecho  |
 
 ## Estructura
 
@@ -121,6 +122,8 @@ Tres cosas que QEMU perdona y el silicio no:
                  wc.c        cuenta lo que le pasa por delante
                  mkdir.c     crea un directorio
                  map.c       mapea un fichero y mide cuando se lee
+                 rmdir.c     borra un directorio vacio
+                 mv.c        mueve y renombra: la misma operacion
                  fp.c        coma flotante: cuentas y supervivencia
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
@@ -2417,6 +2420,125 @@ Es la tercera vez en este proyecto que hace falta este paso -romper el
 codigo a proposito para ver si la prueba se entera- y las tres veces ha
 cambiado lo que sabiamos.
 
+## rmdir y mv, o deshacer lo que se hizo
+
+El sistema sabia crear directorios y no borrarlos. Una asimetria fea, y de
+las que se notan: un sistema de ficheros que solo va hacia adelante no
+esta terminado.
+
+**Lo primero fue comprobar si ademas corrompia.** Estaba apuntado que `rm`
+sobre un directorio "no lo comprueba y puede dejar una entrada sin sus
+datos". Resulto ser falso: `dir_lookup` solo busca ficheros, asi que el
+directorio no aparecia y `rm` decia *"no esta en la tarjeta"*. No
+destruia; **mentia**. Y mandaba a buscar donde no era, que es el mismo
+pecado de siempre: un error que junta causas distintas.
+
+```
+    / $ rm docs
+      docs es un directorio: usa rmdir
+```
+
+**Que quiere decir "vacio" en FAT.** No "sin entradas": un directorio
+recien hecho ya trae `.` y `..`, que las pone quien lo crea. Vacio es "sin
+nada MAS que esas dos".
+
+Y las ocultas **si** cuentan. macOS deja un `._loquesea` al lado de cada
+fichero; al listar se descartan, pero ocupan sitio de verdad, y borrar el
+directorio se los llevaria por delante sin avisar. Mejor negarse.
+
+**El orden al borrar.** Primero la entrada, despues la cadena de clusters.
+Al reves, un corte de corriente a mitad dejaria una entrada apuntando a
+clusters que ya estan en el monton de libres, y eso no pierde un
+directorio: pierde **lo que venga luego**, cuando alguien reutilice esos
+clusters creyendo que son suyos.
+
+## mv: los datos no se mueven
+
+Mover y renombrar son la misma operacion, y ninguna de las dos toca los
+datos. Se escribe la entrada de directorio en otro sitio y se quita la de
+antes; los clusters se quedan donde estaban.
+
+De ahi salen dos cosas que sorprenden hasta que se ve por que:
+
+- renombrar un fichero de un giga cuesta **lo mismo** que uno de cero
+  bytes;
+- y mover entre particiones **no se puede**, porque ahi ya no vale cambiar
+  un nombre de sitio: hay que copiar los bytes. Eso lo hacen `cp` y `rm`,
+  y cuesta lo que pesa.
+
+**El detalle bonito: el `..` hay que ir a corregirlo.** En FAT no existe un
+indice de padres en ninguna parte. Cada directorio lleva escrito dentro,
+en su entrada `..`, quien es el suyo. Asi que mover un directorio no es
+mover su entrada: es mover su entrada **y entrar dentro** a decirle quien
+es su padre ahora.
+
+```c
+    if (es_dir && dir_o != dir_d && cluster) {
+        ...buscar ".." dentro del propio directorio y reescribir su cluster...
+    }
+```
+
+Y por lo mismo hay que impedir meter un directorio dentro de si mismo: el
+arbol dejaria de ser un arbol, y cualquiera que lo recorriera no pararia
+nunca. Se comprueba subiendo desde el destino por los `..` a ver si
+aparece el origen.
+
+**El orden al renombrar, otra vez.** La entrada nueva primero y la vieja
+despues. Si se corta la luz en medio queda el mismo fichero con dos
+nombres: feo, y lo arregla un `fsck`. Al reves se habria perdido. Entre
+dos formas de romperse se elige siempre la que deja los datos
+alcanzables.
+
+**Y una comodidad que NO va en el servidor.** `mv fichero directorio`
+quiere decir "metelo dentro", que es lo que espera cualquiera. Eso se
+resuelve en `mv.c`, preguntando primero si el destino es un directorio y
+componiendo la ruta. Abajo solo hay *"renombra esto asi"*. Es la frontera
+de siempre: el servidor da el mecanismo, la orden pone la costumbre.
+
+## Que lo diga otro: fsck_msdos
+
+Comprobar que TinyOS lee lo que TinyOS escribe no vale para nada,
+especialmente aqui: el `cd ..` de este sistema es **textual**, lo resuelve
+el kernel sobre la cadena, y funcionaria igual aunque el `..` del disco
+estuviera mal.
+
+Asi que lo dice otro:
+
+```
+    $ fsck_msdos -n /dev/rdisk5s2
+    ** Phase 1 - Preparing FAT
+    ** Phase 2 - Checking Directories        <- aqui se validan los ".."
+    ** Phase 3 - Checking for Orphan Clusters
+```
+
+Limpio despues de crear directorios, moverlos de sitio, borrarlos y sacar
+ficheros de dentro. Y de paso encontro algo que no habriamos visto:
+
+```
+    Warning: Free space in FSInfo block (115117) not correct (115116)
+```
+
+FAT32 guarda en un sector aparte -el **FSInfo**- cuantos clusters quedan
+libres y por donde seguir buscando. Son un **atajo**, no la verdad: la
+verdad esta en la FAT. Nosotros no llevamos esa cuenta, asi que en cuanto
+tocamos la tabla el numero de ahi deja de valer.
+
+Dejarlo como estaba seria peor que no tenerlo: **un numero que parece
+bueno y no lo es**. El estandar preve exactamente este caso y permite
+ponerlo a `0xFFFFFFFF`, que quiere decir "no lo se, cuentalo tu". Eso se
+hace ahora, una vez, la primera vez que se escribe algo. Y fsck lo nota:
+
+```
+    Warning: Free space in FSInfo block is unset (should be 115116)
+```
+
+De "esta mal" a "no esta". Es peor informacion y es mejor dato.
+
+**Cuatro errores donde habia uno.** `FS_ES_DIRECTORIO`, `FS_NO_VACIO` y
+`FS_EXISTE` se suman a `FS_ERROR`. No es burocracia: "no existe", "es un
+directorio", "no esta vacio" y "ya existe" mandan a sitios distintos, y
+juntarlos obliga a quien pregunta a adivinar.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -2457,8 +2579,12 @@ cambiado lo que sabiamos.
 - Un punto de montaje se inventa al listar su padre, asi que no se puede
   borrar ni entrar en el con `cd ..` desde dentro esperando encontrar una
   entrada de verdad.
-- No hay `rmdir`, ni `mv`, ni borrado recursivo. Y `rm` sobre un
-  directorio no lo comprueba: se puede dejar una entrada sin sus datos.
+- No hay borrado en cascada (`rm -r`), a proposito: es facil de escribir y
+  dificil de deshacer.
+- `mv` no cruza particiones, porque ahi dejaria de ser un renombrado. Hay
+  que copiar con `cp` y borrar.
+- No se lleva la cuenta de clusters libres del FSInfo de FAT32: se marca
+  como desconocida y que la recalcule quien la quiera.
 - La ruta son 64 bytes y cada componente 8.3, o sea unos cinco niveles.
 - El anillo de entrada de la consola son 64 bytes y lo que no cabe se
   pierde. Ahora al menos lo dice; un terminal de verdad tendria control de

@@ -52,6 +52,8 @@ struct volumen {
     uint32_t sec_por_fat;
     uint32_t max_cluster;        /* el numero mas alto que existe aqui    */
     uint32_t eoc;                /* "fin de cadena" segun el tipo de FAT  */
+    uint32_t fsinfo_lba;         /* FAT32: el sector con las cuentas      */
+    int      fsinfo_olvidado;    /* ...ya puesto a "no lo se"             */
 };
 
 /* Donde cuelga cada volumen. El orden importa al buscar: se prueba el
@@ -156,6 +158,10 @@ static int montar_particion(struct volumen *v, uint32_t lba)
         v->root_cluster = le32(bpb + 44);
         if (v->root_cluster < 2) return -1;
         v->eoc = 0x0FFFFFF8;
+
+        uint32_t fsi = le16(bpb + 48);
+        v->fsinfo_lba      = fsi ? lba + fsi : 0;
+        v->fsinfo_olvidado = 0;
     } else {
         if (!v->root_entries) return -1;           /* FAT16 si lo tiene */
         v->root_cluster = 0;
@@ -400,9 +406,36 @@ static int escribir(uint32_t lba, const uint8_t *src)
  * volumen: perder los datos de un fichero es perder un fichero, perder la
  * FAT es perderlos todos. Escribir solo en la primera "funciona" hasta que
  * alguien repare el disco con la segunda. */
+/* FAT32 guarda en un sector aparte -el FSInfo- cuantos clusters quedan
+ * libres y por donde seguir buscando. Son un ATAJO, no la verdad: la
+ * verdad esta en la FAT, y el estandar dice que se pueden poner a
+ * 0xFFFFFFFF para decir "no lo se, cuentalo tu".
+ *
+ * Nosotros no llevamos esa cuenta, asi que en cuanto tocamos la FAT el
+ * numero de ahi deja de valer. Dejarlo como estaba seria peor que no
+ * tenerlo: un numero que parece bueno y no lo es. Asi que se invalida, una
+ * vez, la primera vez que se escribe algo.
+ *
+ * Lo encontro fsck_msdos, no nosotros:
+ *     Warning: Free space in FSInfo block (115117) not correct (115116)
+ */
+static void fsinfo_olvidar(struct volumen *v)
+{
+    if (!v->fat32 || !v->fsinfo_lba || v->fsinfo_olvidado) return;
+
+    uint8_t *b = cached(v->fsinfo_lba);
+    if (!b) return;
+    if (le32(b) != 0x41615252) return;          /* no es un FSInfo */
+
+    for (int i = 488; i < 496; i++) b[i] = 0xFF;   /* libres y "siguiente" */
+    if (escribir(v->fsinfo_lba, b) == 0) v->fsinfo_olvidado = 1;
+}
+
 static int fat_set(struct volumen *v, uint32_t c, uint32_t valor)
 {
     if (c < 2 || c > v->max_cluster) return -1;
+
+    fsinfo_olvidar(v);
 
     uint32_t ancho = v->fat32 ? 4 : 2;
     uint32_t off   = c * ancho;
@@ -812,6 +845,147 @@ static int fichero_crear(struct volumen *v, const char *nombre)
         return dir_update(dlba, doff, 0, 0);
     }
     return dir_create(v, nombre, &dlba, &doff);
+}
+
+/* ¿Esta vacio este directorio?
+ *
+ * "Vacio" en FAT no quiere decir "sin entradas": un directorio recien
+ * hecho ya trae "." y "..", que las pone quien lo crea. Asi que vacio es
+ * "sin nada MAS que esas dos".
+ *
+ * Las ocultas SI cuentan. macOS deja un "._loquesea" al lado de cada
+ * fichero y al listar se descartan, pero ocupan sitio de verdad: borrar
+ * el directorio se los llevaria por delante sin avisar. Mejor negarse. */
+static int dir_vacio(struct volumen *v, uint32_t cluster)
+{
+    for (uint32_t s = 0; ; s++) {
+        uint32_t lba;
+        if (dir_sector(v, cluster, s, &lba) < 0) return 1;   /* se acabo */
+
+        uint8_t *b = cached(lba);
+        if (!b) return 0;
+
+        for (int e = 0; e < 512; e += 32) {
+            uint8_t *d = b + e;
+            if (d[0] == 0x00) return 1;           /* fin del directorio */
+            if (d[0] == 0xE5) continue;           /* borrada */
+            if ((d[11] & 0x0F) == 0x0F) continue; /* trozo de nombre largo */
+            if (d[0] == '.') continue;            /* "." y ".." */
+            return 0;                             /* algo hay */
+        }
+    }
+}
+
+/* Marcar una entrada como borrada. Es poner un 0xE5 en la primera letra
+ * del nombre: el resto se queda ahi, y por eso se pueden recuperar
+ * ficheros borrados. Nadie ha tocado ni los datos ni la cadena. */
+static int entrada_borrar(uint32_t lba, uint32_t off)
+{
+    uint8_t *b = cached(lba);
+    if (!b) return -1;
+    b[off] = 0xE5;
+    return escribir(lba, b);
+}
+
+/* Borrar un directorio vacio. */
+static int dir_borrar(struct volumen *v, const char *ruta, int *motivo)
+{
+    uint32_t dir;
+    char ultimo[FS_NAME_MAX];
+    if (resolver(v, ruta, &dir, ultimo) < 0) { *motivo = FS_ERROR; return -1; }
+
+    uint32_t lba, off;
+    if (dir_lookup_en(v, dir, ultimo, 1, &lba, &off) < 0) { *motivo = FS_ERROR; return -1; }
+
+    uint32_t cluster, tam;
+    dir_read(lba, off, &cluster, &tam);
+
+    if (!dir_vacio(v, cluster)) { *motivo = FS_NO_VACIO; return -1; }
+
+    /* La entrada PRIMERO y la cadena despues. Al reves, un corte a mitad
+     * dejaria una entrada apuntando a clusters que ya son de otro, que es
+     * la peor de las dos formas de romperse: no se pierde un directorio,
+     * se pierde lo que venga luego. */
+    if (entrada_borrar(lba, off) < 0) { *motivo = FS_ERROR; return -1; }
+    if (cluster) free_chain(v, cluster);
+    return 0;
+}
+
+/* Mover o renombrar. Las dos cosas son la misma: escribir la entrada en
+ * otro sitio y quitar la de antes. Los DATOS no se tocan; lo que cambia
+ * es quien los nombra.
+ *
+ * De ahi que renombrar un fichero de un giga cueste lo mismo que uno de
+ * cero bytes, y que mover "a otra carpeta" sea instantaneo mientras no se
+ * cambie de volumen. Cuando se cambia de volumen ya no es un rename: es
+ * copiar y borrar, y eso si cuesta lo que pesa. */
+static int mover(struct volumen *v, const char *origen, const char *destino,
+                 int *motivo)
+{
+    *motivo = FS_ERROR;
+
+    uint32_t dir_o, dir_d;
+    char nom_o[FS_NAME_MAX], nom_d[FS_NAME_MAX];
+
+    if (resolver(v, origen,  &dir_o, nom_o) < 0) return -1;
+    if (resolver(v, destino, &dir_d, nom_d) < 0) return -1;
+
+    uint32_t lba_o, off_o;
+    if (dir_lookup_en(v, dir_o, nom_o, -1, &lba_o, &off_o) < 0) return -1;
+
+    /* Lo que hay que llevarse: donde empiezan los datos, cuanto miden, y
+     * si es un directorio. */
+    uint8_t *b = cached(lba_o);
+    if (!b) return -1;
+
+    uint32_t cluster = le16(b + off_o + 26);
+    uint32_t tam     = le32(b + off_o + 28);
+    uint8_t  attr    = b[off_o + 11];
+    int      es_dir  = (attr & 0x10) ? 1 : 0;
+
+    /* El destino tiene que estar libre. Machacarlo en silencio seria
+     * perder un fichero por escribir mal una orden. */
+    uint32_t lba_d, off_d;
+    if (dir_lookup_en(v, dir_d, nom_d, -1, &lba_d, &off_d) == 0) {
+        *motivo = FS_EXISTE;
+        return -1;
+    }
+
+    /* Un directorio no se puede meter dentro de si mismo: quedaria un
+     * bucle en el arbol, y cualquiera que lo recorriera no pararia. Se
+     * comprueba subiendo desde el destino a ver si aparece el origen. */
+    if (es_dir && cluster) {
+        uint32_t subir = dir_d;
+        for (int i = 0; i < 16 && subir; i++) {
+            if (subir == cluster) return -1;      /* se mete en si mismo */
+            uint32_t l, o;
+            if (dir_lookup_en(v, subir, "..", -1, &l, &o) < 0) break;
+            subir = entrada_cluster(l, o);
+        }
+    }
+
+    /* La entrada nueva PRIMERO y la vieja despues. Si se corta la luz en
+     * medio queda el mismo fichero con dos nombres, que es feo pero se
+     * arregla; al reves, se habria perdido. Entre dos formas de romperse
+     * se elige la que deja los datos alcanzables. */
+    if (dir_create_en(v, dir_d, nom_d, attr, &lba_d, &off_d) < 0) return -1;
+    if (dir_update(lba_d, off_d, cluster, tam) < 0) return -1;
+
+    /* Si es un directorio y ha cambiado de padre, su ".." apuntaba al
+     * antiguo. En FAT no hay indice de padres en ningun sitio: cada hijo
+     * lleva escrito quien es el suyo, y por eso hay que ir a corregirlo. */
+    if (es_dir && dir_o != dir_d && cluster) {
+        uint32_t l, o;
+        if (dir_lookup_en(v, cluster, "..", -1, &l, &o) == 0) {
+            uint8_t *p = cached(l);
+            if (!p) return -1;
+            p[o + 26] = (uint8_t)(dir_d & 0xFF);
+            p[o + 27] = (uint8_t)(dir_d >> 8);
+            if (escribir(l, p) < 0) return -1;
+        }
+    }
+
+    return entrada_borrar(lba_o, off_o);
 }
 
 static int fichero_borrar(struct volumen *v, const char *nombre)
@@ -1337,6 +1511,31 @@ int main(int argc, char **argv)
                       "", 0);
             break;
 
+        case FS_RMDIR: {
+            int motivo = FS_ERROR;
+            responder(quien, dir_borrar(v, ruta, &motivo) < 0 ? motivo : FS_OK,
+                      "", 0);
+            break;
+        }
+
+        /* El destino viaja en data[], porque en name[] solo cabe uno. */
+        case FS_RENAME: {
+            int motivo = FS_ERROR;
+            r->data[FS_CHUNK - 1] = 0;
+
+            /* Las dos rutas tienen que caer en el MISMO volumen. Mover
+             * entre particiones no es renombrar: hay que copiar los
+             * bytes, y eso lo hace "cp" y luego "rm". */
+            const char *dest = r->data;
+            struct volumen *vd = volumen_de(dest, &dest);
+
+            if (vd != v) responder(quien, FS_ERROR, "", 0);
+            else responder(quien,
+                           mover(v, ruta, dest, &motivo) < 0 ? motivo : FS_OK,
+                           "", 0);
+            break;
+        }
+
         case FS_WRITE: {
             uint32_t n = (uint32_t)pet.len;
             if (n > FS_CHUNK) n = FS_CHUNK;
@@ -1353,10 +1552,24 @@ int main(int argc, char **argv)
                       "", 0);
             break;
 
-        case FS_DELETE:
+        case FS_DELETE: {
+            /* Antes, "rm docs" decia "no existe", porque dir_lookup solo
+             * mira ficheros y el directorio no aparecia. Era verdad a
+             * medias y mandaba al sitio equivocado: el fichero SI esta,
+             * lo que pasa es que no es un fichero. */
+            uint32_t l, o;
+            uint32_t d; char u[FS_NAME_MAX];
+
+            if (resolver(v, ruta, &d, u) == 0 &&
+                dir_lookup_en(v, d, u, 1, &l, &o) == 0) {
+                responder(quien, FS_ES_DIRECTORIO, "", 0);
+                break;
+            }
+
             responder(quien, fichero_borrar(v, ruta) < 0 ? FS_ERROR : FS_OK,
                       "", 0);
             break;
+        }
 
         default:
             responder(quien, FS_ERROR, "", 0);

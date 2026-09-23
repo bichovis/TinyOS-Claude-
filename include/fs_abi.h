@@ -28,11 +28,20 @@
 #define FS_CREATE      5     /* name -> lo crea, o lo vacia si ya estaba   */
 #define FS_DELETE      6     /* name -> lo borra                           */
 #define FS_MKDIR       7     /* name -> crea un directorio                 */
+#define FS_RMDIR       8     /* name -> lo borra, si esta vacio            */
+#define FS_RENAME      9     /* name + data=destino -> lo mueve            */
 
 /* --- Respuestas (message.type) ---------------------------------------- */
 #define FS_OK        100
 #define FS_ERROR     101     /* no existe, o la tarjeta fallo              */
 #define FS_EOF       102     /* no queda nada que leer ahi                 */
+#define FS_ES_DIRECTORIO 103 /* pedias un fichero y es un directorio       */
+#define FS_NO_VACIO  104     /* rmdir sobre un directorio con cosas dentro */
+#define FS_EXISTE    105     /* el destino de un rename ya esta cogido     */
+
+/* Cuatro errores donde antes habia uno. No es burocracia: "no existe",
+ * "es un directorio", "no esta vacio" y "ya existe" mandan a sitios
+ * distintos, y juntarlos en FS_ERROR obliga a quien pregunta a adivinar. */
 
 /* Lo que va en message.data de una peticion. Ocupa los 256 bytes justos.
  *
