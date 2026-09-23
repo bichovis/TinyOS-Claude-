@@ -228,6 +228,48 @@ static int fs_transaccion(uint64_t tipo, const char *nombre, uint64_t off,
     return ok;
 }
 
+/* Leer un trozo de fichero a memoria del KERNEL.
+ *
+ * Es lo mismo que hace fichero_read, pero sin usuario de por medio: el
+ * destino es una pagina fisica recien pedida, vista por el mapa lineal. La
+ * necesita el fallo de pagina de un fichero mapeado, que tiene que
+ * rellenar la pagina ANTES de que el proceso pueda verla.
+ *
+ * Devuelve los bytes leidos, que pueden ser menos de los pedidos si el
+ * fichero se acaba. */
+int64_t fs_leer_en(const char *ruta, uint64_t off, char *dst, uint64_t n)
+{
+    uint64_t hechos = 0;
+
+    while (hechos < n) {
+        struct message resp;
+        if (fs_transaccion(FS_READ, ruta, off + hechos, 0, 0, &resp) < 0)
+            return hechos ? (int64_t)hechos : -1;
+
+        if (resp.type == FS_EOF) break;          /* se acabo el fichero */
+        if (resp.type != FS_OK)  return hechos ? (int64_t)hechos : -1;
+
+        uint64_t hay = resp.len;
+        if (hay == 0) break;
+        if (hay > n - hechos) hay = n - hechos;
+
+        for (uint64_t i = 0; i < hay; i++) dst[hechos + i] = resp.data[i];
+        hechos += hay;
+    }
+
+    return (int64_t)hechos;
+}
+
+int64_t fs_tamano(const char *ruta)
+{
+    struct message resp;
+    if (fs_transaccion(FS_SIZE, ruta, 0, 0, 0, &resp) < 0) return -1;
+    if (resp.type != FS_OK) return -1;
+
+    struct fs_info *i = (struct fs_info *)resp.data;
+    return (i->flags & FS_ES_DIR) ? -1 : (int64_t)i->size;
+}
+
 int fs_es_directorio(const char *ruta)
 {
     struct message resp;

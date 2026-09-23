@@ -115,6 +115,14 @@
 #define MM_USER_DATA (PTE_VALID | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL) \
                       | PTE_AP_RW_ALL | PTE_PXN | PTE_UXN | PTE_nG)
 
+/* Un fichero mapeado: se lee, no se escribe y no se ejecuta.
+ *
+ * De solo lectura porque no hay nada que escriba los cambios de vuelta al
+ * disco. Permitir escribir daria un mapeo que parece funcionar y pierde
+ * todo lo escrito al morir el proceso, que es peor que no dejar. */
+#define MM_USER_RO   (PTE_VALID | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL) \
+                      | PTE_AP_RO_ALL | PTE_PXN | PTE_UXN | PTE_nG)
+
 /* Mapa de un proceso de usuario. Vive abajo del todo porque TTBR0 es suyo
  * entero: el kernel ya no le ocupa ni una entrada. Empezamos en 4 MB y no
  * en 0 para que un puntero nulo (y sus vecinos) fallen en vez de acertar.
@@ -135,6 +143,11 @@
 #define USER_MMIO_BASE   0x10000000UL      /* MMIO concedido a un driver   */
 #define USER_STACK_TOP   0x20000000UL      /* pila (crece hacia abajo)     */
 #define USER_STACK_MIN   0x1FF00000UL      /* ...hasta aqui: 1 MB de pila  */
+/* Ficheros mapeados. Encima de la pila, que crece hacia abajo, asi que
+ * entre las dos zonas queda un hueco de 256 MB que nadie puede alcanzar
+ * por accidente. */
+#define USER_MMAP_BASE   0x30000000UL      /* aqui empiezan los ficheros   */
+#define USER_MMAP_MAX    0x38000000UL      /* ...y aqui se acaban: 128 MB  */
 #define USER_LIMIT       0x40000000UL      /* nada de usuario por encima   */
 
 /* --- Gestor de memoria fisica (pmm.c) --------------------------------- */

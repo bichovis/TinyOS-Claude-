@@ -10,6 +10,7 @@ struct waitqueue;
 struct trap_frame;
 
 #define MAX_TASKS     24
+#define MAX_MAPEOS     4      /* ficheros mapeados a la vez por proceso */
 #define TASK_QUANTUM  5       /* ticks seguidos que puede correr un hilo    */
 #define STACK_MAGIC   0x5441534B5F4F4B21UL   /* "TASK_OK!" al fondo de la pila */
 
@@ -70,6 +71,18 @@ struct task {
     void       *fp_state;
     int         fp_activo;
     int         fp_pedida;   /* la llego a pedir alguna vez; para las cuentas */
+
+    /* --- Ficheros mapeados ---
+     *
+     * Una direccion, un tamanyo y una ruta. Lo que NO hay aqui es memoria:
+     * en el momento de mapear no se lee ni un byte y no se reserva ni una
+     * pagina. Solo se apunta que si alguien toca ese tramo, el fallo de
+     * pagina sabra a quien preguntar. */
+    struct mapeo {
+        uint64_t base;                  /* 0 = ranura libre               */
+        uint64_t len;                   /* bytes del fichero              */
+        char     ruta[FS_PATH_MAX];
+    } mapeos[MAX_MAPEOS];
 
     /* --- El directorio actual ---
      *
@@ -167,6 +180,10 @@ int  user_touch_w(uint64_t va);
 
 /* --- Descriptores ----------------------------------------------------- */
 uint64_t task_creados(void);                  /* hilos que han existido     */
+
+/* Mapear un fichero. Devuelve la direccion o -1; el tamanyo va en *tam. */
+int64_t task_mmap(const char *ruta, uint64_t *tam);
+int     task_mmap_fault(uint64_t direccion);  /* 1 si lo ha resuelto        */
 struct fichero *task_fd(int fd);              /* el de este proceso, o 0    */
 int  task_fd_alloc(struct fichero *f);        /* el primer hueco libre      */
 int  task_fd_close(int fd);

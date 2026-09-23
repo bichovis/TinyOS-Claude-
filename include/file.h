@@ -57,6 +57,11 @@ void    file_close(struct fichero *f);
  * textual: no mira el disco. Ver src/path.c. */
 int path_resolve(const char *base, const char *rel, char *out, uint64_t cap);
 
+/* Leer de un fichero a memoria del kernel. Lo usa el fallo de pagina de un
+ * fichero mapeado. */
+int64_t fs_leer_en(const char *ruta, uint64_t off, char *dst, uint64_t n);
+int64_t fs_tamano(const char *ruta);     /* -1 si no esta o es directorio */
+
 /* Comprobar que una ruta absoluta nombra un directorio. Lo pregunta al
  * servidor, que es el unico que lo sabe. */
 int fs_es_directorio(const char *ruta);

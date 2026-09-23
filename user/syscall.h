@@ -112,6 +112,14 @@ static inline int64_t realpath(const char *ruta, char *salida)
                                           { return syscall2(SYS_realpath, (uint64_t)ruta,
                                                             (uint64_t)salida); }
 
+/* Mapear un fichero: convertirlo en un puntero. No lo lee ahora; los
+ * trozos van llegando segun se tocan. */
+static inline const char *mmap(const char *ruta, uint64_t *tam)
+{
+    int64_t r = syscall2(SYS_mmap, (uint64_t)ruta, (uint64_t)tam);
+    return r < 0 ? 0 : (const char *)(uint64_t)r;
+}
+
 /* Abrir un fichero de la tarjeta y quedarselo en un descriptor. */
 static inline int64_t openf(const char *nombre, uint64_t modo)
                                           { return syscall2(SYS_open, (uint64_t)nombre, modo); }

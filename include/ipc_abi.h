@@ -97,6 +97,11 @@ struct message {
  * propio kernel para la redireccion. */
 #define SYS_realpath     32   /* (ruta, salida) -> 0 | -1                   */
 
+/* Mapear un fichero en el espacio del proceso. No lo lee: reserva las
+ * direcciones y deja que los fallos de pagina vayan trayendo los trozos
+ * segun se toquen. Devuelve la direccion, y el tamanyo en *tam. */
+#define SYS_mmap         33   /* (ruta, uint64_t *tam) -> direccion | -1    */
+
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */
 

@@ -87,6 +87,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 30   | Coma flotante, y el fallo como aviso        | hecho  |
 | 31   | Subdirectorios, y el directorio actual      | hecho  |
 | 32   | Nombres largos, y una interrupcion perdida  | hecho  |
+| 33   | mmap: el kernel pide y un proceso contesta  | hecho  |
 
 ## Estructura
 
@@ -115,6 +116,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  upper.c     filtro: lee de la entrada y escribe en la salida
                  wc.c        cuenta lo que le pasa por delante
                  mkdir.c     crea un directorio
+                 map.c       mapea un fichero y mide cuando se lee
                  fp.c        coma flotante: cuentas y supervivencia
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
@@ -1855,6 +1857,97 @@ Tres cosas mas salieron de ahi, todas del mismo estilo:
   parece modelarlo -nunca se encendio-, pero en silicio si pasa, y estaba
   sin mirar.
 
+## mmap, o el kernel esperando a un programa sin privilegios
+
+`mmap` no lee nada. Reserva un tramo de direcciones, apunta de que fichero
+viene, y se va. La primera vez que el proceso toca una de esas paginas
+salta un fallo de traduccion, y ahi se trae el trozo que hace falta.
+
+Eso ya lo sabiamos hacer: es la pila que crece y es copy-on-write, por
+cuarta vez. Lo nuevo, y es gordo, es **de donde sale el contenido**.
+
+Hasta hoy, cuando el kernel necesitaba una pagina se la pedia al gestor de
+paginas: codigo suyo, en su mismo nivel de privilegio, que contesta
+siempre y enseguida. Ahora se la pide a un **proceso de EL0**. Manda un
+mensaje al servidor de ficheros y se duerme hasta que conteste. El kernel,
+a mitad de una instruccion que todavia no ha terminado de ejecutarse,
+esperando a un programa sin privilegios.
+
+**Y funciona porque "el kernel" no es nadie.** El hilo que falla es un hilo
+normal, con su pila y su entrada en la tabla de tareas, que resulta estar
+en modo privilegiado. Puede dormirse como cualquier otro, y mientras tanto
+los otros tres nucleos siguen corriendo. Si el servidor no esta, la
+peticion falla, el proceso muere, y el sistema sigue. Esa frase -"el kernel
+no es un proceso, es un modo"- llevaba treinta y dos pasos siendo una
+definicion; aqui es lo que hace que la cosa no se caiga.
+
+**La medida, que es lo que hay que mirar.** `map` imprime las paginas
+libres del sistema en tres momentos:
+
+```
+    / $ map ls.elf
+      ls.elf mapeado en 0x30000000, 8720 bytes
+      paginas libres: 245364 antes -> 245364 despues de mapear
+      (mapear no gasta memoria: todavia no se ha leido nada)
+
+      leo el primer byte ('') -> quedan 245362 paginas
+      lo recorro entero      -> quedan 245360 paginas
+```
+
+Mapear un fichero de 8.720 bytes cuesta **cero paginas**. Tocar el primer
+byte cuesta dos: una es la pagina de datos y la otra es un nivel de tabla,
+porque la zona de mapeos esta en 0x30000000 y ahi no habia todavia ninguna
+tabla de nivel 3. Recorrerlo entero trae las dos que faltaban. Con
+`hola.txt`, que son 82 bytes, la ultima linea no gasta nada: cabia entero
+en la primera pagina.
+
+Es el mismo perfil que la pila que crece, pero ahora medido contra un
+fichero de verdad y con el disco de por medio.
+
+**Lo que cuesta, dicho claro.** Un mensaje lleva `FS_CHUNK` = 176 bytes
+utiles, asi que llenar una pagina de 4 KB son **24 viajes** de ida y vuelta
+al servidor. Es lento, y es el precio de que el sistema de ficheros no este
+en el kernel. Se podria arreglar con un protocolo que devuelva una pagina
+entera, o con memoria compartida entre el servidor y el kernel; las dos
+cosas son mas mecanismo, y ninguna cambia la idea.
+
+**El peligro de invertir la dependencia.** Si el que falla es el PROPIO
+servidor de ficheros, se esta esperando a si mismo: no queda nadie para
+contestarle, y con el se cuelga todo el que quiera leer algo. No hay forma
+elegante de evitarlo -es de fondo, viene de que el kernel dependa de un
+proceso- y la unica manera honesta de tratarlo es nombrarlo y cortarlo en
+seco:
+
+```c
+    if (t->pid == port_owner(PORT_FILES)) return -1;
+```
+
+Mejor un `mmap` que devuelve -1 que un sistema que se para sin decir por
+que.
+
+**De solo lectura, y a proposito.** No hay nada que devuelva los cambios al
+disco. Un mapeo que se deja escribir y luego pierde lo escrito al morir el
+proceso es peor que uno que no deja: el fallo aparece tarde y en otro
+sitio. `map -w` lo comprueba, y muere como debe:
+
+```
+    Causa   : EC=0x24  Data Abort desde EL inferior
+    Detalle : Fallo de permisos (escritura)
+    Direccion (FAR_EL1) : 0x0000000030000000
+```
+
+**En el fork, pereza doble.** Los mapeos se heredan. Las paginas que ya
+estaban dentro las copia `vmm_fork` como cualquier otra, en
+copy-on-write; las que no, volveran a pedirse al servidor cuando el hijo
+las toque. Una pereza sobre la memoria y otra sobre el disco, encajadas
+sin que ninguna sepa de la otra.
+
+**Y un tropiezo que ya es viejo conocido.** `t->mapeos[i] = padre->mapeos[i]`
+son 80 bytes, y gcc convierte eso en una llamada a `memcpy` que en el
+kernel no existe. Tercera vez en este proyecto, y siempre se ve igual: no
+falla el compilador, falla el enlazador, y el mensaje no menciona ninguna
+estructura.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -1896,6 +1989,13 @@ Tres cosas mas salieron de ahi, todas del mismo estilo:
 - El anillo de entrada de la consola son 64 bytes y lo que no cabe se
   pierde. Ahora al menos lo dice; un terminal de verdad tendria control de
   flujo (XON/XOFF o RTS/CTS) y no perderia nada.
+- Los ficheros mapeados son de solo lectura y no hay `munmap`: se sueltan
+  al morir el proceso o al hacer `exec`. Un proceso puede tener cuatro.
+- Llenar una pagina mapeada son 24 mensajes al servidor (176 bytes cada
+  uno). Funciona, y es lento.
+- `exec` sigue cargando el ELF entero en memoria con `malloc` antes de
+  arrancarlo. Pasarlo por `mmap` exigiria que el kernel tolerase fallos de
+  pagina mientras copia de memoria de usuario, que es otra pieza.
 - Los nombres largos se LEEN pero no se escriben: un fichero creado desde
   TinyOS se guarda en 8.3, en mayusculas y truncado.
 - De los nombres largos solo se entiende el ASCII. Lo de fuera sale como

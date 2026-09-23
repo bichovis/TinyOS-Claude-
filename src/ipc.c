@@ -149,6 +149,18 @@ int port_recv(int id, struct message *out, uint64_t pid)
  * Se llama desde task_exit(), que YA tiene sched_lock cogido y no lo va a
  * soltar hasta despues del cambio de contexto. Pedirlo aqui otra vez seria
  * un interbloqueo contra uno mismo. */
+/* De quien es un puerto. Sirve para una cosa muy concreta: saber si quien
+ * pregunta ES el servidor de ficheros. */
+uint64_t port_owner(int id)
+{
+    if (id < 0 || id >= MAX_PORTS) return 0;
+
+    uint64_t f = sched_lock_irqsave();
+    uint64_t due = ports[id].in_use ? ports[id].owner : 0;
+    sched_unlock_irqrestore(f);
+    return due;
+}
+
 int port_notify(int id, uint64_t tipo)
 {
     if (id < 0 || id >= MAX_PORTS) return -1;

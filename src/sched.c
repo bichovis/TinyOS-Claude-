@@ -19,6 +19,7 @@
 #include "exception.h"
 #include "sync.h"
 #include "ipc.h"
+#include "fs_abi.h"
 #include "elf.h"
 #include "smp.h"
 #include "spinlock.h"
@@ -41,6 +42,8 @@ _Static_assert(__builtin_offsetof(struct task, ctx) == 0, "ctx debe ir primero")
  * reparten a quien las pida. */
 static struct task tasks[MAX_TASKS];
 static uint64_t    next_pid = CORES;
+
+static void mapeos_limpiar(struct task *t);
 
 /* Cuantos hilos han existido. Sirve para poner en contexto cuantos han
  * llegado a pedir la FPU: sin el denominador, el numero no dice nada. */
@@ -440,6 +443,7 @@ static void reap(struct task *t)
         kstack_free((int)(t - tasks));
 
     fp_release(t);              /* sus 528 bytes, si llego a necesitarlos */
+    mapeos_limpiar(t);
 
     t->pgd     = 0;
     t->asid    = 0;
@@ -519,6 +523,133 @@ static struct task *by_pid(uint64_t pid)
  * escribe despues. Un puntero salvaje que apunte mucho mas abajo sigue
  * siendo mortal, que es lo que tiene que ser.
  */
+/* ====================== FICHEROS MAPEADOS ==========================
+ *
+ * mmap no lee nada. Reserva un tramo de direcciones, apunta de que fichero
+ * viene, y se va. La primera vez que el proceso toca una de esas paginas
+ * salta un fallo de traduccion, y AHI se trae el trozo que hace falta.
+ *
+ * Eso ya lo sabiamos hacer: es lo mismo que la pila que crece y que
+ * copy-on-write. Lo nuevo, y es gordo, es DE DONDE sale el contenido.
+ *
+ * Hasta hoy, cuando el kernel necesitaba una pagina se la pedia al gestor
+ * de paginas, que es codigo suyo, en su mismo nivel de privilegio, y que
+ * contesta siempre. Ahora se la pide a un PROCESO DE EL0: manda un mensaje
+ * al servidor de ficheros y se duerme hasta que conteste. El kernel, a
+ * mitad de una instruccion que todavia no ha terminado de ejecutarse,
+ * esperando a un programa sin privilegios.
+ *
+ * Esa inversion es la idea entera del microkernel llevada hasta el final.
+ * Y funciona porque el hilo que falla no es "el kernel": es un hilo
+ * normal, con su pila y su entrada en la tabla de tareas, que resulta
+ * estar en modo privilegiado. Puede dormirse como cualquier otro, y
+ * mientras tanto los demas siguen corriendo. Si el servidor no esta, la
+ * peticion falla, el proceso muere, y el sistema sigue.
+ *
+ * Lo que NO se puede hacer es que el propio servidor de ficheros mapee un
+ * fichero: se estaria esperando a si mismo. No hay nada que lo impida por
+ * ahora, y esta en las limitaciones.
+ */
+int64_t task_mmap(const char *ruta, uint64_t *tam)
+{
+    struct task *t = current;
+    if (!t || !t->pgd) return -1;
+
+    /* El servidor de ficheros NO puede mapear ficheros.
+     *
+     * Rellenar una pagina mapeada es mandarle un mensaje al servidor y
+     * dormirse hasta que conteste. Si el que se duerme ES el servidor, no
+     * queda nadie para contestarle: se espera a si mismo, para siempre, y
+     * con el se cuelga todo el que quiera leer algo.
+     *
+     * Es la pega de fondo de invertir la dependencia -el kernel esperando
+     * a un proceso- y la unica forma honesta de tratarla es nombrarla.
+     * Aqui se corta en seco: mejor un mmap que devuelve -1 que un sistema
+     * que se para sin decir por que. */
+    if (t->pid == port_owner(PORT_FILES)) return -1;
+
+    int64_t largo = fs_tamano(ruta);
+    if (largo < 0) return -1;
+
+    uint64_t paginas = ((uint64_t)largo + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (paginas == 0) paginas = 1;            /* un fichero vacio, una pagina */
+
+    /* Sitio en la tabla, y sitio en el mapa. Se colocan uno detras de otro
+     * dejando una pagina de hueco, que es barato y evita que un desbordado
+     * de un mapeo aterrice en el siguiente. */
+    int hueco = -1;
+    uint64_t siguiente = USER_MMAP_BASE;
+
+    for (int i = 0; i < MAX_MAPEOS; i++) {
+        if (!t->mapeos[i].base) { if (hueco < 0) hueco = i; continue; }
+        uint64_t fin = t->mapeos[i].base +
+                       ((t->mapeos[i].len + PAGE_SIZE - 1) / PAGE_SIZE + 1) * PAGE_SIZE;
+        if (fin > siguiente) siguiente = fin;
+    }
+
+    if (hueco < 0) return -1;                  /* ya tiene cuatro */
+    if (siguiente + paginas * PAGE_SIZE > USER_MMAP_MAX) return -1;
+
+    struct mapeo *m = &t->mapeos[hueco];
+    m->base = siguiente;
+    m->len  = (uint64_t)largo;
+    for (int i = 0; i < FS_PATH_MAX; i++) m->ruta[i] = ruta[i];
+
+    if (tam) *tam = m->len;
+    return (int64_t)m->base;
+}
+
+/* El fallo de pagina de un fichero mapeado. Devuelve 1 si lo ha resuelto. */
+int task_mmap_fault(uint64_t direccion)
+{
+    struct task *t = current;
+    if (!t || !t->pgd) return 0;
+    if (direccion < USER_MMAP_BASE || direccion >= USER_MMAP_MAX) return 0;
+
+    uint64_t pag = direccion & ~(uint64_t)(PAGE_SIZE - 1);
+
+    struct mapeo *m = 0;
+    for (int i = 0; i < MAX_MAPEOS; i++) {
+        struct mapeo *c = &t->mapeos[i];
+        if (!c->base) continue;
+        uint64_t fin = c->base + ((c->len + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+        if (pag >= c->base && pag < fin) { m = c; break; }
+    }
+    if (!m) return 0;                          /* ahi no hay nada mapeado */
+
+    uint64_t pa = pmm_alloc();
+    if (!pa) return 0;
+
+    /* Rellenarla ANTES de mapearla. Si se mapeara primero, el proceso
+     * podria ver la pagina a medio llenar: aqui hay cuatro nucleos, y el
+     * fichero lo trae un servidor que tarda. */
+    char *dst = (char *)phys_to_virt(pa);
+    for (uint64_t i = 0; i < PAGE_SIZE; i++) dst[i] = 0;
+
+    uint64_t off = pag - m->base;
+    uint64_t pedir = m->len > off ? m->len - off : 0;
+    if (pedir > PAGE_SIZE) pedir = PAGE_SIZE;
+
+    if (pedir && fs_leer_en(m->ruta, off, dst, pedir) < 0) {
+        pmm_free(pa);
+        return 0;
+    }
+
+    /* El ultimo trozo del fichero no llena la pagina, y lo que sobra se
+     * queda a cero. Es lo que hace cualquier Unix, y es lo que permite
+     * tratar el final sin contar bytes a mano. */
+    if (vmm_map_in(t->pgd, pag, pa, MM_USER_RO) < 0) {
+        pmm_free(pa);
+        return 0;
+    }
+    return 1;
+}
+
+static void mapeos_limpiar(struct task *t)
+{
+    for (int i = 0; i < MAX_MAPEOS; i++) t->mapeos[i].base = 0;
+}
+
 int task_grow_stack(uint64_t direccion, uint64_t sp)
 {
     struct task *t = current;
@@ -1219,6 +1350,11 @@ int task_exec(const uint8_t *image, uint64_t size, const char *args,
     fp_hw_disable();
     fp_release(t);
 
+    /* Los ficheros mapeados se van con el programa que los mapeo. Las
+     * paginas ya estan muertas -el espacio de direcciones entero se
+     * sustituye-, asi que esto solo borra el apunte. */
+    mapeos_limpiar(t);
+
     /* El directorio actual NO se toca, y esa ausencia es la regla: el
      * programa cambia, el sitio donde estabas no. Es lo que hace que
      * "cd docs" seguido de "cat notas.txt" funcione. */
@@ -1345,6 +1481,16 @@ int task_fork(struct trap_frame *f)
      * shell tenga efecto sobre lo que ejecutes despues. */
     for (int i = 0; i < FS_PATH_MAX; i++) t->cwd[i] = padre->cwd[i];
 
+    /* Y los ficheros mapeados. Las paginas que ya estaban dentro las copia
+     * vmm_fork como cualquier otra -en copy-on-write-, y las que no,
+     * volveran a pedirse al servidor cuando el hijo las toque. Es la misma
+     * pereza dos veces: una en la memoria y otra en el disco. */
+    /* kcopy y no una asignacion de estructura: son 80 bytes, y gcc
+     * convierte eso en una llamada a memcpy que aqui no existe. Es la
+     * tercera vez que pasa en este proyecto y siempre se ve igual, en el
+     * enlazador y no en el compilador. */
+    kcopy(t->mapeos, padre->mapeos, sizeof(t->mapeos));
+
     t->brk_base  = padre->brk_base;
     t->brk       = padre->brk;
     t->stack_low = padre->stack_low;
@@ -1468,6 +1614,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
      * quien heredar un directorio actual. */
     t->cwd[0] = '/';
     t->cwd[1] = 0;
+
+    mapeos_limpiar(t);
 
     /* Entrada, salida y errores a la consola. Si quien lo arranca quiere
      * otra cosa, que los cambie despues. */

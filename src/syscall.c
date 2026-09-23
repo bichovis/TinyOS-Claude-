@@ -353,6 +353,25 @@ void syscall_dispatch(struct trap_frame *f)
         break;
     }
 
+    /* Mapear un fichero. La ruta se resuelve aqui, como en open: el
+     * servidor solo entiende absolutas. */
+    case SYS_mmap: {
+        char rel[FS_PATH_MAX], abs[FS_PATH_MAX];
+        if (copiar_ruta(rel, f->x[0]) < 0) { ret = -1; break; }
+        if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
+
+        uint64_t tam = 0;
+        int64_t base = task_mmap(abs, &tam);
+        if (base < 0) { ret = -1; break; }
+
+        if (f->x[1]) {
+            if (!user_writable(f->x[1], sizeof(uint64_t))) { ret = -1; break; }
+            copy_bytes((void *)f->x[1], &tam, sizeof(tam));
+        }
+        ret = base;
+        break;
+    }
+
     case SYS_close:
         ret = task_fd_close((int)f->x[0]);
         break;

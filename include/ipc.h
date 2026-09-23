@@ -34,6 +34,7 @@ int  port_send(int id, const struct message *m);            /* 0 o -1       */
  * desde el manejador de interrupciones, donde esperar no es una opcion:
  * quedarse ahi parado seria colgar la maquina entera. */
 int  port_notify(int id, uint64_t tipo);
+uint64_t port_owner(int id);            /* pid del duenyo, 0 si no hay      */
 int  port_recv(int id, struct message *out, uint64_t pid);  /* 0 o -1       */
 void ipc_release_ports(uint64_t pid);   /* al morir un proceso              */
 void ipc_dump(void);
