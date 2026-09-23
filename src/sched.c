@@ -18,6 +18,7 @@
 #include "exception.h"
 #include "sync.h"
 #include "ipc.h"
+#include "user_abi.h"
 
 /* Definidos en switch.S */
 void cpu_switch_to(struct task *prev, struct task *next);
@@ -316,9 +317,74 @@ static void kcopy(void *dst, const void *src, uint64_t n)
  * nos deposite en EL0. Para la CPU es indistinguible de volver de una
  * interrupcion que hubiera ocurrido en el primer instante del proceso.
  */
+/* Carga [va_ini, va_fin) en el espacio nuevo con los permisos dados.
+ *
+ * Lo que caiga por debajo de 'copia_hasta' sale de la imagen; lo que quede
+ * por encima se queda a cero, que es justo lo que quiere .bss. Y "dejar a
+ * cero" aqui no cuesta nada: pmm_alloc entrega las paginas limpias.
+ */
+static int load_range(uint64_t *pgd, const uint8_t *image, uint64_t size,
+                      uint64_t va_ini, uint64_t va_fin, uint64_t copia_hasta,
+                      uint64_t flags)
+{
+    for (uint64_t va = va_ini; va < va_fin; va += PAGE_SIZE) {
+        uint64_t page = pmm_alloc();
+        if (!page) return -1;
+
+        if (va < copia_hasta) {
+            uint64_t n = copia_hasta - va;
+            if (n > PAGE_SIZE) n = PAGE_SIZE;
+
+            /* Ni un byte de fuera de la imagen: el fichero podria estar
+             * truncado y la cabecera prometer mas de lo que hay. */
+            uint64_t off = va - USER_BASE;
+            if (off >= size)          n = 0;
+            else if (off + n > size)  n = size - off;
+
+            if (n) kcopy(phys_to_virt(page), image + off, n);
+        }
+
+        if (vmm_map_in(pgd, va, page, flags) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Comprueba que la cabecera dice algo coherente. Es codigo aburrido y es
+ * exactamente el que evita que una imagen mal construida (o maliciosa)
+ * consiga que el kernel mapee donde no debe. */
+static int header_ok(const struct user_header *h, uint64_t size)
+{
+    if (size < sizeof(*h))                       return 0;
+    if (h->magic != USER_MAGIC)                  return 0;
+    if (h->version != USER_ABI_VER)              return 0;
+    if (h->text_start != USER_BASE)              return 0;
+    if (h->text_end & (PAGE_SIZE - 1))           return 0;  /* el corte de */
+                                                            /* permisos va */
+                                                            /* en frontera */
+    if (h->text_end  <  h->text_start)           return 0;
+    if (h->data_end  <  h->text_end)             return 0;
+    if (h->bss_end   <  h->data_end)             return 0;
+    if (h->entry     <  h->text_start ||
+        h->entry     >= h->text_end)             return 0;  /* entrar en un */
+                                                            /* sitio no     */
+                                                            /* ejecutable   */
+    /* Los datos tienen que estar de verdad en la imagen. El texto no hace
+     * falta comprobarlo igual: text_end esta redondeado a pagina, asi que
+     * un programa pequenyo da una imagen mas corta y el cargador rellena
+     * el resto de la pagina con ceros. */
+    if (h->data_end > h->text_end &&
+        h->data_end - h->text_start > size)      return 0;
+    if (h->bss_end >= USER_STACK_TOP - PAGE_SIZE) return 0; /* pisaria la   */
+                                                            /* pila         */
+    return 1;
+}
+
 int task_create_user(const char *name, const uint8_t *image, uint64_t size,
                      uint64_t mmio_pa)
 {
+    const struct user_header *h = (const struct user_header *)image;
+    if (!header_ok(h, size)) return -1;
+
     uint64_t flags = irq_save();
     struct task *t = 0;
 
@@ -330,22 +396,30 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     uint64_t *pgd = vmm_create_pgd(&asid);
     if (!pgd) { irq_restore(flags); return -1; }
 
-    /* --- Codigo: tantas paginas como haga falta, copiadas de la imagen --- */
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        uint64_t page = pmm_alloc();
-        if (!page) { irq_restore(flags); return -1; }
+    uint64_t kstack_pa = 0;
 
-        uint64_t chunk = size - off;
-        if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
-        kcopy(phys_to_virt(page), image + off, chunk);   /* escribir: virtual */
+    /* --- Tramo 1: texto y rodata. Solo lectura y ejecutable. -------------
+     * Que sea RO no es un detalle: es lo que impide que un programa se
+     * reescriba a si mismo, y lo que permitiria mas adelante compartir
+     * estas paginas entre varias instancias del mismo programa. */
+    if (load_range(pgd, image, size, h->text_start, h->text_end,
+                   h->text_end, MM_USER_CODE) < 0)
+        goto fail;
 
-        vmm_map_in(pgd, USER_BASE + off, page, MM_USER_CODE);
-    }
+    /* --- Tramo 2: datos y bss. Escribible y NUNCA ejecutable. ------------
+     * Hasta aqui el proceso no podia tener una sola variable global: la
+     * imagen entera se mapeaba de solo lectura, asi que escribir en .data
+     * era un fallo de permisos y .bss ni siquiera estaba mapeada. */
+    uint64_t rw_end = (h->bss_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (load_range(pgd, image, size, h->text_end, rw_end,
+                   h->data_end, MM_USER_DATA) < 0)
+        goto fail;
 
     /* --- Pila de usuario: una pagina justo debajo de USER_STACK_TOP --- */
     uint64_t ustack = pmm_alloc();
-    if (!ustack) { irq_restore(flags); return -1; }
-    vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA);
+    if (!ustack) goto fail;
+    if (vmm_map_in(pgd, USER_STACK_TOP - PAGE_SIZE, ustack, MM_USER_DATA) < 0)
+        goto fail;
 
     /* --- MMIO concedido: asi un driver puede vivir en EL0 ---------------
      * Le mapeamos la pagina de registros del periferico en su espacio, como
@@ -353,14 +427,15 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
      * con el hardware sin pasar por el kernel ni una sola vez. */
     t->mmio_va = 0;
     if (mmio_pa) {
-        vmm_map_in(pgd, USER_MMIO_BASE, mmio_pa & ~(PAGE_SIZE - 1),
-                   MM_DEVICE | PTE_AP_RW_ALL | PTE_nG);
+        if (vmm_map_in(pgd, USER_MMIO_BASE, mmio_pa & ~(PAGE_SIZE - 1),
+                       MM_DEVICE | PTE_AP_RW_ALL | PTE_nG) < 0)
+            goto fail;
         t->mmio_va = USER_MMIO_BASE | (mmio_pa & (PAGE_SIZE - 1));
     }
 
     /* --- Pila de kernel: donde se guardara su contexto en cada syscall --- */
-    uint64_t kstack_pa = pmm_alloc();
-    if (!kstack_pa) { irq_restore(flags); return -1; }
+    kstack_pa = pmm_alloc();
+    if (!kstack_pa) goto fail;
     uint64_t kstack = (uint64_t)phys_to_virt(kstack_pa);
     *(uint64_t *)kstack = STACK_MAGIC;
 
@@ -376,7 +451,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     struct trap_frame *tf =
         (struct trap_frame *)(kstack + PAGE_SIZE - sizeof(struct trap_frame));
     kzero(tf, sizeof(*tf));
-    tf->elr    = USER_BASE;          /* empezar por el principio del codigo */
+    tf->elr    = h->entry;           /* ya no se supone: lo dice la imagen  */
     tf->spsr   = 0;                  /* M=0b0000 -> EL0t; DAIF=0 -> IRQ ON  */
     tf->sp_el0 = USER_STACK_TOP;     /* su pila, no la nuestra              */
 
@@ -388,6 +463,14 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
 
     irq_restore(flags);
     return (int)t->pid;
+
+fail:
+    /* Media carga es peor que ninguna: se devuelve todo lo repartido. Antes
+     * de que existiera el recolector esto no se podia ni escribir. */
+    if (kstack_pa) pmm_free(kstack_pa);
+    vmm_destroy_pgd(pgd, asid);
+    irq_restore(flags);
+    return -1;
 }
 
 static const char *state_name(uint64_t s)

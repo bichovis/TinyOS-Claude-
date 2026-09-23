@@ -6,6 +6,13 @@
  */
 #include "syscall.h"
 
+/* Dos variables globales. Hasta el paso 12 esto era imposible: el kernel
+ * mapeaba la imagen ENTERA de solo lectura, asi que escribir en 'veces'
+ * era un fallo de permisos, y 'marca' ni siquiera estaba mapeada porque
+ * .bss no ocupa sitio en el binario. */
+static int  veces = 41;       /* .data: llega con su valor desde la imagen */
+static char marca[32];        /* .bss : no esta en la imagen, llega a cero */
+
 /* Imprimir un numero por la via directa del kernel (SYS_write). El cliente
  * del servidor de consola lo hace por mensajes; este proceso usa la syscall
  * a proposito, para que se vean los dos caminos. */
@@ -26,6 +33,23 @@ void _start(void)
 
     kprint("  >> mi pid es ");
     kdec(getpid());
+    kprint("\n");
+
+    /* --- .data: viene con valor, y se puede cambiar --- */
+    kprint("  >> global de .data: ");
+    kdec((uint64_t)veces);
+    veces++;
+    kprint(" -> le sumo uno -> ");
+    kdec((uint64_t)veces);
+    kprint("\n");
+
+    /* --- .bss: no esta en la imagen y aun asi llega a cero --- */
+    kprint("  >> global de .bss, sin inicializar: ");
+    kdec((uint64_t)marca[0]);
+    for (int i = 0; i < 11; i++)
+        marca[i] = (char)("escribible"[i]);
+    kprint(" -> escribo en ella -> ");
+    kprint(marca);
     kprint("\n");
 
     for (int i = 1; i <= 3; i++) {

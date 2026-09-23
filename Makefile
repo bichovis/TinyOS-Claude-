@@ -57,9 +57,10 @@ $(BUILD)/%.S.o: $(SRCDIR)/%.S | $(BUILD)
 # se pasa a binario plano y se empotra en el kernel como un array de C.
 .PRECIOUS: $(BUILD)/%.elf $(BUILD)/%.bin $(BUILD)/%_bin.c
 
-$(BUILD)/%.elf: user/%.c user/syscall.h $(INCDIR)/ipc_abi.h user/user.ld | $(BUILD)
+$(BUILD)/%.elf: user/%.c user/header.S user/syscall.h $(INCDIR)/ipc_abi.h \
+                $(INCDIR)/user_abi.h user/user.ld | $(BUILD)
 	@echo "  CC-U  user/$*.c"
-	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c -o $@
+	@$(CC) $(UCFLAGS) $(ULDFLAGS) user/$*.c user/header.S -o $@
 
 $(BUILD)/%.bin: $(BUILD)/%.elf
 	@$(OBJCOPY) -O binary $< $@

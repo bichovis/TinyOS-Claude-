@@ -63,6 +63,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 10a  | Kernel en alto: split TTBR0 / TTBR1         | hecho  |
 | 10b  | ASIDs: dejar de tirar la TLB entera         | hecho  |
 | 11   | Recolector: devolver lo que deja un muerto  | hecho  |
+| 12   | Cargador con secciones: W^X y globales      | hecho  |
 
 ## Estructura
 
@@ -77,6 +78,7 @@ Tres cosas que QEMU perdona y el silicio no:
     syscall.c    despacho de las llamadas al sistema desde EL0
     ipc.c        puertos de mensajes entre procesos
     user/        programas de usuario, compilados aparte y empotrados:
+                 header.S    la cabecera que lee el cargador
                  hello.c     usa syscalls directas
                  conserver.c driver de la UART en EL0, sirve el puerto 0
                  client.c    imprime mandando mensajes al servidor
@@ -167,11 +169,36 @@ mapeada es RAM nuestra** — a un driver de EL0 le hemos mapeado los registros
 de un periferico. Devolver eso al PMM seria repartir la UART como si fuera
 memoria libre. Se distingue por el indice de MAIR del propio descriptor.
 
+## El cargador
+
+El kernel recibe un binario **plano**: una tira de bytes sin secciones ni
+simbolos, porque `objcopy` se los ha comido. Mirandolo no hay forma de saber
+donde acaba el codigo y empiezan los datos — y esa diferencia es justo la
+que decide los permisos de cada pagina.
+
+Asi que el programa lo dice de su puno y letra. Los primeros 48 bytes de
+toda imagen son una cabecera (`include/user_abi.h`, emitida por
+`user/header.S`) con las direcciones que el enlazador conoce y el kernel no:
+
+    [text_start, text_end)   solo lectura, ejecutable   <- de la imagen
+    [text_end,   data_end)   lectura/escritura          <- de la imagen
+    [data_end,   bss_end )   lectura/escritura          <- ceros
+
+El corte entre el primer tramo y el segundo esta alineado a 4 KB en
+`user/user.ld`, y no por estetica: una pagina no puede ser medio ejecutable.
+
+Con esto un programa de usuario ya puede tener variables globales. Antes no:
+la imagen entera se mapeaba de solo lectura, asi que escribir en `.data` era
+un fallo de permisos y `.bss` ni siquiera estaba mapeada. Y a cambio se gana
+W^X de verdad — `user/hello.c` lo enseña por los dos lados, escribiendo en
+sus globales y muriendo si toca su propio codigo.
+
+Un detalle del que es facil no darse cuenta: `__data_end` en `user.ld` NO se
+alinea. Ese simbolo marca el ultimo byte que `objcopy` escribe en la imagen,
+y si se redondea, la cabecera promete mas bytes de los que hay.
+
 ## Limitaciones conocidas
 
-- El cargador de procesos mapea toda la imagen como codigo de solo lectura,
-  asi que un programa de usuario no puede tener variables globales
-  escribibles; solo pila.
 - El recolector es un solo hilo y da por hecho un solo nucleo: puede
   liberar la pila de un zombi porque, para que el llegue a ejecutarse, el
   zombi ha tenido que dejar la CPU. Con varios nucleos eso deja de ser
