@@ -10,23 +10,23 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "syscall.h"
 
 int main(int argc, char **argv)
 {
     if (argc < 2) { printf("\n  uso: rm FICHERO\n"); exit(1); }
 
-    /* Distinguir "no esta" de "es un directorio" no lo hace el kernel:
-     * lo hace quien pregunta, porque es una diferencia de mensaje, no de
-     * mecanismo. */
-    struct estado e;
-    if (stat(argv[1], &e) == 0 && (e.flags & FS_ES_DIR)) {
-        printf("\n  %s es un directorio: usa rmdir\n", argv[1]);
-        return 1;
-    }
-
+    /* Una sola llamada, y el motivo viene con ella.
+     *
+     * Antes habia que preguntar DOS veces -un stat para ver si era un
+     * directorio y luego el unlink- porque el fallo no decia por que. Eso
+     * no era solo feo: entre las dos preguntas el fichero podia cambiar. */
     if (unlink(argv[1]) < 0) {
-        printf("\n  %s: no esta en la tarjeta\n", argv[1]);
+        if (errno == EISDIR)
+            printf("\n  %s es un directorio: usa rmdir\n", argv[1]);
+        else
+            printf("\n  %s: %s\n", argv[1], strerror(errno));
         return 1;
     }
 

@@ -45,6 +45,23 @@ static inline int64_t syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a
     return (int64_t)x0;
 }
 
+/* --- Deshacer el truco del valor negativo ----------------------------
+ *
+ * El kernel mete el motivo del fallo en el propio valor devuelto, entre
+ * -4095 y -1. Aqui se separan otra vez: el motivo va a errno y la
+ * funcion devuelve -1, que es lo que espera cualquier programa escrito
+ * para un Unix.
+ *
+ * El rango no es magia: ningun resultado legitimo -un tamanyo, un
+ * descriptor, una posicion- es negativo, asi que no hay ambiguedad. */
+extern int errno;
+
+static inline int64_t revisar(int64_t r)
+{
+    if (r < 0 && r >= -4095) { errno = (int)-r; return -1; }
+    return r;
+}
+
 /* --- Llamadas basicas -------------------------------------------------- */
 /* --- Descriptores ------------------------------------------------------
  * El 0 es la entrada y el 1 la salida, por costumbre. Quien arranca el
@@ -125,7 +142,7 @@ static inline uint64_t mmio_base(void)    { return (uint64_t)syscall2(SYS_mmio_b
  * para la redireccion, y dos implementaciones acabarian discrepando en
  * algun caso raro. Ver src/path.c. */
 static inline int64_t chdir(const char *ruta)
-                                          { return syscall2(SYS_chdir, (uint64_t)ruta, 0); }
+                                          { return revisar(syscall2(SYS_chdir, (uint64_t)ruta, 0)); }
 static inline int64_t getcwd(char *buf, uint64_t n)
                                           { return syscall2(SYS_getcwd, (uint64_t)buf, n); }
 static inline int64_t realpath(const char *ruta, char *salida)
@@ -157,29 +174,29 @@ static inline void ucopiar(char *dst, const char *src, uint64_t max)
  * Debajo siguen estando los mensajes al servidor; lo que cambia es que ya
  * no hay que conocerlos para usar un fichero. */
 static inline int64_t stat(const char *ruta, struct estado *e)
-{ return syscall2(SYS_stat, (uint64_t)ruta, (uint64_t)e); }
+{ return revisar(syscall2(SYS_stat, (uint64_t)ruta, (uint64_t)e)); }
 
 static inline int64_t lseek(int fd, int64_t desp, int desde)
-{ return syscall3(SYS_lseek, (uint64_t)fd, (uint64_t)desp, (uint64_t)desde); }
+{ return revisar(syscall3(SYS_lseek, (uint64_t)fd, (uint64_t)desp, (uint64_t)desde)); }
 
 static inline int64_t unlink(const char *ruta)
-{ return syscall2(SYS_unlink, (uint64_t)ruta, 0); }
+{ return revisar(syscall2(SYS_unlink, (uint64_t)ruta, 0)); }
 
 static inline int64_t mkdir(const char *ruta)
-{ return syscall2(SYS_mkdir, (uint64_t)ruta, 0); }
+{ return revisar(syscall2(SYS_mkdir, (uint64_t)ruta, 0)); }
 
 static inline int64_t rmdir(const char *ruta)
-{ return syscall2(SYS_rmdir, (uint64_t)ruta, 0); }
+{ return revisar(syscall2(SYS_rmdir, (uint64_t)ruta, 0)); }
 
 static inline int64_t rename(const char *origen, const char *destino)
-{ return syscall2(SYS_rename, (uint64_t)origen, (uint64_t)destino); }
+{ return revisar(syscall2(SYS_rename, (uint64_t)origen, (uint64_t)destino)); }
 
 static inline int64_t opendir(const char *ruta)
-{ return syscall2(SYS_opendir, (uint64_t)ruta, 0); }
+{ return revisar(syscall2(SYS_opendir, (uint64_t)ruta, 0)); }
 
 /* 1 si hay entrada, 0 si se acabo, -1 si algo fue mal. */
 static inline int64_t readdir(int fd, struct fs_info *info)
-{ return syscall2(SYS_readdir, (uint64_t)fd, (uint64_t)info); }
+{ return revisar(syscall2(SYS_readdir, (uint64_t)fd, (uint64_t)info)); }
 
 /* La hora, en segundos desde 1970. Ver SYS_time: en esta maquina es un
  * invento honesto, no un reloj. */
@@ -207,7 +224,7 @@ static inline int64_t munmap(const char *p)
 
 /* Abrir un fichero de la tarjeta y quedarselo en un descriptor. */
 static inline int64_t openf(const char *nombre, uint64_t modo)
-                                          { return syscall2(SYS_open, (uint64_t)nombre, modo); }
+                                          { return revisar(syscall2(SYS_open, (uint64_t)nombre, modo)); }
 
 /* Para escribir un driver: pedir que una interrupcion llegue como mensaje,
  * devolverla cuando ya esta atendida, y entregarle al kernel las teclas. */

@@ -102,6 +102,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 45   | La superficie de fichero que espera una libc| hecho  |
 | 46   | Memoria anonima, y el ultimo programa sin IPC| hecho |
 | 47   | La libc crece: setjmp, qsort, strtol        | hecho  |
+| 48   | errno, o hacer que el kernel diga por que   | hecho  |
 
 ## Estructura
 
@@ -147,6 +148,7 @@ Tres cosas que QEMU perdona y el silicio no:
                  crt0.S      _start: lo que corre ANTES de main()
                  stdio.c     printf, snprintf, putchar, puts, getchar
                  string.c    memcpy, memset, strlen, strcmp... las de siempre
+                 errno.c     el motivo del ultimo fallo, y su texto
                  stdlib.c    exit, atoi, qsort, bsearch, strtol
                  setjmp.S    volver a un punto de antes
                  malloc.c    malloc/free de usuario, encima de sbrk
@@ -3386,6 +3388,81 @@ tiene que negarse, no dar un bloque de dos bytes al que desborda.
 `realloc` devuelve la direccion nueva porque puede mover el bloque, y si
 no puede, **el viejo sigue valiendo** -perderlo ahi es un fallo clasico-.
 
+## errno, o hacer que el kernel diga por que
+
+Hasta aqui, **todo** fallo era `-1`. "No existe", "es un directorio", "ya
+existe", "no cabe" y "ese descriptor no es tuyo" se contaban igual, y
+quien preguntaba tenia que adivinar.
+
+Es exactamente la leccion del paso 38 -cuatro errores donde habia uno- un
+nivel mas arriba: entonces fue el protocolo del servidor, ahora las
+llamadas al sistema. La informacion **ya existia** y se perdia por el
+camino: el servidor distinguia cuatro casos desde hace diez pasos, y el
+kernel los aplastaba todos en un `-1`.
+
+**El truco de devolver el error en el valor.** Una llamada devuelve UN
+numero, y el kernel no tiene donde poner un segundo que sea del que llama:
+escribir en su memoria exige un puntero que quiza no ha dado. Asi que se
+aprovecha que ningun resultado legitimo -un tamanyo, un descriptor, una
+posicion- es negativo, y en el rango de -4095 a -1 se meten los codigos.
+
+La libc lo deshace:
+
+```c
+    static inline int64_t revisar(int64_t r)
+    {
+        if (r < 0 && r >= -4095) { errno = (int)-r; return -1; }
+        return r;
+    }
+```
+
+O sea que `errno`, que hoy suena a error de disenyo -informar de un fallo
+escribiendo en una variable global-, **no es como se transporta el error**
+en este sistema: es como se le entrega a un programa que espera un Unix.
+El transporte va dentro del valor, que es donde tiene que ir.
+
+## Siete mensajes donde habia uno
+
+```
+    / $ rm docs
+      docs es un directorio: usa rmdir
+    / $ rm noexiste.txt
+      noexiste.txt: no existe
+    / $ rmdir docs
+      no he podido borrar docs: el directorio tiene cosas dentro
+    / $ rmdir hola.txt
+      no he podido borrar hola.txt: no es un directorio
+    / $ mkdir docs
+      no he podido crear docs: ya existe
+    / $ ls noexiste
+      /noexiste: no existe
+    / $ ls hola.txt
+      /hola.txt: no es un directorio
+```
+
+Y dos de esos siete costaron una transaccion de mas, porque el servidor no
+los distinguia:
+
+- `mkdir` sobre algo que ya esta le sale como "no pude". Se mira si existe,
+  y entonces es `EEXIST`.
+- `rmdir` sobre un FICHERO le sale como "no esta", porque busca solo entre
+  los directorios. Y eso es falso: esta, lo que pasa es que no es un
+  directorio.
+
+Las dos comprobaciones estan **en el camino del error**, que es justo donde
+da igual lo que cuesten.
+
+**Y una que se cae sola.** `rm` preguntaba dos veces -un `stat` para ver si
+era un directorio y luego el `unlink`- porque el fallo no decia por que.
+Eso no era solo feo: entre las dos preguntas el fichero podia cambiar.
+Ahora es una llamada y el motivo viene con ella.
+
+**Un codigo que merece existir por si solo:** `ESPIPE`. Rebobinar una
+tuberia no es un argumento invalido, es una operacion que no tiene sentido
+sobre esa cosa: los bytes ya no estan. Que haya un codigo aparte para eso
+-y no un `EINVAL` generico- es una decision de hace cincuenta anyos que
+sigue siendo util.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -3415,10 +3492,12 @@ no puede, **el viejo sigue valiendo** -perderlo ahi es un fallo clasico-.
   sin el y publica con el otra vez.)
 - El shell no tiene historial, ni segundo plano, ni tuberias de mas de dos,
   ni `>>`: lee, carga, arranca y espera.
-- La libc no tiene `errno` ni ficheros con buffer (`FILE`, `fopen`): se
-  trabaja con descriptores. Es lo siguiente que hace falta.
-- `strtol` no detecta desbordamiento: `strtol("99999999999999999999", ...)`
-  da lo que salga. Hacerlo bien necesita `errno`. `printf` entiende banderas, anchura, precision
+- La libc no tiene ficheros con buffer (`FILE`, `fopen`): se trabaja con
+  descriptores. Es lo siguiente que hace falta.
+- `strtol` sigue sin detectar desbordamiento, aunque ya hay `ERANGE` donde
+  ponerlo.
+- `errno` es una variable global y no una por hilo. Con un solo hilo por
+  proceso da igual; el dia que haya hilos dentro de un proceso, no. `printf` entiende banderas, anchura, precision
   y `l`, pero no notacion exponencial (`%e`, `%g`) ni `long double`.
 - El cambio de contexto de FP es perezoso solo al restaurar. Al salir se
   salva siempre, porque con cuatro nucleos dejar el estado vivo en los

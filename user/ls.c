@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "syscall.h"
 #include "fs_abi.h"
 
@@ -60,7 +61,7 @@ int main(int argc, char **argv)
      * sigue pasando, pero lo hace el kernel y no este programa. */
     int64_t d = opendir(ruta);
     if (d < 0) {
-        printf("  [ls] %s no es un directorio, o no existe\n", ruta);
+        printf("  %s: %s\n", ruta, strerror(errno));
         exit(1);
     }
 

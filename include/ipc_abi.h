@@ -204,6 +204,54 @@ struct estado {
     unsigned long flags;        /* FS_ES_DIR */
 };
 
+/* --- Por que fallo -----------------------------------------------------
+ *
+ * Hasta aqui, TODO fallo era -1. "No existe", "es un directorio", "ya
+ * existe", "no cabe" y "ese descriptor no es tuyo" se contaban igual, y
+ * quien preguntaba tenia que adivinar.
+ *
+ * Es exactamente la leccion del paso 38 -cuatro errores donde habia uno-
+ * un nivel mas arriba: entonces fue el protocolo del servidor, ahora las
+ * llamadas al sistema.
+ *
+ * EL TRUCO DE DEVOLVER EL ERROR EN EL VALOR. Una llamada devuelve UN
+ * numero, y el kernel no tiene donde poner un segundo que sea del que
+ * llama: escribir en su memoria exige un puntero que quiza no ha dado.
+ * Asi que se aprovecha que ningun resultado legitimo cae entre -4095 y
+ * -1, y ahi se meten los codigos. Es lo que hace Linux, y funciona porque
+ * nadie devuelve un tamanyo ni un descriptor negativo.
+ *
+ * La libc lo deshace: si el valor esta en ese rango, lo copia a errno y
+ * devuelve -1, que es lo que espera cualquier programa escrito para un
+ * Unix. Los numeros son los de Linux para que el codigo portado no
+ * extranye nada. */
+#define EPERM             1   /* no te toca a ti                          */
+#define ENOENT            2   /* no existe                                */
+#define ESRCH             3   /* ese proceso no esta                      */
+#define EINTR             4   /* te interrumpio una senyal                */
+#define EIO               5   /* el hardware dijo que no                  */
+#define EBADF             9   /* ese descriptor no es tuyo                */
+#define ECHILD           10   /* no tienes hijos que esperar              */
+#define EAGAIN           11   /* ahora no; vuelve a intentarlo            */
+#define ENOMEM           12   /* no hay memoria                           */
+#define EACCES           13   /* existe, pero no para eso                 */
+#define EFAULT           14   /* ese puntero no vale                      */
+#define EBUSY            16   /* esta ocupado                             */
+#define EEXIST           17   /* ya esta cogido                           */
+#define EXDEV            18   /* eso cruza de volumen                     */
+#define ENODEV           19   /* no hay tal dispositivo                   */
+#define ENOTDIR          20   /* pedias un directorio y no lo es          */
+#define EISDIR           21   /* pedias un fichero y es un directorio     */
+#define EINVAL           22   /* eso que pides no tiene sentido           */
+#define EMFILE           24   /* no te quedan descriptores                */
+#define ENOSPC           28   /* no cabe                                  */
+#define ESPIPE           29   /* eso no se puede rebobinar                */
+#define EPIPE            32   /* al otro lado no hay nadie                */
+#define ERANGE           34   /* el numero no cabe                        */
+#define ENAMETOOLONG     36   /* ese nombre es demasiado largo            */
+#define ENOSYS           38   /* eso no esta hecho                        */
+#define ENOTEMPTY        39   /* el directorio tiene cosas dentro         */
+
 #define O_LEER            0
 #define O_ESCRIBIR        1   /* lo crea, y si ya estaba lo vacia           */
 

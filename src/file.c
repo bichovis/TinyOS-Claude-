@@ -282,27 +282,64 @@ int fs_es_directorio(const char *ruta)
     return (i->flags & FS_ES_DIR) ? 1 : 0;
 }
 
+/* De lo que dice el servidor a lo que entiende un programa.
+ *
+ * El servidor ya distinguia cuatro casos desde el paso 38 -no existe, es
+ * un directorio, no esta vacio, ya existe- y esa informacion se perdia
+ * en el kernel, que lo convertia todo en -1. Aqui se conserva.
+ *
+ * Es la misma leccion dos veces: un error que junta causas distintas
+ * manda a quien lo lee al sitio equivocado. */
+static int motivo_de(uint64_t tipo)
+{
+    switch (tipo) {
+    case FS_OK:              return 0;
+    case FS_ES_DIRECTORIO:   return -EISDIR;
+    case FS_NO_VACIO:        return -ENOTEMPTY;
+    case FS_EXISTE:          return -EEXIST;
+    default:                 return -ENOENT;
+    }
+}
+
 /* Las que solo necesitan el nombre. Todas son la misma frase dicha cuatro
  * veces: manda esta peticion y mira si dijo que si. */
 int fs_borrar(const char *ruta)
 {
     struct message r;
-    if (fs_transaccion(FS_DELETE, ruta, 0, 0, 0, &r) < 0) return -1;
-    return r.type == FS_OK ? 0 : -1;
+    if (fs_transaccion(FS_DELETE, ruta, 0, 0, 0, &r) < 0) return -EIO;
+    return motivo_de(r.type);
 }
 
 int fs_mkdir(const char *ruta)
 {
     struct message r;
-    if (fs_transaccion(FS_MKDIR, ruta, 0, 0, 0, &r) < 0) return -1;
-    return r.type == FS_OK ? 0 : -1;
+    if (fs_transaccion(FS_MKDIR, ruta, 0, 0, 0, &r) < 0) return -EIO;
+
+    /* mkdir sobre algo que ya esta es EEXIST, no ENOENT. El servidor solo
+     * dice FS_ERROR, asi que se mira: es la unica forma de dar el motivo
+     * bueno sin cambiar el protocolo. */
+    if (r.type != FS_OK && fs_estado(ruta, 0, 0, 0) == 0) return -EEXIST;
+    return motivo_de(r.type);
 }
 
 int fs_rmdir(const char *ruta)
 {
     struct message r;
-    if (fs_transaccion(FS_RMDIR, ruta, 0, 0, 0, &r) < 0) return -1;
-    return r.type == FS_OK ? 0 : -1;
+    if (fs_transaccion(FS_RMDIR, ruta, 0, 0, 0, &r) < 0) return -EIO;
+
+    /* El servidor busca solo entre los directorios, asi que un FICHERO le
+     * sale como "no esta". Y eso es falso: esta, lo que pasa es que no es
+     * un directorio. Se distingue preguntando.
+     *
+     * Cuesta una transaccion de mas en el camino del error, que es
+     * justamente donde da igual lo que cueste. */
+    if (r.type != FS_OK) {
+        uint64_t flags = 0;
+        if (fs_estado(ruta, 0, 0, &flags) == 0 && !(flags & FS_ES_DIR))
+            return -ENOTDIR;
+    }
+
+    return motivo_de(r.type);
 }
 
 int fs_renombrar(const char *origen, const char *destino)
@@ -311,15 +348,15 @@ int fs_renombrar(const char *origen, const char *destino)
     while (destino[n] && n < FS_CHUNK - 1) n++;
 
     struct message r;
-    if (fs_transaccion(FS_RENAME, origen, 0, destino, n + 1, &r) < 0) return -1;
-    return r.type == FS_OK ? 0 : -1;
+    if (fs_transaccion(FS_RENAME, origen, 0, destino, n + 1, &r) < 0) return -EIO;
+    return motivo_de(r.type);
 }
 
 int fs_estado(const char *ruta, uint64_t *tam, uint64_t *mtime, uint64_t *flags)
 {
     struct message r;
-    if (fs_transaccion(FS_SIZE, ruta, 0, 0, 0, &r) < 0) return -1;
-    if (r.type != FS_OK) return -1;
+    if (fs_transaccion(FS_SIZE, ruta, 0, 0, 0, &r) < 0) return -EIO;
+    if (r.type != FS_OK) return -ENOENT;
 
     struct fs_info *i = (struct fs_info *)r.data;
     if (tam)   *tam   = i->size;

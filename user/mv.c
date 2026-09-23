@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "syscall.h"
 
 int main(int argc, char **argv)
@@ -35,9 +36,9 @@ int main(int argc, char **argv)
     }
 
     if (rename(argv[1], destino) < 0) {
-        printf("\n  no he podido mover %s\n", argv[1]);
-        printf("  (o no existe, o el destino ya esta cogido, o esta en\n");
-        printf("   otra particion: eso no es renombrar, es copiar)\n");
+        printf("\n  no he podido mover %s: %s\n", argv[1], strerror(errno));
+        if (errno == EEXIST)
+            printf("  (el destino ya esta cogido; no lo machaco)\n");
         return 1;
     }
 

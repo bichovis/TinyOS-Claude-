@@ -9,6 +9,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "syscall.h"
 
 int main(int argc, char **argv)
@@ -21,7 +22,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         int64_t fd = openf(argv[i], O_LEER);
         if (fd < 0) {
-            printf("\n  %s: no esta en la tarjeta\n", argv[i]);
+            printf("\n  %s: %s\n", argv[i], strerror(errno));
             return 1;
         }
 

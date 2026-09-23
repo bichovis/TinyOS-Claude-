@@ -63,7 +63,7 @@ ULDFLAGS := -nostdlib -nostartfiles -T user/user.ld \
 # enlazador saca de ella SOLO los objetos que hagan falta, asi que un
 # programa que no use printf no lo lleva dentro.
 LIBCASM := lib/setjmp.S
-LIBCSRC := lib/string.c lib/stdio.c lib/stdlib.c lib/malloc.c lib/signal.c
+LIBCSRC := lib/errno.c lib/string.c lib/stdio.c lib/stdlib.c lib/malloc.c lib/signal.c
 LIBCOBJ := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIBCSRC)) \
            $(patsubst lib/%.S,$(BUILD)/lib/%.S.o,$(LIBCASM))
 CRT0    := $(BUILD)/lib/crt0.o

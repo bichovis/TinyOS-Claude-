@@ -130,7 +130,7 @@ static int copiar_args(struct args *a, uint64_t uargv)
 static int64_t por_nombre(uint64_t nr, struct trap_frame *f)
 {
     char abs[FS_PATH_MAX];
-    if (traer_ruta(f->x[0], abs) < 0) return -1;
+    if (traer_ruta(f->x[0], abs) < 0) return -EFAULT;
 
     switch (nr) {
     case SYS_unlink: return fs_borrar(abs);
@@ -139,28 +139,35 @@ static int64_t por_nombre(uint64_t nr, struct trap_frame *f)
 
     case SYS_stat: {
         struct estado e = { 0, 0, 0 };
-        if (fs_estado(abs, &e.tam, &e.mtime, &e.flags) < 0) return -1;
-        return copy_to_user(f->x[1], &e, sizeof(e)) == 0 ? 0 : -1;
+        int r = fs_estado(abs, &e.tam, &e.mtime, &e.flags);
+        if (r < 0) return r;
+        return copy_to_user(f->x[1], &e, sizeof(e)) == 0 ? 0 : -EFAULT;
     }
 
     case SYS_opendir: {
+        /* Tres motivos distintos para no poder abrir un directorio, y los
+         * tres mandan a sitios distintos: no esta, no es un directorio, o
+         * ya tienes todos los descriptores cogidos. */
+        uint64_t flags = 0;
+        int r = fs_estado(abs, 0, 0, &flags);
+        if (r < 0) return r;
+        if (!(flags & FS_ES_DIR)) return -ENOTDIR;
+
         struct fichero *fi = file_opendir(abs);
-        if (!fi) return -1;
+        if (!fi) return -ENOMEM;
 
         int fd = task_fd_alloc(fi);
-        if (fd < 0) file_close(fi);
+        if (fd < 0) { file_close(fi); return -EMFILE; }
         return fd;
     }
 
     case SYS_rename: {
-        /* El destino reaprovecha 'rel': ya no hace falta para nada, y son
-         * 256 bytes menos en una pila que va justa. */
         char destino[FS_PATH_MAX];
-        if (traer_ruta(f->x[1], destino) < 0) return -1;
+        if (traer_ruta(f->x[1], destino) < 0) return -EFAULT;
         return fs_renombrar(abs, destino);
     }
     }
-    return -1;
+    return -ENOSYS;
 }
 
 /* exec y spawn, fuera del despachador y por el mismo motivo que
@@ -390,7 +397,7 @@ void syscall_dispatch(struct trap_frame *f)
      * dos numeros escritos en un array suyo. */
     case SYS_pipe: {
         struct fichero *r = 0, *w = 0;
-        if (!user_rango(f->x[0], 2 * sizeof(int))) { ret = -1; break; }
+        if (!user_rango(f->x[0], 2 * sizeof(int))) { ret = -EFAULT; break; }
         if (file_pipe(&r, &w) < 0)                    { ret = -1; break; }
 
         int fr = task_fd_alloc(r);
@@ -420,10 +427,10 @@ void syscall_dispatch(struct trap_frame *f)
         if (path_resolve(current->cwd, rel, abs, sizeof(abs)) < 0) { ret = -1; break; }
 
         struct fichero *fi = file_open(abs, (int)f->x[1]);
-        if (!fi) { ret = -1; break; }
+        if (!fi) { ret = -ENOENT; break; }
 
         ret = task_fd_alloc(fi);
-        if (ret < 0) file_close(fi);     /* no habia descriptor libre */
+        if (ret < 0) { file_close(fi); ret = -EMFILE; }
         break;
     }
 
@@ -535,9 +542,19 @@ void syscall_dispatch(struct trap_frame *f)
         break;
     }
 
-    case SYS_lseek:
-        ret = file_seek(task_fd((int)f->x[0]), (int64_t)f->x[1], (int)f->x[2]);
+    case SYS_lseek: {
+        struct fichero *fi = task_fd((int)f->x[0]);
+        if (!fi) { ret = -EBADF; break; }
+
+        /* Una tuberia no se puede rebobinar: los bytes ya no estan. Eso
+         * no es EINVAL, es ESPIPE, y existe un codigo aparte justo porque
+         * la diferencia importa. */
+        if (fi->tipo != F_FICHERO) { ret = -ESPIPE; break; }
+
+        ret = file_seek(fi, (int64_t)f->x[1], (int)f->x[2]);
+        if (ret < 0) ret = -EINVAL;
         break;
+    }
 
     case SYS_mmap_anon:
         ret = task_mmap_anon(f->x[0]);
