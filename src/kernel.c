@@ -249,6 +249,122 @@ static volatile int verboso;
  * gracias al mutex, pero el kernel tambien escribe desde sitios que no son
  * hilos -un manejador de interrupcion, por ejemplo- y contra eso el mutex
  * no puede hacer nada. */
+/* ====================== CASTIGAR EL MONTON =========================
+ *
+ * Lo que hay que demostrar de un asignador no es que reparta memoria -eso
+ * lo hace cualquiera una vez- sino dos cosas mas dificiles:
+ *
+ *   que la DEVUELVA entera, o se va goteando hasta que no queda
+ *   que FUNDA los trozos vecinos al liberarlos, o la deja picada
+ *
+ * Las dos se miden al final: 'usado' tiene que volver a donde estaba, y la
+ * lista de huecos tiene que quedar corta. Si se reparten mil bloques, se
+ * liberan todos y quedan mil huecos, el asignador no esta fundiendo nada y
+ * el monton esta muerto aunque el contador diga que esta vacio.
+ */
+#define PRUEBA_N   96
+static void    *trozos[PRUEBA_N];
+static uint64_t tamanyos[PRUEBA_N];
+
+static uint64_t siguiente_azar(uint64_t *s)
+{
+    *s = *s * 6364136223846793005UL + 1442695040888963407UL;
+    return *s >> 33;
+}
+
+/* Rellenar y comprobar: cada bloque lleva un patron que depende de su
+ * indice, asi que si un kmalloc devuelve memoria que ya era de otro, se
+ * nota. Sin esto la prueba solo mediria que no revienta. */
+static void marcar(void *p, uint64_t n, uint64_t sello)
+{
+    uint8_t *b = p;
+    for (uint64_t i = 0; i < n; i++) b[i] = (uint8_t)(sello + i);
+}
+
+static int comprobar(void *p, uint64_t n, uint64_t sello)
+{
+    const uint8_t *b = p;
+    for (uint64_t i = 0; i < n; i++)
+        if (b[i] != (uint8_t)(sello + i)) return 0;
+    return 1;
+}
+
+static void linea_monton(const char *que)
+{
+    uint64_t tot, uso, huecos, mayor;
+    kheap_stats(&tot, &uso, &huecos, &mayor);
+
+    uint64_t lf = uart_begin();
+    uart_puts("    ");
+    uart_puts(que);
+    uart_puts("  total ");   uart_dec(tot);
+    uart_puts("  usado ");   uart_dec(uso);
+    uart_puts("  huecos ");  uart_dec(huecos);
+    uart_puts("  mayor ");   uart_dec(mayor);
+    uart_puts("\n");
+    uart_end(lf);
+}
+
+static void prueba_monton(void)
+{
+    uint64_t azar = 20250923;
+    uint64_t uso_antes, tot;
+    kheap_stats(&tot, &uso_antes, 0, 0);
+
+    uart_puts("\n  Castigando el monton:\n");
+    linea_monton("al empezar ");
+
+    /* 1. Repartir de tamanyos muy distintos, para que la lista se pique. */
+    int vivos = 0;
+    for (int i = 0; i < PRUEBA_N; i++) {
+        tamanyos[i] = 8 + siguiente_azar(&azar) % 3000;
+        trozos[i]   = kmalloc(tamanyos[i]);
+        if (trozos[i]) { marcar(trozos[i], tamanyos[i], (uint64_t)i); vivos++; }
+    }
+    linea_monton("96 bloques ");
+
+    /* 2. Soltar uno de cada dos: quedan huecos alternos, que es el peor
+     *    caso para un asignador que no funda. */
+    for (int i = 0; i < PRUEBA_N; i += 2)
+        if (trozos[i]) { kfree(trozos[i]); trozos[i] = 0; }
+    linea_monton("mitad fuera");
+
+    /* 3. Volver a pedir, a ver si reaprovecha esos huecos. */
+    for (int i = 0; i < PRUEBA_N; i += 2) {
+        tamanyos[i] = 8 + siguiente_azar(&azar) % 1500;
+        trozos[i]   = kmalloc(tamanyos[i]);
+        if (trozos[i]) marcar(trozos[i], tamanyos[i], (uint64_t)(i + 100));
+    }
+    linea_monton("rellenado  ");
+
+    /* 4. Comprobar que nadie ha pisado a nadie. */
+    int malos = 0;
+    for (int i = 0; i < PRUEBA_N; i++) {
+        if (!trozos[i]) continue;
+        uint64_t sello = (i % 2 == 0) ? (uint64_t)(i + 100) : (uint64_t)i;
+        if (!comprobar(trozos[i], tamanyos[i], sello)) malos++;
+    }
+
+    /* 5. Y devolverlo todo. */
+    for (int i = 0; i < PRUEBA_N; i++)
+        if (trozos[i]) { kfree(trozos[i]); trozos[i] = 0; }
+    linea_monton("todo fuera ");
+
+    uint64_t uso_despues, huecos;
+    kheap_stats(0, &uso_despues, &huecos, 0);
+
+    uart_puts("\n    bloques repartidos : ");
+    uart_dec((uint64_t)vivos);
+    uart_puts("\n    solapamientos      : ");
+    uart_dec((uint64_t)malos);
+    uart_puts(malos ? "   <- MAL\n" : "\n");
+    uart_puts("    memoria devuelta   : ");
+    uart_puts(uso_despues == uso_antes ? "entera\n" : "SE HA PERDIDO ALGO\n");
+    uart_puts("    huecos al final    : ");
+    uart_dec(huecos);
+    uart_puts(huecos <= 2 ? "   <- fundidos\n" : "   <- picado\n");
+}
+
 static void say(const char *who, const char *what, uint64_t n)
 {
     if (!verboso) return;
@@ -450,6 +566,7 @@ static void menu(void)
     uart_puts("  x - traducciones VA -> PA del kernel\n");
     uart_puts("  j - estado de los cuatro nucleos\n");
     uart_puts("  d - que los hilos de demostracion hablen (o se callen)\n");
+    uart_puts("  g - castigar el monton del kernel (kmalloc/kfree)\n");
     uart_puts("  f - arrancar el SERVIDOR DE FICHEROS (driver SD en EL0)\n"
               "  z - ceder la consola a un interprete de ordenes en EL0\n");
     uart_puts("  o - listar la tarjeta\n");
@@ -588,6 +705,10 @@ static void command(char c)
         if (pid < 0) uart_puts("\n  [kernel] no he podido crearlo\n");
         break;
     }
+
+    case 'g':
+        prueba_monton();
+        break;
 
     case 'd':
         verboso = !verboso;

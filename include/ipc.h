@@ -10,7 +10,7 @@
 struct port {
     int          in_use;
     uint64_t     owner;                  /* pid que puede recibir de el     */
-    struct message q[PORT_QUEUE];
+    struct message *q;                   /* la cola, del monton del kernel  */
     uint32_t     head, tail, count;
     uint64_t     sent, received;
     struct waitqueue receivers;          /* el duenyo, esperando mensaje    */

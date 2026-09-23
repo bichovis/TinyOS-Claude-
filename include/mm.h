@@ -97,10 +97,21 @@
 /* --- Gestor de memoria fisica (pmm.c) --------------------------------- */
 void     pmm_init(uint64_t ram_limit);
 uint64_t pmm_alloc(void);             /* una pagina de 4 KB, 0 si no hay    */
+uint64_t pmm_alloc_contig(uint64_t n);   /* n paginas SEGUIDAS              */
+void     pmm_free_contig(uint64_t pa, uint64_t n);
 void     pmm_free(uint64_t pa);
 uint64_t pmm_total_pages(void);
 uint64_t pmm_free_pages(void);
 uint64_t pmm_used_pages(void);
+
+/* --- El monton del kernel (kheap.c) -----------------------------------
+ * Memoria de tamanyo arbitrario. Por debajo pide paginas contiguas al PMM
+ * y las va partiendo; al liberar funde los trozos vecinos, que es lo que
+ * evita que el monton se pique hasta quedarse sin huecos grandes. */
+void *kmalloc(uint64_t n);
+void  kfree(void *p);
+void  kheap_stats(uint64_t *total, uint64_t *usado,
+                  uint64_t *huecos, uint64_t *mayor);
 
 /* --- Memoria virtual (vmm.c) ------------------------------------------ */
 /* Las tablas del kernel y el encendido de la MMU ya no estan aqui: ocurren

@@ -73,6 +73,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 16   | Procesos en ELF y argumentos                | hecho  |
 | 17   | Un interprete de ordenes en EL0             | hecho  |
 | 18   | Escritura en FAT16                          | hecho  |
+| 19   | kmalloc: el monton del kernel               | hecho  |
 
 ## Estructura
 
@@ -102,6 +103,7 @@ Tres cosas que QEMU perdona y el silicio no:
     config.txt   lo que la GPU lee antes de arrancar la CPU
     switch.S     cambio de contexto (solo registros callee-saved)
     pmm.c        reparte la RAM en paginas de 4 KB (bitmap)
+    kheap.c      el monton: memoria de tamanyo arbitrario sobre el PMM
     vmm.c        tablas de traduccion de 3 niveles y espacios de usuario
     elf.h        lo justo de ELF64 para cargar un programa
     smp.c        despierta los nucleos 1-3 y el demo del contador
@@ -628,6 +630,54 @@ Borrar, por cierto, es poner un `0xE5` en la primera letra del nombre y
 devolver los clusters. Los datos siguen ahi intactos — y por eso se pueden
 recuperar ficheros borrados mientras nadie escriba encima.
 
+## El monton del kernel
+
+Hasta aqui el kernel solo sabia repartir paginas de 4 KB. Todo lo que
+necesitaba otro tamanyo se declaraba como un array estatico, y con eso se
+fijaba un techo para siempre: `MAX_TASKS`, `MAX_PORTS`, `MAX_ARGS`.
+
+El diseño es el de toda la vida: una lista de los trozos libres, una
+cabecera pequenya delante de cada uno, y dos operaciones inversas. `kmalloc`
+busca el primer hueco donde quepa y lo parte si sobra mucho; `kfree` lo
+devuelve y lo **funde** con sus vecinos.
+
+Fundir es la mitad que se olvida, y es la que decide si el monton dura. Sin
+fundir, cada pareja de reserva y liberacion deja la lista un poco mas
+picada: al cabo de un rato hay memoria libre de sobra pero ningun hueco lo
+bastante grande. Eso es la fragmentacion, y es una forma de quedarse sin
+memoria teniendola.
+
+Por eso la lista esta ordenada **por direccion** y no por tamanyo: asi los
+vecinos en memoria son vecinos en la lista, y fundirlos es mirar si el de al
+lado empieza justo donde acaba este.
+
+El comando `g` lo castiga a proposito — reparte 96 bloques de tamanyos
+dispares, suelta uno de cada dos (huecos alternos, el peor caso) y vuelve a
+pedir:
+
+    al empezar   total 0       usado 0       huecos 0
+    96 bloques   total 196608  usado 139008  huecos 1
+    mitad fuera  total 196608  usado 68400   huecos 49
+    rellenado    total 196608  usado 110608  huecos 43
+    todo fuera   total 196608  usado 0       huecos 1   mayor 196608
+
+Los **49 huecos vuelven a ser uno solo** de 192 KB. Eso, y que `usado`
+regrese a cero exacto, es lo unico que hay que comprobar de un asignador:
+que devuelva la memoria entera y que la funda. Cada bloque lleva ademas un
+patron que depende de su indice, asi que si un `kmalloc` entregara memoria
+que ya era de otro, se veria.
+
+Su primer cliente de verdad son las colas de los puertos IPC, que con
+mensajes de 128 bytes eran 10 KB de `.bss` reservados siempre. Ahora se
+piden al crear el puerto y se devuelven al morir su duenyo: tras arrancar
+el sistema entero, el monton dice `usado 2464`, que son exactamente las dos
+colas vivas con sus cabeceras.
+
+**Orden de cerrojos**, que ahora son tres: `sched_lock` antes que
+`heap_lock`, y `heap_lock` antes que el del PMM. La cola de un puerto se
+pide ANTES de coger el del planificador, porque `kmalloc` puede tener que ir
+a por paginas y borrar 64 KB, y eso con los otros tres nucleos parados no.
+
 ## Limitaciones conocidas
 
 - `sched_lock` es un cerrojo grande: protege la tabla de tareas, las colas
@@ -653,6 +703,12 @@ recuperar ficheros borrados mientras nadie escriba encima.
   kernel y el driver vive en EL0.
 - Un mensaje lleva 48 bytes, asi que cargar un programa de 4 KB son 86
   idas y venidas por el IPC. Funciona y se nota.
+- El monton busca el primer hueco que valga, recorriendo la lista: es O(n)
+  y basta a esta escala. Lo siguiente serian listas por tamanyos.
+- El monton nunca le devuelve paginas al PMM. Crece y no encoge.
+- `pmm_alloc_contig()` busca n paginas seguidas recorriendo el bitmap, asi
+  que se vuelve lenta si la memoria se fragmenta. Cuando duela, lo que hay
+  que traer es un asignador por compañeros ("buddy").
 - El planificador no tiene ni prioridades ni afinidad: una tarea se ejecuta
   en el primer nucleo que la mire. Es una eleccion, no un olvido — con esta
   carga no hay nada que priorizar.

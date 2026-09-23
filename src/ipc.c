@@ -16,6 +16,7 @@
  */
 #include <stdint.h>
 #include "ipc.h"
+#include "mm.h"
 #include "sched.h"
 #include "irq.h"
 #include "spinlock.h"
@@ -45,12 +46,19 @@ void ipc_init(void)
  * el invento se vendria abajo el dia que se arranque al reves. */
 int port_create(uint64_t owner_pid, int64_t want)
 {
+    /* La cola se pide ANTES de coger el cerrojo del planificador: kmalloc
+     * puede tener que ir al gestor de paginas y borrar 64 KB, y eso con
+     * los otros tres nucleos parados no. */
+    struct message *cola = kmalloc(sizeof(struct message) * PORT_QUEUE);
+    if (!cola) return -1;
+
     uint64_t f = sched_lock_irqsave();
     int id = -1;
 
     if (want >= 0) {
         if (want < MAX_PORTS && !ports[want].in_use) {
             struct port *p = &ports[want];
+            p->q      = cola;
             p->in_use = 1;
             p->owner  = owner_pid;
             p->head = p->tail = p->count = 0;
@@ -60,12 +68,14 @@ int port_create(uint64_t owner_pid, int64_t want)
             id = (int)want;
         }
         sched_unlock_irqrestore(f);
+        if (id < 0) kfree(cola);         /* el puerto estaba cogido */
         return id;
     }
 
     for (int i = 0; i < MAX_PORTS; i++) {
         if (!ports[i].in_use) {
             struct port *p = &ports[i];
+            p->q      = cola;
             p->in_use = 1;
             p->owner  = owner_pid;
             p->head = p->tail = p->count = 0;
@@ -78,6 +88,7 @@ int port_create(uint64_t owner_pid, int64_t want)
     }
 
     sched_unlock_irqrestore(f);
+    if (id < 0) kfree(cola);             /* no habia ni un puerto libre */
     return id;
 }
 
@@ -143,6 +154,12 @@ void ipc_release_ports(uint64_t pid)
             ports[i].in_use = 0;
             wq_wake_all(&ports[i].senders);
             wq_wake_all(&ports[i].receivers);
+
+            /* Y devolver la cola. Se coge heap_lock teniendo sched_lock, y
+             * ese orden es el bueno: nadie pide el del planificador
+             * teniendo el del monton, asi que no hay abrazo posible. */
+            kfree(ports[i].q);
+            ports[i].q = 0;
         }
     }
 }

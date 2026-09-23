@@ -37,11 +37,13 @@ static inline void mark_used(uint64_t pfn) { bitmap[pfn / 64] |=  (1UL << (pfn %
 static inline void mark_free(uint64_t pfn) { bitmap[pfn / 64] &= ~(1UL << (pfn % 64)); }
 static inline int  is_used(uint64_t pfn)   { return (bitmap[pfn / 64] >> (pfn % 64)) & 1; }
 
+static uint64_t last_page;       /* la primera que ya no existe */
+
 void pmm_init(uint64_t ram_limit)
 {
     if (ram_limit == 0 || ram_limit > RAM_MAX)
         ram_limit = RAM_MAX;
-    uint64_t last_page = ram_limit / PAGE_SIZE;
+    last_page = ram_limit / PAGE_SIZE;
 
     /* Todo ocupado de entrada; luego liberamos lo que de verdad es nuestro. */
     for (uint64_t i = 0; i < BITMAP_WORDS; i++)
@@ -114,3 +116,60 @@ void pmm_free(uint64_t pa)
 uint64_t pmm_total_pages(void) { return total; }
 uint64_t pmm_used_pages(void)  { return used;  }
 uint64_t pmm_free_pages(void)  { return total - used; }
+
+/* --- Paginas contiguas ------------------------------------------------
+ *
+ * pmm_alloc() reparte de una en una y no promete nada sobre donde caen.
+ * Para el monton del kernel hace falta otra cosa: un trozo seguido, porque
+ * un objeto de 6 KB tiene que caber entero en direcciones consecutivas.
+ *
+ * La busqueda es tonta a proposito -recorre el bitmap mirando si hay n
+ * huecos seguidos- y eso la hace lenta cuando la memoria esta fragmentada.
+ * Se puede permitir porque solo se llama cuando el monton se queda corto,
+ * que con trozos de 64 KB es muy de vez en cuando. Si algun dia duele, lo
+ * que hay que traer es un asignador por compañeros ("buddy").
+ */
+uint64_t pmm_alloc_contig(uint64_t n)
+{
+    if (n == 0) return 0;
+
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+
+    for (uint64_t inicio = first_page; inicio + n <= last_page; inicio++) {
+        uint64_t i = 0;
+        while (i < n && !is_used(inicio + i)) i++;
+
+        if (i < n) {                       /* topamos con una ocupada */
+            inicio += i;                   /* y saltamos hasta ella */
+            continue;
+        }
+
+        for (uint64_t k = 0; k < n; k++) mark_used(inicio + k);
+        used += n;
+
+        uint64_t pa = inicio * PAGE_SIZE;
+        spin_unlock_irqrestore(&pmm_lock, flags);
+
+        /* El borrado, fuera del cerrojo: ya son nuestras. */
+        uint64_t *p = phys_to_virt(pa);
+        for (uint64_t i2 = 0; i2 < n * PAGE_SIZE / 8; i2++) p[i2] = 0;
+        return pa;
+    }
+
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return 0;
+}
+
+void pmm_free_contig(uint64_t pa, uint64_t n)
+{
+    uint64_t pfn = pa / PAGE_SIZE;
+
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    for (uint64_t k = 0; k < n; k++) {
+        if (pfn + k < first_page || pfn + k >= last_page) continue;
+        if (!is_used(pfn + k)) continue;
+        mark_free(pfn + k);
+        used--;
+    }
+    spin_unlock_irqrestore(&pmm_lock, flags);
+}
