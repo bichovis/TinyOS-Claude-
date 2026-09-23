@@ -173,6 +173,14 @@ static struct mutex console;
 /* syscall.c tambien imprime, y tiene que compartir el mismo mutex. */
 struct mutex *console_mutex(void) { return &console; }
 
+/* Los hilos de demostracion de los pasos 5 y 6 siguen trabajando siempre,
+ * pero callados. Cuando eran lo unico que habia, su cháchara ERA la
+ * demostracion; ahora tapan todo lo demas. El comando 'd' los hace hablar.
+ *
+ * Lo que siguen enseñando sin decir palabra: 'l' que estan vivos y en que
+ * nucleo, 'c' el contador compartido, 'k' el canal productor/consumidor. */
+static volatile int verboso;
+
 /* El mutex serializa los HILOS; el uart_begin/end serializa los NUCLEOS.
  * No es lo mismo ni sobra ninguno: dos hilos nunca entran a la vez aqui
  * gracias al mutex, pero el kernel tambien escribe desde sitios que no son
@@ -180,6 +188,8 @@ struct mutex *console_mutex(void) { return &console; }
  * no puede hacer nada. */
 static void say(const char *who, const char *what, uint64_t n)
 {
+    if (!verboso) return;
+
     mutex_lock(&console);
     uint64_t f = uart_begin();
     uart_puts("    [");
@@ -360,6 +370,7 @@ static void menu(void)
     uart_puts("  r - pagina de solo lectura (FATAL: fallo de permisos)\n");
     uart_puts("  x - traducciones VA -> PA del kernel\n");
     uart_puts("  j - estado de los cuatro nucleos\n");
+    uart_puts("  d - que los hilos de demostracion hablen (o se callen)\n");
     uart_puts("  w - los 4 nucleos contra un contador (con y sin cerrojo)\n");
     uart_puts("  b - medir velocidad de la memoria\n");
     uart_puts("  t - tiempo e interrupciones\n");
@@ -448,6 +459,12 @@ static void command(char c)
 
     case 'r':
         demo_readonly();
+        break;
+
+    case 'd':
+        verboso = !verboso;
+        uart_puts(verboso ? "\n  Los hilos hablan.\n"
+                          : "\n  Los hilos se callan. Siguen trabajando.\n");
         break;
 
     case 'j':
