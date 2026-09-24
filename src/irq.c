@@ -264,7 +264,7 @@ int irq_ack(uint64_t irq)
  * significa "ya lo tiene todo". */
 static volatile int klog_avisado;
 
-static void klog_avisar(void)
+void klog_avisar(void)
 {
     int h = hueco_de(IRQ_UART);
     if (h < 0) return;                    /* la UART la lleva el kernel */

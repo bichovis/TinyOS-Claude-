@@ -1036,23 +1036,98 @@ static int hid_sondear(struct hid_ep *e, uint8_t *out)
     return -1;
 }
 
-/* Del "usage" del teclado boot a un caracter, para lo que cabe en una tabla
- * pequenya. Lo que no cabe se ensenya como numero. */
-static char hid_tecla(int usage, int shift)
+/* --- Del "usage" a un byte para la consola ---------------------------------
+ *
+ * El informe boot trae posiciones de tecla, no letras: el 4 es la tecla
+ * donde un teclado americano tiene la 'a'. Traducir es cosa del anfitrion, y
+ * por eso el mismo teclado escribe distinto en cada sistema. Esta tabla es la
+ * distribucion americana, que es la que la norma usa para nombrar las
+ * teclas; la espanyola cambia una docena de posiciones y se anyade cuando
+ * haga falta.
+ *
+ * Lo que sale de aqui es lo mismo que mandaria un terminal por la UART: el
+ * Enter es '\n', borrar es 127, Escape es 27, y Ctrl con una letra es esa
+ * letra menos 64. Asi la disciplina de linea del kernel no distingue de
+ * donde vino la tecla, que es la idea. */
+static const char tabla_sin[] =
+    "abcdefghijklmnopqrstuvwxyz1234567890\n\x1b\x7f\t -=[]\\#;'`,./";
+static const char tabla_con[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\n\x1b\x7f\t _+{}|~:\"~<>?";
+
+static char hid_tecla(int usage, int shift, int ctrl, int mayusculas)
 {
-    if (usage >= 4 && usage <= 29)  return (char)((shift ? 'A' : 'a') + usage - 4);
-    if (usage >= 30 && usage <= 38) return shift ? "!@#$%^&*("[usage - 30] : (char)('1' + usage - 30);
-    if (usage == 39) return shift ? ')' : '0';
-    if (usage == 40) return '\n';
-    if (usage == 42) return 8;                   /* borrar */
-    if (usage == 43) return '\t';
-    if (usage == 44) return ' ';
-    if (usage == 45) return shift ? '_' : '-';
-    if (usage == 46) return shift ? '+' : '=';
-    if (usage == 54) return shift ? '<' : ',';
-    if (usage == 55) return shift ? '>' : '.';
-    if (usage == 56) return shift ? '?' : '/';
-    return 0;
+    if (usage < 4 || usage > 56) return 0;          /* fuera de la tabla */
+    int letra = (usage <= 29);
+    if (letra && mayusculas) shift = !shift;         /* bloq mayus solo afecta a letras */
+    char c = (shift ? tabla_con : tabla_sin)[usage - 4];
+    if (ctrl && letra) c = (char)((c & 0x1F));       /* Ctrl-A = 1 ... Ctrl-Z = 26 */
+    return c;
+}
+
+/* Un informe del teclado boot convertido en bytes para la consola.
+ *
+ * El informe dice que teclas ESTAN pulsadas, no cuales se acaban de pulsar:
+ * comparar con el anterior es lo que convierte "la a sigue abajo" en nada y
+ * "la a acaba de bajar" en una 'a'. Y como el teclado no repite, lo hace el
+ * anfitrion: media segundo abajo y la ultima tecla se repite treinta veces
+ * por segundo, que es lo que uno espera al dejar el dedo puesto. */
+static uint8_t tecla_antes[8];
+static int     tecla_quieta;            /* sondeos con el informe igual */
+static int     tecla_ultima;            /* la ultima que bajo, para repetir */
+
+static int teclado_traducir(const uint8_t *inf, char *out)
+{
+    int n = 0;
+    int shift = (inf[0] & 0x22) != 0, ctrl = (inf[0] & 0x11) != 0;
+    static int mayusculas;
+
+    int igual = 1;
+    for (int k = 0; k < 8; k++) if (inf[k] != tecla_antes[k]) igual = 0;
+
+    if (igual) {
+        /* Repeticion: a partir de medio segundo, cada tres sondeos. */
+        if (tecla_ultima && ++tecla_quieta >= 50 && (tecla_quieta % 3) == 0) {
+            char c = hid_tecla(tecla_ultima, shift, ctrl, mayusculas);
+            if (c) out[n++] = c;
+        }
+        return n;
+    }
+    tecla_quieta = 0;
+
+    for (int k = 2; k < 8; k++) {
+        int u = inf[k];
+        if (!u) continue;
+        int ya = 0;
+        for (int j = 2; j < 8; j++) if (tecla_antes[j] == u) ya = 1;
+        if (ya) continue;                              /* sigue pulsada */
+
+        if (u == 57) { mayusculas = !mayusculas; continue; }   /* bloq mayus */
+        char c = hid_tecla(u, shift, ctrl, mayusculas);
+        if (c) { out[n++] = c; tecla_ultima = u; }
+    }
+
+    /* Si la que se repetia ya no esta, se acabo la repeticion. */
+    int sigue = 0;
+    for (int j = 2; j < 8; j++) if (inf[j] == tecla_ultima) sigue = 1;
+    if (!sigue) tecla_ultima = 0;
+
+    for (int k = 0; k < 8; k++) tecla_antes[k] = inf[k];
+    return n;
+}
+
+/* Entregar a la consola lo que se ha tecleado. Ctrl-C y Ctrl-Z no son bytes,
+ * son ordenes, y las da el kernel: a quien le toca es cosa suya. El resto va
+ * a la disciplina de linea por la misma puerta que las teclas de la UART. */
+static void teclado_entregar(const char *b, int n)
+{
+    char plano[8];
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (b[i] == 3)       { if (m) { console_push(plano, m); m = 0; } console_int();  continue; }
+        if (b[i] == 26)      { if (m) { console_push(plano, m); m = 0; } console_stop(); continue; }
+        plano[m++] = b[i];
+    }
+    if (m) console_push(plano, m);
 }
 
 /* --- Lo demas de la configuracion ------------------------------------- */
@@ -1631,28 +1706,22 @@ int main(int argc, char **argv)
      * el hardware; aqui lo hace un proceso, que es la razon de que solo sirva
      * para teclados y ratones y no para nada que pida mas de cien preguntas
      * por segundo. */
-    printf("  [usb] escuchando el teclado: pulsa algo\n");
+    printf("  [usb] teclado USB listo: lo que teclees va a la consola\n");
 
-    uint8_t inf[64], antes[8] = { 0 };
+    uint8_t inf[64];
     unsigned vueltas = 0;
     for (;;) {
-        if (++vueltas % 200 == 0)
+        if (detallado && ++vueltas % 200 == 0)
             printf("  [usb] sondeos: %u con datos, %u NAK, %u NYET, %u sin respuesta, %u error\n",
                    sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error);
 
         int n = hid_sondear(&teclado, inf);
-        if (n >= 8) {
-            int shift = (inf[0] & 0x22) != 0;
-            for (int k = 2; k < 8; k++) {
-                int u = inf[k];
-                if (!u) continue;
-                int ya = 0;
-                for (int j = 2; j < 8; j++) if (antes[j] == u) ya = 1;
-                if (ya) continue;                      /* sigue pulsada */
-                char c = hid_tecla(u, shift);
-                if (c) printf("%c", c); else printf("[%02x]", u);
-            }
-            for (int k = 0; k < 8; k++) antes[k] = inf[k];
+        if (n >= 8 || (n == 0 && tecla_ultima)) {
+            /* Con datos, o sin ellos pero con una tecla abajo: en el segundo
+             * caso el informe no ha cambiado y lo que toca es repetir. */
+            char teclas[8];
+            int t = teclado_traducir(n >= 8 ? inf : tecla_antes, teclas);
+            if (t) teclado_entregar(teclas, t);
         } else if (n < 0) {
             printf("  [usb] el teclado ha fallado al sondearlo\n");
             sleep(50);

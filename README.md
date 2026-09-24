@@ -6591,6 +6591,73 @@ En QEMU, con `-device usb-kbd` y `sendkey` desde el monitor, el driver imprime
 las teclas (ahi no hay hub ni particion: prueba solo el camino corto). Lo
 partido solo se puede probar en la placa.
 
+## Un teclado de verdad
+
+Imprimir las teclas por `printf` demostraba que llegaban. Un teclado no es
+eso: un teclado es lo que hace que el shell reciba `ls` y lo ejecute. Este
+paso quita el `printf` y mete las teclas donde estaban las de la UART.
+
+### La misma puerta
+
+La disciplina de linea vive en el kernel desde el paso en que el conserver
+se fue a EL0: el conserver saca los bytes de la UART y se los da con
+`console_push`, y el kernel hace lo demas -acumular la linea, el eco, borrar,
+Ctrl-U, Ctrl-D-. Los procesos leen con `read()` y no saben de donde vino.
+
+Eso es exactamente lo que necesita un segundo teclado. El driver de USB
+traduce el informe HID a los MISMOS bytes que mandaria un terminal por el
+cable -Enter es `\n`, borrar es 127, Escape es 27, Ctrl con una letra es la
+letra menos 64- y los entrega por la misma puerta. A la disciplina de linea,
+al shell y a `vi` no ha habido que tocarles nada: `ls` desde el USB y `ls`
+desde la UART son indistinguibles a partir de `console_push`. Ctrl-C y
+Ctrl-Z tampoco cambian: el driver ve la tecla y llama a `console_int` o
+`console_stop`, y el kernel decide a quien le cae, igual que con el
+conserver.
+
+### Quien puede ser el teclado
+
+Con un solo teclado nadie se hizo esta pregunta, y `console_push` la podia
+llamar cualquiera. Con dos, hay que contestarla: meter teclas en la consola
+es decir "esto lo ha tecleado el usuario", y un programa cualquiera que
+pudiera escribirle `rm -r /` al shell no seria un teclado, seria un agujero.
+
+La respuesta es la que ya usaba `SYS_klog`: puede quien TIENE el
+dispositivo, es decir, quien se ha quedado su interrupcion. `es_teclado()`
+es "duenyo de la IRQ de la UART o de la del USB", y `console_push`,
+`console_int` y `console_stop` contestan `-EPERM` a todos los demas. `malo`
+lo comprueba: "console_push siendo un programa normal: -1 (no te toca a ti)".
+La lista de las dos IRQ sigue escrita a mano, por la misma razon de siempre.
+
+### El eco no espera al tick
+
+El eco de una tecla lo escribe el kernel, y desde el paso 59 lo que escribe
+el kernel va al anillo y lo saca el conserver. Cuando las teclas venian del
+conserver no habia problema: vaciaba el anillo el mismo al volver. Con las
+del USB, el conserver no sabia que habia eco esperando y salia al siguiente
+tick: diez milisegundos entre pulsar y ver la letra, que al teclear se
+notan. Ahora `uart_push` llama a `klog_avisar()` al terminar, cuando ya no
+tiene ningun cerrojo cogido, y el conserver recibe el `CMSG_KLOG` en el
+acto. Es la misma funcion que llama el tick; solo cambia quien avisa.
+
+### Lo que hace el anfitrion y no el teclado
+
+El informe boot dice que teclas ESTAN abajo, no cuales acaban de bajar:
+comparar con el anterior convierte "la a sigue pulsada" en nada y "la a
+acaba de bajar" en una `a`. Y el teclado no repite: lo hace el anfitrion,
+medio segundo abajo y treinta por segundo, que es lo que uno espera al dejar
+el dedo puesto. Bloq Mayus es una tecla mas que el driver recuerda. La tabla
+es la distribucion americana, la que la norma usa para nombrar las
+posiciones; la espanyola mueve una docena y se anyade cuando toque.
+
+### La prueba
+
+En QEMU, con `-device usb-kbd` y el monitor (`sendkey`): `echo usb` tecleado
+en el USB ejecuta y contesta `usb`; `echo Hola` con Shift, `Hola`; un
+`lento 9 x` muere con Ctrl-C ("termina por la senyal 2") y un `wc` se para
+con Ctrl-Z ("[1] parado (Ctrl-Z)"), y `jobs` por la UART lo ve. La UART
+sigue funcionando igual. En la placa, lo partido: es el mismo camino con la
+temporizacion del paso 65b debajo.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -6681,8 +6748,8 @@ partido solo se puede probar en la placa.
   compita con un volcado.
 - Un mensaje del kernel puede tardar hasta 10 ms en salir: el aviso al duenyo
   de la consola va en el tick del reloj, porque avisar donde se escribe
-  romperia el orden de cerrojos. El eco no paga ese precio -el conserver vacia
-  el anillo en la misma vuelta en que entrega las teclas- pero un `[kernel]`
+  romperia el orden de cerrojos. El eco no paga ese precio -`uart_push` avisa
+  al conserver nada mas meter las teclas, ya sin cerrojos- pero un `[kernel]`
   suelto, si.
 - El anillo del kernel son 4 KB y no se puede leer desde un programa: solo lo
   saca quien tiene la UART. No hay `dmesg`, aunque ya hay donde ponerlo.
@@ -6764,11 +6831,16 @@ partido solo se puede probar en la placa.
 - La memoria de DMA se pide y no se devuelve hasta que el proceso muere: no
   hay `dma_free`. Un driver la pide al arrancar y la tiene para siempre, que
   es lo que hace un driver, pero no es una regla que el kernel imponga.
-- El tick son 10 ms, y las transferencias partidas del USB piden 125 us. Eso
-  NO bloquea la red -el LAN9514 es de alta velocidad y no usa transferencias
-  partidas- pero si bloquea cualquier dispositivo de baja o completa velocidad
-  enchufado por fuera: un teclado USB necesita una fuente de tiempo fina y
-  separada del planificador, y el driver de la Fundacion usa una FIQ para eso.
+- El teclado USB se sondea desde un proceso cada tick (10 ms), y cada sondeo
+  partido espera a mano a la micro-trama 7 mirando `HFNUM`: hasta un
+  milisegundo de espera activa por sondeo. Para un teclado y un raton sobra;
+  para audio isocrono no valdria, y ahi si haria falta que lo llevara una
+  interrupcion (o la FIQ que usa el driver de la Fundacion). Lo que dije
+  antes -que un teclado necesitaba esa FIQ- no era verdad: las particiones
+  se hacen sincronas, y funciona.
+- La distribucion del teclado USB es la americana. Las flechas y el teclado
+  numerico no estan en la tabla. El raton esta descubierto y configurado, pero
+  nadie lo sondea todavia.
 - El driver de USB no pide ninguna interrupcion todavia: `GINTMSK` esta a cero
   y se pregunta mirando los registros. La IRQ 9 esta reclamada y sin usar.
 - La direccion que se le da al DWC2 lleva el alias `0xC0000000` y ese alias

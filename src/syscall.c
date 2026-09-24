@@ -260,6 +260,16 @@ static int64_t sys_recv(uint64_t port, uint64_t umsg)
     return 0;
 }
 
+/* ¿Puede este proceso hablar en nombre del usuario? Solo si lleva un
+ * dispositivo de entrada: la UART o el USB. La lista es la misma que la de
+ * las interrupciones reclamables, y por la misma razon: esta escrita a mano
+ * porque aun no hay arbol de dispositivos que la escriba. */
+static int es_teclado(void)
+{
+    uint64_t pid = current ? current->pid : 0;
+    return irq_es_duenyo(IRQ_UART, pid) || irq_es_duenyo(IRQ_USB, pid);
+}
+
 void syscall_dispatch(struct trap_frame *f)
 {
     uint64_t nr = f->x[8];
@@ -660,7 +670,15 @@ void syscall_dispatch(struct trap_frame *f)
         ret = irq_ack(f->x[0]);
         break;
 
+    /* Meter teclas en la consola. Hasta ahora podia hacerlo cualquiera, y
+     * no importaba porque solo lo hacia uno. Con un segundo teclado -el
+     * USB- la pregunta pasa a tener respuesta: puede decir "el usuario ha
+     * tecleado esto" quien TIENE un teclado, que es quien se ha quedado la
+     * interrupcion de un dispositivo de entrada. Un proceso cualquiera que
+     * pudiera meter "rm -r /" en la linea del shell no seria un teclado,
+     * seria un agujero. */
     case SYS_console_push: {
+        if (!es_teclado()) { ret = -EPERM; break; }
         char tmp[64];
         uint64_t n = f->x[1];
         if (n > sizeof(tmp)) n = sizeof(tmp);
@@ -676,6 +694,7 @@ void syscall_dispatch(struct trap_frame *f)
      * del kernel. De ahi el reparto: el driver detecta la tecla, el kernel
      * decide a quien le cae. */
     case SYS_console_int:
+        if (!es_teclado()) { ret = -EPERM; break; }
         task_console_interrupt();
         ret = 0;
         break;
@@ -685,6 +704,7 @@ void syscall_dispatch(struct trap_frame *f)
      * a proposito: la lista de lo que un driver puede provocar esta escrita
      * en el kernel, y no la elige quien llama. */
     case SYS_console_stop:
+        if (!es_teclado()) { ret = -EPERM; break; }
         task_console_stop();
         ret = 0;
         break;

@@ -55,6 +55,18 @@ int main(int argc, char **argv)
     printf("  dma_alloc siendo un programa normal : %ld (%s)\n",
            (long)dma_alloc(4, &pa), strerror(errno));
 
+    /* --- Y la del paso 66: hablar en nombre del usuario ------------------
+     *
+     * Meter teclas en la consola es decir "esto lo ha tecleado el usuario".
+     * Solo puede quien tiene un teclado, es decir, quien lleva un dispositivo
+     * de entrada. Este programa no lleva ninguno: si esto no fallara, podria
+     * escribirle "rm -r /" al shell y firmarlo como si fuera David. */
+    printf("\n  --- y hacerse pasar por el teclado, que tampoco ---\n");
+    printf("  console_push siendo un programa normal : %ld (%s)\n",
+           (long)console_push("rm -r /\n", 8), strerror(errno));
+    printf("  console_int  siendo un programa normal : %ld (%s)\n",
+           (long)console_int(), strerror(errno));
+
     printf("\n  --- y sigo vivo para contarlo ---\n");
     return 0;
 }

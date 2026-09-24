@@ -665,6 +665,15 @@ void uart_push(const char *buf, uint64_t n)
     wq_wake_all(&rx_waiters);
     sched_unlock_irqrestore(f);
 
+    /* El eco de esas teclas acaba de entrar en el anillo del kernel, y si
+     * nadie avisa sale al siguiente tick: diez milisegundos, que al teclear
+     * se notan. Cuando las teclas vienen del conserver da igual -vacia el
+     * anillo el mismo al volver-, pero cuando vienen de otro driver, como el
+     * de USB, el conserver no sabe que hay algo que sacar. Se lo dice el
+     * kernel, que es quien ha escrito el eco. Aqui ya no hay ningun cerrojo
+     * cogido, que es la condicion para poder llamarlo. */
+    klog_avisar();
+
     /* El anillo son 64 bytes y quien lee va a su ritmo. Si llega mas de lo
      * que cabe, sobra, y lo que sobra SE TIRA: no hay a donde meterlo y no
      * hay forma de decirle al otro lado que pare, porque no hay control de
