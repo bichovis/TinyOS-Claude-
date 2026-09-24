@@ -6412,11 +6412,41 @@ enseguida -el pendrive emulado es de velocidad completa y el driver se para ahi
 diciendolo-. La Ethernet del LAN9514 es de alta, y por eso hasta aqui no ha hecho
 falta.
 
+### Y en la placa, a la primera
+
+```
+  [usb] el hub ya es la direccion 1
+  [usb] configuracion 1 puesta: 41 bytes de descriptores, 1 interfaz
+  [usb] hub de 5 puertos, caracteristicas 0x000d, corriente buena a los 100 ms
+  [usb] puerto 1: 0x0101/0x0001 alimentado, HAY ALGO (completa)
+  [usb] puerto 3: 0x0101/0x0001 alimentado, HAY ALGO (completa)
+  [usb] puerto 1 reseteado, alta velocidad; le pregunto quien es
+  [usb] descriptor: 12 01 00 02 ff 00 01 40 24 04 00 ec 00 02 00 00 00 01
+  [usb] direccion 0: es 0424:ec00, clase 255, USB 2.00, paquete maximo 64
+  [usb] 0424:ec00 es la Ethernet del LAN9514. Ahi esta la red.
+```
+
+Cinco puertos: cuatro de fuera y uno interno, y en el interno la Ethernet, con
+clase 255 -*vendor*, o sea "hablame en mi idioma y no en el de nadie"-.
+
+Dos detalles del log valen mas que el resultado. El puerto 1 decia *completa*
+**antes** del reset y *alta* **despues**: es el *chirp* ocurriendo dentro del
+reset del hub, el mismo que en el puerto raiz costo medio paso, visto aqui desde
+el otro lado. Y el puerto 3 tiene algo enchufado a velocidad completa: cuando
+haya que hablar con eso, haran falta las transferencias partidas.
+
+El testigo por transferencia -recibidos, `HCDMA`, el SETUP releido- se queda en
+el codigo pero deja de imprimirse: fue lo que destapo la L2 de la VideoCore y se
+guarda para el siguiente dispositivo que no conteste. Con la conversacion
+funcionando son dos lineas por peticion, y lo normal no se anuncia.
+
 ### Lo que falta
 
 La Ethernet en la direccion 0 con su descriptor leido: darle direccion y
-configuracion, leer sus endpoints bulk, y hablarle en su idioma, que ya no es el
-del USB sino el del LAN9514.
+configuracion, leer su descriptor de configuracion para encontrar los endpoints
+bulk, y hablarle en su idioma, que ya no es el del USB sino el del LAN9514: sus
+registros se leen y escriben con peticiones *vendor* por el endpoint 0, y las
+tramas van por bulk con una cabecera propia delante.
 
 ## Limitaciones conocidas
 

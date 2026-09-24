@@ -218,6 +218,7 @@ static int dma_bus = 1;
 
 /* Lo que quedo en el canal al detenerse la ultima transferencia. */
 static uint32_t ultimo_hctsiz, ultimo_hcdma;
+static int      detallado;           /* 1 = contar cada transferencia */
 
 static volatile uint32_t *reg;
 
@@ -583,8 +584,13 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
 
     /* El testigo: lo que el chip dice que recibio, contra lo que se pidio. En
      * este ejemplar el campo de tamanyo son 16 bits (max_transfer_size 65535
-     * en Linux), asi que se enmascara a eso. */
-    {
+     * en Linux), asi que se enmascara a eso.
+     *
+     * Ya no se imprime por defecto. Fue lo que destapo la L2 de la VideoCore y
+     * se queda a mano -'detallado'- para el siguiente dispositivo que no
+     * conteste; pero con la conversacion funcionando, son dos lineas por cada
+     * peticion y la regla de esta casa es que lo normal no se anuncia. */
+    if (detallado) {
         int paquetes  = (bytes + mps - 1) / mps;
         int programado = paquetes * mps;
         int restante  = (int)(ultimo_hctsiz & 0xFFFF);
