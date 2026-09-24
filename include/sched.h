@@ -120,6 +120,19 @@ struct task {
     uint64_t    pgid;
     int64_t     exit_code;    /* lo que devolvio al morir                    */
 
+    /* Por que esta parado, y si ya se ha contado.
+     *
+     * Las dos son del HIJO y no del que pregunta, que es donde las lleva un
+     * Unix: "esta parada ya se aviso" es un hecho sobre el proceso, no sobre
+     * quien mira. Con un solo padre por hijo da igual; el dia que dos
+     * pudieran esperar al mismo, solo uno se enteraria.
+     *
+     * 'parada_avisada' se limpia en task_parar, o sea en cada parada nueva.
+     * Asi una que se repite -SIGCONT y otro SIGTTIN despues- vuelve a ser
+     * noticia, y la misma no lo es dos veces. */
+    int         parada_sig;   /* la senyal que lo detuvo                     */
+    int         parada_avisada; /* 1 si un waitpid ya conto esta parada      */
+
     /* Sus descriptores. El 0 es la entrada, el 1 la salida, y quien los
      * pone no es el programa sino quien lo arranco. */
     struct fichero *fd[MAX_FD];
@@ -224,12 +237,12 @@ void task_yield(void);           /* ceder la CPU voluntariamente            */
 void task_sleep(uint64_t ticks);
 void task_exit(void);
 void task_exit_con(int64_t codigo);   /* y apunta lo que devolvio */
-/* Espera y recoge su salida. Devuelve 0 y deja el codigo en 'codigo' y en
- * 'que' el W_SALIDA o W_PARADO correspondiente, o un errno negativo:
- * -EINTR si una senyal corto la espera, -EAGAIN si se pidio WNOHANG y ese
- * proceso sigue vivo, -ECHILD si no hay tal hijo. Con PID_CUALQUIERA vale
- * cualquiera de los hijos del que pregunta. */
-int  task_wait(int64_t pid, int64_t *codigo, int *que, int banderas);
+/* Espera y recoge su salida. Devuelve el PID del hijo del que hay
+ * noticias, y deja en 'que' el W_SALIDA o W_PARADO y en 'codigo' el numero
+ * que corresponda a ese 'que'. O un errno negativo: -EINTR si una senyal
+ * corto la espera, -EAGAIN si se pidio WNOHANG y no hay nada que contar,
+ * -ECHILD si no hay tal hijo. Con PID_CUALQUIERA vale cualquiera. */
+int64_t task_wait(int64_t pid, int64_t *codigo, int *que, int banderas);
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
 int  task_exec(const uint8_t *image, uint64_t size, const struct args *args,
@@ -282,7 +295,7 @@ int  task_dar_consola(uint64_t pgid);          /* y quien puede darla */
 int  task_signal_grupo(uint64_t pgid, int sig); /* a todo un trabajo */
 int  task_en_primer_plano(void);               /* ¿el mio tiene la consola? */
 void task_console_stop(void);                  /* lo llama el driver con Ctrl-Z */
-int  task_parar(void);                         /* detenerse aqui mismo */
+int  task_parar(int sig);                       /* detenerse aqui mismo */
 int64_t task_get_pgid(uint64_t pid);
 uint64_t task_console_pid(void);               /* ...y quien la tiene ahora */
 void task_console_interrupt(void);             /* lo llama uart.c con Ctrl-C*/

@@ -60,7 +60,7 @@ struct message {
 #define SYS_spawn        11    /* (buffer, bytes, argv[], envp[]) -> pid|-1*/
 #define SYS_clock_rate   12    /* (id) -> Hz de un reloj de la placa        */
 #define SYS_read         13    /* (fd, buffer, bytes) -> leidos | 0 | -1    */
-#define SYS_waitpid      14    /* (pid, banderas) -> codigo de salida       */
+#define SYS_waitpid      14    /* (pid, banderas, &que, &codigo) -> pid     */
 
 /* Esperar sin esperar. Sin esto, un shell con trabajos en segundo plano no
  * puede enterarse de que uno ha terminado sin quedarse bloqueado en el, y
@@ -85,15 +85,34 @@ struct message {
  * algo que no es un pid, sin salirse del numero. */
 #define PID_CUALQUIERA   (-1)
 
-/* Que le paso al proceso por el que preguntabas.
+/* --- Las TRES cosas que tiene que contestar waitpid -------------------
  *
- * waitpid tiene que contestar DOS cosas -que ocurrio y con que numero- y
- * un solo entero no da para las dos. Unix lo resolvio metiendolas en el
- * mismo valor y repartiendo bits, que es por lo que hay que desmontarlo
- * con WIFEXITED y companyia y por lo que nadie se acuerda de como va.
- * Aqui van por separado, que cuesta un puntero y se entiende leyendolo. */
-#define W_SALIDA          0   /* termino solo; el valor es su codigo        */
-#define W_PARADO          1   /* NO ha terminado: esta detenido             */
+ * Empezo contestando una -el codigo de salida- y cada vez que le faltaba
+ * algo se vio donde: primero "que paso", porque parado no es terminado, y
+ * ahora QUIEN, porque sin eso PID_CUALQUIERA no sirve para nada mas que
+ * enterrar. Son tres, y en un entero no caben.
+ *
+ * El pid va en el valor de retorno, y eso no es solo por identificar al
+ * hijo: es lo que separa el canal de los errores del de los datos. Un pid
+ * es siempre positivo y un errno siempre negativo, asi que no se pisan.
+ * Mientras ahi iba el codigo de salida NO era verdad -un hijo que saliera
+ * con -11 era indistinguible de un -EAGAIN, y uno al que matara una senyal
+ * sale con -1, que es -EPERM- y era una ambiguedad sin arreglo posible,
+ * porque las dos cosas necesitaban todo el rango.
+ *
+ * Unix devuelve el pid por lo mismo, y mete "que paso" y "con que numero"
+ * en el mismo status repartiendo bits, que es por lo que hay que
+ * desmontarlo con WIFEXITED y companyia y por lo que nadie se acuerda de
+ * como va. Aqui esos dos van en dos punteros, que cuesta un argumento y se
+ * entiende leyendolo.
+ *
+ * Y el tercero cambia de significado segun el segundo, igual que en Unix:
+ * el numero de un W_SALIDA es lo que devolvio, y el de un W_PARADO es la
+ * senyal que lo paro. No es un ahorro de sitio, es que para un proceso
+ * detenido "con que numero acabo" no quiere decir nada y "quien te paro"
+ * si. */
+#define W_SALIDA          0   /* termino solo; el numero es su codigo      */
+#define W_PARADO          1   /* NO ha terminado: el numero es la senyal   */
 #define SYS_sbrk         15    /* (delta) -> tope viejo del monton          */
 #define SYS_fork         16    /* () -> pid del hijo en el padre, 0 en el hijo */
 #define SYS_freepages    17    /* () -> paginas de 4 KB libres en el sistema */

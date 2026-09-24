@@ -181,7 +181,10 @@ static int64_t consola_read(uint64_t uva, uint64_t n)
             task_signal(current->pid, SIGTTIN);
             return -EINTR;
         }
-        if (task_parar() < 0) return -EINTR;   /* lo estan matando */
+        /* Y se para POR SIGTTIN, que es lo que luego contestara el
+         * waitpid del padre. Sin decirlo aqui, la lista de trabajos no
+         * puede distinguir esto de un Ctrl-Z. */
+        if (task_parar(SIGTTIN) < 0) return -EINTR;   /* lo estan matando */
     }
 
     /* -EINTR y no -1 a secas.

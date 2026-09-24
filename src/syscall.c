@@ -597,22 +597,30 @@ void syscall_dispatch(struct trap_frame *f)
     case SYS_waitpid: {
         int64_t codigo = -1;
         int     que    = W_SALIDA;
-        int     r      = task_wait((int64_t)f->x[0], &codigo, &que,
+        int64_t r      = task_wait((int64_t)f->x[0], &codigo, &que,
                                   (int)f->x[1]);
 
-        /* El "que paso" va aparte, en memoria del que pregunta, porque en
-         * el valor de retorno ya no cabe: ahi esta el numero. Si no da un
-         * sitio donde escribirlo, es que no le interesa. */
-        if (r == 0 && f->x[2]) {
+        /* El "que paso" y "con que numero" van aparte, en memoria del que
+         * pregunta, porque en el valor de retorno esta el pid. Si no da un
+         * sitio donde escribirlos, es que no le interesan.
+         *
+         * Y no se escribe nada si la respuesta es un error: un -EAGAIN no
+         * trae ni que ni numero, y dejarle al programa lo que hubiera en
+         * esas variables seria peor que no tocarlas. */
+        if (r > 0 && f->x[2]) {
             if (!user_rango(f->x[2], sizeof(int))) { ret = -EFAULT; break; }
             if (copy_to_user(f->x[2], &que, sizeof(int)) != 0) { ret = -EFAULT; break; }
         }
 
-        /* El errno pasa por delante del codigo de salida: -EAGAIN quiere
-         * decir "no ha terminado", que no es lo mismo que "termino
-         * devolviendo -11". Con el convenio del paso 48 los dos caben en
-         * el mismo numero sin pisarse. */
-        ret = (r < 0) ? r : codigo;
+        if (r > 0 && f->x[3]) {
+            if (!user_rango(f->x[3], sizeof(int64_t))) { ret = -EFAULT; break; }
+            if (copy_to_user(f->x[3], &codigo, sizeof(int64_t)) != 0) { ret = -EFAULT; break; }
+        }
+
+        /* El pid, o el errno. Y ahora no se pisan: el primero es siempre
+         * positivo y el segundo siempre negativo, que es media razon de que
+         * Unix devuelva el pid aqui. */
+        ret = r;
         break;
     }
 

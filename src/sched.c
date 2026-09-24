@@ -1299,11 +1299,22 @@ int task_signal_grupo(uint64_t pgid, int sig)
  * Que esto sea una funcion y no dos copias importa: lo llaman el
  * repartidor de senyales -para un Ctrl-Z- y la lectura del teclado -para
  * un SIGTTIN-, y son dos caminos muy distintos hasta la misma decision. */
-int task_parar(void)
+int task_parar(int sig)
 {
     uint64_t flags = sched_lock_irqsave();
 
     current->state = TASK_STOPPED;
+
+    /* Quien lo paro, y que esta parada esta sin contar.
+     *
+     * Lo segundo se limpia AQUI y no al reanudar, y es lo que hace que una
+     * parada se avise una vez y solo una: cada vez que se para de verdad
+     * hay algo nuevo que decir, y mientras siga parado no. Ponerlo al
+     * reanudar habria necesitado saber que alguien lo reanudo, que es
+     * precisamente el suceso que aqui no existe (no hay WCONTINUED). */
+    current->parada_sig     = sig;
+    current->parada_avisada = 0;
+
     avisar_al_padre(current);       /* y esto es la NOTICIA de que se paro */
     wq_wake_all(&exit_wq);          /* que el padre se entere ANTES */
     schedule_locked();
@@ -1480,7 +1491,7 @@ void signal_deliver(struct trap_frame *f)
          * siempre: el hijo no ha muerto -asi que no despierta a nadie- y
          * tampoco va a volver a correr. Los dos esperando al otro. */
         if (!h && ES_PARADA(s)) {
-            task_parar();
+            task_parar(s);
             continue;                    /* al volver, mirar si queda algo */
         }
 
@@ -1642,17 +1653,28 @@ static struct task *hijo_con_noticias(int64_t pid, int banderas, int *hijos)
 
         *hijos = 1;
 
-        if (t->state == TASK_ZOMBIE)                             return t;
-        if (t->state == TASK_STOPPED && (banderas & WUNTRACED))  return t;
+        if (t->state == TASK_ZOMBIE) return t;
+
+        /* Y una parada solo cuenta MIENTRAS ESTE SIN CONTAR.
+         *
+         * Sin esto, un bucle de "preguntame por cualquiera hasta que no
+         * quede nada" no acabaria nunca: un hijo parado contestaria en cada
+         * vuelta, siempre lo mismo, y quien pregunta no tendria forma de
+         * distinguir "otra noticia" de "la misma otra vez". Un zombi se
+         * recoge y desaparece de la lista; una parada no desaparece -el
+         * proceso sigue ahi, y parado- asi que hace falta apuntar aparte
+         * que ya se dijo. */
+        if (t->state == TASK_STOPPED && (banderas & WUNTRACED) &&
+            !t->parada_avisada) return t;
     }
 
     return 0;
 }
 
-int task_wait(int64_t pid, int64_t *codigo, int *que, int banderas)
+int64_t task_wait(int64_t pid, int64_t *codigo, int *que, int banderas)
 {
     uint64_t flags = sched_lock_irqsave();
-    int      ret   = 0;
+    int64_t  ret   = 0;
 
     /* Con WNOHANG NO se apunta la espera. 'waiting_for' existia para que
      * Ctrl-C supiera a quien seguir, y ya no sirve para eso; lo que si
@@ -1674,6 +1696,7 @@ int task_wait(int64_t pid, int64_t *codigo, int *que, int banderas)
 
         if (t && t->state == TASK_ZOMBIE) {
             if (codigo) *codigo = t->exit_code;
+            ret = (int64_t)t->pid;         /* QUIEN, antes de desheredarlo */
 
             /* Recogido. Ahora si se lo puede llevar el recolector: el
              * zombi existia precisamente para que su padre leyera esto.
@@ -1701,8 +1724,17 @@ int task_wait(int64_t pid, int64_t *codigo, int *que, int banderas)
          * Y NO se recoge: un proceso parado no es un zombi, va a volver.
          * Lo unico que se hace es contarlo. */
         if (t) {                           /* parado, que es lo que queda */
-            if (codigo) *codigo = 0;
+            /* El numero de un W_PARADO es la senyal que lo paro, no un
+             * codigo de salida que no existe. Es lo que permite distinguir
+             * "lo paraste tu con Ctrl-Z" de "intento leer el teclado desde
+             * el fondo", que en la lista de trabajos se veian igual. */
+            if (codigo) *codigo = (int64_t)t->parada_sig;
             if (que)    *que    = W_PARADO;
+
+            /* Contada. El proceso sigue parado, asi que lo unico que impide
+             * volver a contarla es esto. */
+            t->parada_avisada = 1;
+            ret = (int64_t)t->pid;
             break;
         }
 
@@ -2133,6 +2165,8 @@ int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
     t->sig_fp       = 0;
     t->sig_tramp    = 0;
     t->reanudable   = 0;
+    t->parada_sig      = 0;
+    t->parada_avisada  = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
     /* Y sin coma flotante, por lo mismo. Lo que hubiera en esos registros
@@ -2309,6 +2343,8 @@ int task_fork(struct trap_frame *f)
      * quedaria puesta para siempre. */
     t->reanudable   = 0;
     t->waiting_for  = 0;
+    t->parada_sig      = 0;   /* el hijo nace corriendo, no parado */
+    t->parada_avisada  = 0;
     t->parent       = padre->pid;
 
     /* El grupo se hereda, como el directorio actual: un hijo forma parte
@@ -2419,6 +2455,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->sig_tramp    = 0;
     t->reanudable   = 0;
     t->waiting_for  = 0;
+    t->parada_sig      = 0;
+    t->parada_avisada  = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
     /* Nace sin FPU. Si la quiere, que la pida atrapando. */

@@ -129,24 +129,35 @@ static inline int64_t fork(void)          { return syscall2(SYS_fork, 0, 0); }
 static inline void *sbrk(int64_t delta)
 { return (void *)(uint64_t)syscall2(SYS_sbrk, (uint64_t)delta, 0); }
 
-/* Esperar a que termine un proceso y recoger su codigo de salida. Vuelve
- * -1 si ya no existe o si nos interrumpio una senyal. */
+/* --- Esperar a un hijo, la completa -----------------------------------
+ *
+ * Devuelve el PID de aquel del que hay noticias, o un errno negativo. Las
+ * otras dos respuestas van por puntero, y los dos se pueden dejar a cero si
+ * no interesan:
+ *
+ *   que    -> W_SALIDA (termino) o W_PARADO (sigue ahi, detenido)
+ *   codigo -> con W_SALIDA, lo que devolvio; con W_PARADO, la senyal que lo
+ *             paro
+ *
+ * Con PID_CUALQUIERA vale cualquier hijo, y es ahora cuando eso sirve para
+ * algo: mientras el pid no se devolvia, "cualquiera" solo se podia usar para
+ * enterrar, porque no habia forma de saber de quien eran las noticias. */
+static inline int64_t esperar(int64_t pid, int *que, int64_t *codigo,
+                              int banderas)
+{ return syscall4(SYS_waitpid, (uint64_t)pid, (uint64_t)banderas,
+                  (uint64_t)que, (uint64_t)codigo); }
+
+/* Bloquear hasta que ese hijo termine, sin preguntar nada mas. Es lo que
+ * quiere quien se bifurco para hacer una cosa y espera a que este hecha. */
 static inline int64_t waitpid(int64_t pid)
-{ return syscall3(SYS_waitpid, (uint64_t)pid, 0, 0); }
+{ return esperar(pid, 0, 0, 0); }
 
-/* Esperar sabiendo QUE paso. 'que' recibe W_SALIDA o W_PARADO, porque un
- * proceso detenido no ha terminado y confundir las dos cosas hace que
- * quien espera siga adelante dejando atras algo que sigue existiendo. */
-static inline int64_t waitpid_que(int64_t pid, int *que, int banderas)
-{ return syscall3(SYS_waitpid, (uint64_t)pid, (uint64_t)banderas, (uint64_t)que); }
-
-/* Preguntar sin quedarse esperando. Devuelve el codigo de salida, o
- * -EAGAIN si ese proceso sigue vivo. Es lo que necesita un shell para
- * enterarse de que un trabajo de segundo plano ha terminado sin bloquearse
- * en el, y de paso para recogerlo: un hijo que nadie espera se queda de
- * zombi. */
-static inline int64_t waitpid_ya(int64_t pid)
-{ return syscall3(SYS_waitpid, (uint64_t)pid, WNOHANG, 0); }
+/* Preguntar sin quedarse esperando: -EAGAIN si no hay nada que contar,
+ * -ECHILD si no hay hijos. Es lo que necesita un shell para enterarse de que
+ * un trabajo de segundo plano ha cambiado sin bloquearse en el, y de paso
+ * para recogerlo: un hijo que nadie espera se queda de zombi. */
+static inline int64_t waitpid_ya(int64_t pid, int *que, int64_t *codigo)
+{ return esperar(pid, que, codigo, WNOHANG | WUNTRACED); }
 
 /* El grupo, o sea el trabajo. Con pid 0 se refiere a uno mismo, y con
  * pgid 0 el grupo pasa a llamarse como el propio pid: "formo el mio". */

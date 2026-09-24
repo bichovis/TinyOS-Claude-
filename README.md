@@ -4803,6 +4803,172 @@ Ctrl-Z sobre un hijo de primer plano no cambia, y no porque se haya tenido
 cuidado: la senyal va al GRUPO que tiene la consola, que en ese momento es el
 del hijo y no el del shell. El manejador nuevo no se entera de que existe.
 
+## waitpid tiene que contestar tres cosas
+
+Esta llamada empezo contestando una sola: el codigo de salida. Cada vez que
+le faltaba algo se vio donde, y siempre igual -alguien intentando usarla para
+algo razonable y descubriendo que la respuesta no daba-.
+
+Primero falto **que paso**, en el paso 52: "parado" no es "terminado", y un
+waitpid que las confundiera hacia que el shell siguiera adelante dejando
+atras un proceso vivo con sus ficheros abiertos. Se arreglo con un puntero de
+salida, `que`, en vez de repartir bits como Unix.
+
+Y en el paso 54 falto **quien**. Puse `PID_CUALQUIERA` porque hacia falta
+-un manejador de SIGCHLD no puede preguntar por un pid concreto, porque la
+senyal dice que algo cambio y no que cambio- y el resultado fue un mecanismo
+a medias: se sabia que habia noticias, pero no de quien. Solo servia para
+enterrar. El shell tuvo que seguir recorriendo su tabla de trabajos con pids
+concretos, y el barrido de los hijos que no estaban en la tabla quedo como un
+segundo bucle aparte.
+
+Son tres, y en un entero no caben.
+
+### El pid no es solo el pid: es el canal de los errores
+
+Devolver el pid parece un detalle de comodidad y es dos cosas a la vez, y la
+segunda es la que de verdad estaba rota.
+
+Mientras en el valor de retorno iba el codigo de salida, ese valor tenia que
+transportar dos cosas incompatibles: un codigo, que puede ser cualquier
+numero con su signo, y un errno, que es negativo por convenio desde el paso
+48. Se pisaban. Un hijo que saliera con -11 era indistinguible de un
+`-EAGAIN`, y no era un caso rebuscado: **un proceso al que mata una senyal
+sale con -1, que es exactamente `-EPERM`**. Lo tenia apuntado en las
+limitaciones con un "el barrido lo soporta porque equivocarse ahi solo le
+cuesta acabar una vuelta antes", que es la clase de frase que uno escribe
+cuando sabe que algo esta mal y no ve como arreglarlo.
+
+Y no se podia arreglar, porque las dos cosas necesitaban todo el rango.
+
+Un pid, no. Un pid es siempre positivo. Asi que en el momento en que el valor
+de retorno es un pid, el negativo queda libre entero para los errores y la
+ambiguedad no es que se resuelva: **deja de poder existir**. Los dos
+problemas -no saber quien, y no poder distinguir un codigo de un fallo- se
+van con el mismo cambio, y ahora entiendo que Unix devuelva el pid aqui.
+Siempre habia dado por hecho que era para identificar al hijo.
+
+```c
+/* (pid, banderas, &que, &codigo) -> pid | -errno */
+```
+
+Los otros dos van por puntero y se pueden dejar a cero si no interesan.
+`waitpid(pid)` a secas -bloquear hasta que ese hijo acabe, que es lo que
+quieren `libc`, `anyadir`, `fp`, `forkd` e `init`- sigue siendo una linea.
+
+### El tercero cambia de significado segun el segundo
+
+`codigo` con un `W_SALIDA` es lo que devolvio el proceso. Con un `W_PARADO`
+no puede ser eso, porque un proceso detenido no ha devuelto nada: es **la
+senyal que lo paro**. Es lo mismo que hace Unix con `WEXITSTATUS` y
+`WSTOPSIG` sobre el mismo status, solo que sin tener que desmontar bits.
+
+No es un ahorro de sitio. Es que para un proceso parado "con que numero
+acabo" no quiere decir nada y "quien te paro" si, y hasta ahora ahi iba un
+cero. De eso sale una cosa que se ve:
+
+```
+/ $ wc &
+  [1] en el fondo  wc
+/ $ jobs
+  [1] parado (queria el teclado)  9  wc
+
+/ $ lento 9 pausa
+  [pausa] 1 de 9
+^Z
+  [2] parado (Ctrl-Z)  lento 9 pausa
+```
+
+Las dos decian "parado" y son situaciones distintas: la segunda la pediste tu
+y se arregla con `fg` cuando te apetezca; la primera es un programa que esta
+esperando algo que solo `fg` le puede dar. Si la lista no te dice por que
+esta parado, no te dice que te esta esperando.
+
+### Una parada solo es noticia una vez
+
+Esto no lo quise anyadir: hizo falta, y el sitio donde hizo falta lo dice
+mejor que ninguna explicacion.
+
+Con el pid en la respuesta, lo natural es darle la vuelta al bucle del shell:
+en vez de recorrer la tabla preguntando por cada pid que creemos que existe,
+preguntar "¿de quien hay noticias?" y buscar despues a quien pertenece. Un
+bucle que llama a `waitpid(PID_CUALQUIERA)` hasta que no quede nada.
+
+Y ese bucle no acababa nunca. Un zombi se recoge y desaparece de la lista de
+candidatos, pero **una parada no desaparece**: el proceso sigue ahi, y sigue
+parado, y con `WUNTRACED` volvia a contestar en cada vuelta. Siempre lo
+mismo, y quien pregunta sin forma de distinguir "otra noticia" de "la misma
+otra vez".
+
+Estaba apuntado en las limitaciones desde el paso 52 -"`WUNTRACED` avisa cada
+vez que se pregunta, no solo la primera; un Unix lo lleva en el propio
+proceso"- y ahi se quedaba porque el shell lo tapaba anunciandolo solo al
+cambiar de estado. Se tapaba mientras el shell recorriera su propia tabla, o
+sea mientras supiera de antemano a quien preguntaba. En cuanto el que decide
+de quien hablar es el kernel, la tapa no vale.
+
+Asi que son dos campos en el hijo, y el detalle esta en cuando se limpia el
+segundo:
+
+```c
+    current->parada_sig     = sig;
+    current->parada_avisada = 0;
+```
+
+Se limpia en `task_parar`, o sea **cada vez que se para de verdad**, y no al
+reanudarlo. Lo natural habria sido lo otro -"ya no esta parado, asi que la
+proxima parada sera noticia"- y no se puede: reanudarse no es un suceso que
+aqui exista. Nadie pasa por ningun sitio cuando un proceso vuelve a correr,
+porque volver a correr es que el planificador lo elija, que no es un evento
+que nadie observe. Poniendolo al pararse sale gratis y sale bien: si se para,
+si se reanuda y si se vuelve a parar, la segunda parada es noticia otra vez.
+Comprobado con un Ctrl-Z, un `fg` y otro Ctrl-Z.
+
+Y las dos son del hijo, no del que pregunta, que es donde las lleva un Unix:
+"esta parada ya se conto" es un hecho sobre el proceso.
+
+### Dos bucles que se convierten en uno
+
+Con el pid y con la parada que solo se cuenta una vez, las dos funciones del
+paso 54 dejan de tener motivo para ser dos:
+
+- `recoger()` recorria la tabla de trabajos, un waitpid por pid conocido.
+- `barrer_ajenos()` barria con `PID_CUALQUIERA` lo que la tabla no conocia
+  -el noveno trabajo de fondo, el que no cupo y que nadie iba a enterrar-.
+
+Eran dos bucles, dos formas de preguntar, y la lista de a quien preguntar
+escrita en un sitio distinto del que decidia que hacer con la respuesta.
+Ahora es uno: se pregunta de quien hay noticias, se busca a quien pertenece
+el pid, y si no pertenece a nadie se ignora -que ya esta enterrado con solo
+haber preguntado, y era todo lo que se le debia-.
+
+```c
+        int64_t quien = waitpid_ya(PID_CUALQUIERA, &que, &codigo);
+        if (quien < 0) return;           /* -EAGAIN o -ECHILD: ya esta */
+
+        struct trabajo *t = trabajo_de((uint64_t)quien);
+        if (!t) continue;                /* uno que nadie apunto */
+```
+
+Ese `quien < 0` es el canal de errores separado en una sola linea: antes
+habia que comparar contra `-EAGAIN` y contra `-ECHILD` uno por uno, y aun asi
+un codigo de salida desafortunado podia colarse por ahi.
+
+El barrido no es que se haya quitado: es que ha dejado de ser codigo. Sale
+del mismo bucle, y eso es lo que suele pasar cuando una respuesta empieza a
+traer la informacion que le faltaba.
+
+### Lo que sigue sin haber
+
+No hay `WCONTINUED`, o sea que "ha seguido" no es una noticia. El shell se
+entera de las paradas y de las muertes, pero si alguien reanima un trabajo
+con un `kill -18` a mano, la lista seguira diciendo que esta parado. No le
+afecta al uso normal porque los unicos SIGCONT que existen aqui los manda el
+propio shell -`fg` y `bg`- y esos si los apunta el, pero antes de este paso
+lo acertaba por casualidad: el bucle viejo preguntaba por todos sus pids en
+cada vuelta y veia que ese seguia vivo. Un bucle que reacciona a sucesos solo
+sabe de los sucesos que hay.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -4854,14 +5020,6 @@ del hijo y no el del shell. El manejador nuevo no se entera de que existe.
   muere entre las dos llamadas -un Ctrl-C mientras pide la contrasenya-
   el terminal se queda como lo dejo. Un Unix tampoco lo arregla solo:
   por eso existe el `stty sane` que todos hemos tecleado a ciegas.
-- Un trabajo parado por `SIGTTIN` no dice por que esta parado: la lista
-  ensenya "parado" igual que si lo hubieras parado tu con Ctrl-Z. `waitpid`
-  contesta W_PARADO pero no cual fue la senyal.
-- `WUNTRACED` avisa de que un proceso esta parado cada vez que se
-  pregunta, no solo la primera. El shell lo tapa anunciandolo solo al
-  cambiar de estado; un Unix lo lleva en el propio proceso. Y es lo que
-  impide barrer con `PID_CUALQUIERA | WUNTRACED`: un hijo parado contestaria
-  en cada vuelta y el bucle no acabaria.
 - La contraprueba de `anyadir` depende del tiempo: pierde 19 lineas de 60
   en QEMU y 7 en la Pi, con la misma ventana. Si algun dia dejara de
   perder ninguna, no seria que el `lseek` se ha arreglado, seria que la
@@ -4872,19 +5030,18 @@ del hijo y no el del shell. El manejador nuevo no se entera de que existe.
   letra: `lento a | lento b` saca las dos lineas trenzadas. El descriptor
   de consola no tiene cerrojo, y ponerselo no bastaria mientras el kernel
   y el `conserver` sigan siendo dos drivers sobre la misma UART.
-- `waitpid` con `PID_CUALQUIERA` no dice QUIEN ha sido: devuelve el codigo
-  de salida, y el pid no cabe en el mismo numero. El de Unix devuelve el pid
-  y pone el estado aparte, que es justo la forma de poder usarlo para llevar
-  una lista de trabajos. Aqui solo sirve para lo que no hace falta
-  identificar -enterrar-, y el shell sigue recorriendo su tabla con pids
-  concretos para todo lo demas.
-- Un codigo de salida negativo se confunde con un errno. `waitpid` devuelve
-  los dos en el mismo entero, asi que un hijo que salga con -11 es
-  indistinguible de un `-EAGAIN`, y de hecho un proceso al que mata una
-  senyal sale con -1, que es `-EPERM`. El barrido lo soporta porque
-  equivocarse ahi solo le cuesta acabar una vuelta antes, y el prompt
-  siguiente barre otra vez; para cualquier otra cosa habria que separar los
-  dos como se separo el "que paso".
+- No hay `WCONTINUED`: "ha seguido" no es un suceso que nadie observe, asi
+  que un `kill -18` a mano deja la lista diciendo "parado" de algo que corre.
+  Los unicos SIGCONT de aqui los manda el propio shell con `fg` y `bg`, y
+  esos si los apunta. Y no se puede arreglar como las paradas, porque
+  reanudarse es que el planificador te elija, no un sitio por el que se pase.
+- `parada_avisada` es un bit del HIJO y no del que pregunta, igual que en
+  Unix. Con un padre por hijo da igual; si dos pudieran esperar al mismo,
+  solo uno se enteraria de la parada.
+- `esperar` con `PID_CUALQUIERA` no sabe elegir por grupo. Unix tiene
+  `waitpid(-pgid)` -"cualquiera de ese trabajo"- y aqui el signo ya esta
+  gastado en distinguir el pid de "cualquiera", asi que harian falta
+  banderas. Con trabajos de dos procesos como mucho, no hace falta.
 - No hay `sigprocmask`: una senyal no se puede bloquear, solo atrapar o no.
   El shell lo suple con una variable que apaga su propio manejador mientras
   espera en primer plano, y el precio es que esa senyal se pierde. Funciona
