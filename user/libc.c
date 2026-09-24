@@ -216,6 +216,29 @@ static void prueba_buffer(void)
     printf("  2000 caracteres sin cubo:  2000 llamadas a write()\n");
     printf("  o sea %lu veces menos viajes al kernel\n", 2000 / (con ? con : 1));
 
+    /* --- Y un stream SIN cubo, que es otra cosa --------------------------
+     *
+     * stderr no guarda nada: lo que se le escribe sale en el acto, y eso es lo
+     * que se quiere de una salida de errores -si el programa se muere a la
+     * linea siguiente, el mensaje ya esta fuera-.
+     *
+     * Pero "en el acto" no quiere decir "letra a letra". Hasta el paso 60
+     * estaba implementado asi, un viaje al kernel por byte, y eso es lo que
+     * hacia que dos procesos escribiendo a la vez salieran trenzados: entre
+     * dos de los treinta viajes de una linea cabe el otro proceso entero.
+     *
+     * Ahora un fprintf entero es UN viaje. Sigue sin guardar nada entre
+     * llamadas, que es lo que el estandar pide; lo que ya no hace es trocear
+     * lo que se le da de una pieza. */
+    antes = stdio_escrituras;
+    fprintf(stderr, "  esta linea de stderr son %d caracteres\n", 42);
+    unsigned long sinbuf = stdio_escrituras - antes;
+
+    printf("  un fprintf a stderr (sin cubo): %lu llamada%s a write()\n",
+           sinbuf, sinbuf == 1 ? "" : "s");
+    if (sinbuf != 1)
+        printf("  MAL: deberia ser una sola\n");
+
     /* Orden. Antes de este paso printf tenia su propio cubo y fputs
      * escribia al descriptor: lo segundo salia ANTES que lo primero. */
     printf("  orden: uno");

@@ -5553,6 +5553,97 @@ Y queda el kernel escribiendo en crudo durante el arranque, que es correcto:
 cuando se imprime el rotulo no existe ni un proceso, y no hay con quien
 competir.
 
+## "Sin cubo" no quiere decir letra a letra
+
+El paso 59 dejo la consola con un solo escritor y dejo una cosa a medias: dos
+procesos escribiendo a la vez seguian mezclandose. Ya no se perdia nada -pasan
+por el mismo anillo y el anillo tiene cerrojo- pero `lento a | lento b` salia
+con las dos lineas trenzadas.
+
+Fui a ponerle un cerrojo al descriptor de consola, que es lo que las
+limitaciones decian que faltaba. Y antes de escribirlo mire por donde sale ese
+texto, porque `lento` escribe a `stderr` a proposito. Esto es lo que habia:
+
+```c
+    if (f->modo & M_SINBUF)
+        return escribir_todo(f->fd, &b, 1) < 0 ? -1 : c;
+```
+
+`M_SINBUF` -el `_IONBF` del estandar- estaba implementado como **un viaje al
+kernel por byte**. Asi que un `fprintf(stderr, ...)` de cuarenta caracteres
+eran **cuarenta llamadas al sistema**, y un cerrojo en el descriptor no habria
+servido de nada: habria hecho indivisible cada letra, que ya lo era. El
+trenzado no venia de que faltara un cerrojo; venia de que la linea llegaba al
+kernel en cuarenta trozos, y entre dos de ellos cabe el otro proceso entero.
+
+### Lo que el estandar quiere decir
+
+"Sin cubo" no dice "cada byte va solo". Dice que al acabar cada operacion no
+queda nada dentro. La diferencia es la que hay entre *"cuando termines,
+entrega"* y *"entrega letra a letra"*, y se me habia colado la segunda.
+
+Hace falta saber CUANDO acaba una operacion, y para eso un contador de
+profundidad en el `FILE`: cada funcion publica que puede producir mas de un
+caracter entra y sale, y el cubo se vacia al salir del todo. Un `fputc` suelto
+sigue saliendo en el acto, porque para el la operacion acaba al volver.
+
+Todo desemboca en `fputc`, asi que fueron cuatro sitios: `fwrite`, `fputs`,
+`vfprintf` y `puts`. Y el `FILE` de `stderr` ya tenia su cubo de `BUFSIZ` ahi,
+sin usar, desde que existe.
+
+La medida, con la contraprueba hecha revirtiendo solo la libc:
+
+```
+  un fprintf a stderr (sin cubo): 41 llamadas a write()   <- antes
+  un fprintf a stderr (sin cubo): 1 llamada a write()     <- ahora
+```
+
+Es la tercera vez en este proyecto que la velocidad sale de efecto secundario
+de arreglar otra cosa. Aqui lo que se arreglaba era quien puede colarse en
+medio de una linea.
+
+### Y el cerrojo, que ahora si sirve
+
+Con la linea llegando de una pieza, el cerrojo del descriptor hace lo que
+prometia: una escritura entera es indivisible.
+
+Es un **mutex** y no un spinlock, y no se podia elegir: dentro de la escritura
+se puede dormir, porque si el anillo del paso 59 se llena hay que esperar a que
+lo vacien. Un spinlock cogido mientras se duerme cuelga la maquina.
+
+Que se pueda dormir teniendolo cogido obliga a comprobar una cosa, y es la
+comprobacion que hay que hacer siempre con un cerrojo que duerme: que el que lo
+tiene no dependa de que otro lo coja. Y no depende: el que vacia el anillo es
+el `conserver`, que escribe por su cuenta en el hardware y nunca pasa por aqui.
+Si pasara, esto seria un interbloqueo en la primera linea que imprimiera.
+
+Dos detalles pequenyos que valen su comentario:
+
+- El copiado desde el proceso se hace **antes** de coger el cerrojo, no dentro.
+  Puede provocar un fallo de pagina, y un fallo de pagina con el cerrojo de la
+  consola cogido es un camino nuevo por donde llegar a un interbloqueo.
+- El mutex es un estatico y NO se inicializa: `mutex_init` no hace mas que
+  poner a cero sus tres campos, que es en lo que nace un estatico. Un init
+  perezoso habria sido una carrera entre nucleos por inicializar el cerrojo que
+  van a usar para no pisarse, que tiene su gracia.
+
+De paso cayo un cadaver: `syscall.c` declaraba un `console_mutex()` que no
+estaba definido ni se usaba, resto de las demos que se llevo el paso 43.
+
+### Una prueba que no medía nada
+
+Escribi la prueba obvia -`lento 6 aaaa | lento 6 bbbb`- y salio con las lineas
+enteras. Luego la corri en el commit anterior, y salio **igual de limpia**.
+
+En QEMU el trenzado no se reproduce: los tiempos son demasiado gruesos y los
+cuarenta viajes de una linea se hacen de una tirada sin que nadie desaloje al
+proceso. O sea que la prueba no medía nada, como el trenzado del arranque del
+paso 59: los dos son de la placa.
+
+Lo que si se puede medir aqui es el MECANISMO -cuantas llamadas al sistema
+cuesta un `fprintf`- y eso es determinista y falla cuando debe. El sintoma hay
+que verlo en la Pi.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -5629,14 +5720,13 @@ competir.
   prueba ha dejado de medir.
 - No hay sesiones, ni proceso lider, ni `SIGHUP`. Con un solo terminal y
   un solo shell, una sesion seria una etiqueta que no distingue nada.
-- Dos procesos que escriban a la vez en la consola se entrelazan letra a
-  letra: `lento a | lento b` saca las dos lineas trenzadas. El descriptor de
-  consola no tiene cerrojo, asi que una escritura entera no es indivisible.
-
-  Desde el paso 59 eso ya **no pierde nada**, que es la diferencia que
-  importa: los dos pasan por el mismo anillo y el anillo tiene su cerrojo, asi
-  que se mezclan pero llegan enteros. Antes habia dos drivers sobre la misma
-  PL011 y se destruia el 55% del texto en silencio.
+- Dos procesos que escriban a la vez en la consola ya no se trenzan letra a
+  letra: desde el paso 60 una escritura entera es indivisible y un `fprintf`
+  entero es una sola escritura. Lo que SI puede pasar es que se mezclen por
+  LINEAS -el orden entre dos procesos no esta garantizado- y que una linea de
+  mas de 128 caracteres se parta, porque `consola_write` acepta 128 por llamada
+  y la libc da la vuelta. Subir ese tope es subir un buffer que vive en la pila
+  del kernel, que es una pagina.
 - El texto del KERNEL si se puede perder: un diagnostico se escribe desde
   sitios donde no se puede dormir -un manejador de interrupcion, el eco de una
   tecla- asi que si el anillo esta lleno se tira. Lo dice cuando pasa

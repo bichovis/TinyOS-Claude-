@@ -37,9 +37,9 @@ static FILE abiertos[MAX_ABIERTOS];
 
 /* Los tres de siempre. stderr SIN buffer, a proposito: es para lo que
  * tienes que ver aunque el programa se este cayendo. */
-static FILE _stdin  = { 0, M_LEER | M_MIO | M_SINDECIDIR, 0, 0, { 0 } };
-static FILE _stdout = { 1, M_ESCRIBIR | M_MIO | M_SINDECIDIR, 0, 0, { 0 } };
-static FILE _stderr = { 2, M_ESCRIBIR | M_SINBUF | M_MIO, 0, 0, { 0 } };
+static FILE _stdin  = { 0, M_LEER | M_MIO | M_SINDECIDIR, 0, 0, { 0 }, 0 };
+static FILE _stdout = { 1, M_ESCRIBIR | M_MIO | M_SINDECIDIR, 0, 0, { 0 }, 0 };
+static FILE _stderr = { 2, M_ESCRIBIR | M_SINBUF | M_MIO, 0, 0, { 0 }, 0 };
 
 FILE *stdin  = &_stdin;
 FILE *stdout = &_stdout;
@@ -289,6 +289,41 @@ char *fgets(char *dst, int max, FILE *f)
 
 /* --- Escribir ---------------------------------------------------------- */
 
+/* --- Los limites de una operacion, y que significa "sin cubo" ----------
+ *
+ * Esto estaba mal, y se veia en la pantalla. M_SINBUF -el _IONBF del
+ * estandar- estaba implementado como UN VIAJE AL KERNEL POR BYTE:
+ *
+ *     if (f->modo & M_SINBUF)
+ *         return escribir_todo(f->fd, &b, 1) < 0 ? -1 : c;
+ *
+ * Asi que un fprintf(stderr, "  [%s] %d de %d\n", ...) de treinta caracteres
+ * eran TREINTA llamadas al sistema. Dos cosas mal por el mismo precio: es
+ * lento, y es lo que hacia que "lento a | lento b" saliera trenzado letra a
+ * letra, porque entre dos de esos treinta viajes cabe el otro proceso entero.
+ *
+ * Y no es lo que dice el estandar. "Sin cubo" quiere decir que al acabar cada
+ * operacion no queda nada dentro, no que cada byte vaya solo. La diferencia
+ * es la que hay entre "cuando termines, entrega" y "entrega letra a letra", y
+ * el FILE de stderr ya tenia su cubo de BUFSIZ ahi sin usar.
+ *
+ * Hace falta saber CUANDO acaba una operacion, y para eso el contador: cada
+ * funcion publica que puede producir mas de un caracter entra y sale, y el
+ * cubo se vacia al salir del todo. Un fputc suelto sigue saliendo en el acto,
+ * porque para el la operacion acaba en cuanto vuelve. */
+void op_entra(FILE *f)
+{
+    if (f) f->nivel++;
+}
+
+int op_sale(FILE *f)
+{
+    if (!f) return 0;
+    if (--f->nivel > 0) return 0;
+    if (f->modo & M_SINBUF) return fflush(f);
+    return 0;
+}
+
 int fputc(int c, FILE *f)
 {
     if (!f || !(f->modo & M_ESCRIBIR)) { errno = EBADF; return -1; }
@@ -297,14 +332,13 @@ int fputc(int c, FILE *f)
 
     char b = (char)c;
 
-    if (f->modo & M_SINBUF)
-        return escribir_todo(f->fd, &b, 1) < 0 ? -1 : c;
-
     f->buf[f->n++] = b;
 
-    /* Se vacia por dos motivos: porque el cubo esta lleno, o porque ha
-     * llegado un salto de linea y alguien esta mirando. */
-    if (f->n == BUFSIZ || ((f->modo & M_LINEA) && b == '\n'))
+    /* Se vacia por tres motivos: porque el cubo esta lleno, porque ha llegado
+     * un salto de linea y alguien esta mirando, o porque este stream no
+     * guarda nada y no estamos dentro de una operacion mayor. */
+    if (f->n == BUFSIZ || ((f->modo & M_LINEA) && b == '\n') ||
+        ((f->modo & M_SINBUF) && f->nivel == 0))
         if (fflush(f) < 0) return -1;
 
     return c;
@@ -317,17 +351,20 @@ size_t fwrite(const void *src, size_t tam, size_t n, FILE *f)
     const char *s = src;
     size_t total = tam * n;
 
+    op_entra(f);
     for (size_t i = 0; i < total; i++)
-        if (fputc((unsigned char)s[i], f) < 0) return i / tam;
+        if (fputc((unsigned char)s[i], f) < 0) { op_sale(f); return i / tam; }
+    if (op_sale(f) < 0) return 0;
 
     return n;
 }
 
 int fputs(const char *s, FILE *f)
 {
+    op_entra(f);
     for (; *s; s++)
-        if (fputc(*s, f) < 0) return -1;
-    return 0;
+        if (fputc(*s, f) < 0) { op_sale(f); return -1; }
+    return op_sale(f);
 }
 
 /* --- Moverse ----------------------------------------------------------- */

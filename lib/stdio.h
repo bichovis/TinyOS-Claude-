@@ -42,11 +42,24 @@ typedef struct _FILE {
     int      n;            /* bytes utiles en el cubo    */
     int      pos;          /* por donde vamos leyendo    */
     char     buf[BUFSIZ];
+
+    /* Profundidad de operacion. Un stream "sin cubo" no vacia hasta que la
+     * operacion que se esta haciendo termina, y esto es lo que distingue "un
+     * fputc suelto" de "un fputc de los cien que lleva dentro un fprintf".
+     * Va al final para no tocar los inicializadores de stdin/stdout/stderr:
+     * lo que no se nombra se pone a cero. */
+    int      nivel;
 } FILE;
 
 extern FILE *stdin;
 extern FILE *stdout;
 extern FILE *stderr;
+
+/* --- Interno: los limites de una operacion ----------------------------
+ * Lo usa cualquier funcion de stdio que pueda producir mas de un caracter,
+ * para que un stream sin cubo salga de una pieza. Ver fputc en lib/file.c. */
+void op_entra(FILE *f);
+int  op_sale(FILE *f);
 
 FILE *fopen(const char *ruta, const char *modo);
 int   fclose(FILE *f);

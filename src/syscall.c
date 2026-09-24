@@ -19,8 +19,6 @@
 #include "mbox.h"
 #include "irq.h"
 
-extern struct mutex *console_mutex(void);
-
 /* El trozo que se saca del anillo del kernel de una vez. Va en la pila del
  * kernel, que es UNA pagina, asi que no puede ser grande. */
 #define BOUNCE_KLOG  256

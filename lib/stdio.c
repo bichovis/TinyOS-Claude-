@@ -255,7 +255,15 @@ int snprintf(char *buf, size_t cap, const char *fmt, ...)
 int vfprintf(FILE *f, const char *fmt, va_list ap)
 {
     struct destino d = { f, 0, 0, 0, 0 };
+
+    /* Entre estas dos lineas, un stream sin cubo NO vacia: lo que sale de un
+     * printf sale de una pieza, en un solo viaje al kernel. Sin esto, un
+     * fprintf a stderr era una llamada al sistema por caracter y dos
+     * procesos escribiendo a la vez se trenzaban letra a letra. */
+    op_entra(f);
     formatear(&d, fmt, ap);
+    if (op_sale(f) < 0) return -1;
+
     return ferror(f) ? -1 : (int)d.total;
 }
 
@@ -285,6 +293,11 @@ int getchar(void)           { return fgetc(stdin); }
 
 int puts(const char *s)
 {
-    if (fputs(s, stdout) < 0) return -1;
-    return fputc('\n', stdout);
+    /* Las dos partes bajo la misma operacion: un puts es UNA cosa, y si el
+     * stream no guarda nada, su texto y su salto de linea tienen que salir
+     * juntos o alguien se puede colar entre ellos. */
+    op_entra(stdout);
+    if (fputs(s, stdout) < 0)        { op_sale(stdout); return -1; }
+    if (fputc('\n', stdout) < 0)     { op_sale(stdout); return -1; }
+    return op_sale(stdout);
 }

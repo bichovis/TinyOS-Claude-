@@ -127,6 +127,30 @@ static int64_t pipe_write(struct pipe *p, uint64_t uva, uint64_t n)
 
 /* --- La consola ------------------------------------------------------- */
 
+/* --- El cerrojo de la consola -----------------------------------------
+ *
+ * Para que una escritura entera sea indivisible, que es la otra mitad de que
+ * dos procesos no se trencen. La primera mitad esta en la libc: hasta ahora un
+ * fprintf a stderr era una llamada al sistema POR CARACTER, asi que ningun
+ * cerrojo de aqui habria servido de nada -habria hecho indivisible cada
+ * letra, que ya lo era-.
+ *
+ * Es un MUTEX y no un spinlock, y no se podia elegir: dentro de la escritura
+ * se puede dormir. Si el anillo del kernel se llena, quien escribe espera a
+ * que el duenyo de la consola lo vacie (paso 59), y un spinlock cogido
+ * mientras se duerme cuelga la maquina.
+ *
+ * Que se pueda dormir teniendolo cogido obliga a comprobar una cosa: que el
+ * que lo tiene no dependa de que otro lo coja. Y no: el que vacia el anillo es
+ * el conserver, que escribe por su cuenta en el hardware y nunca pasa por
+ * aqui. Si pasara, esto seria un interbloqueo en la primera linea que
+ * imprimiera. */
+/* Sin mutex_init: es un estatico, y mutex_init no hace mas que poner a cero
+ * los tres campos, que es exactamente en lo que nace un estatico. Un init
+ * perezoso aqui habria sido una carrera entre nucleos por inicializar el
+ * cerrojo que van a usar para no pisarse, que tiene su gracia. */
+static struct mutex consola_lock;
+
 static int64_t consola_write(uint64_t uva, uint64_t n)
 {
     char tmp[BOUNCE];
@@ -139,8 +163,18 @@ static int64_t consola_write(uint64_t uva, uint64_t n)
      * tenga la UART, que puede ser el kernel mismo o el driver de consola.
      * Puede aceptar menos de lo que se le da -si el anillo se llena y una
      * senyal corta la espera- y por eso se devuelve lo que acepto: es una
-     * escritura parcial, como la de cualquier Unix. */
-    return uart_escribir_texto(tmp, hay);
+     * escritura parcial, como la de cualquier Unix.
+     *
+     * Con el cerrojo alrededor, para que no se cuele nadie por el medio. El
+     * copiado desde el proceso queda FUERA a proposito: puede provocar un
+     * fallo de pagina, y un fallo de pagina con el cerrojo de la consola
+     * cogido es un camino nuevo por donde llegar a un interbloqueo. Se copia
+     * primero, se bloquea despues. */
+    mutex_lock(&consola_lock);
+    int64_t r = uart_escribir_texto(tmp, hay);
+    mutex_unlock(&consola_lock);
+
+    return r;
 }
 
 static int64_t consola_read(uint64_t uva, uint64_t n)
