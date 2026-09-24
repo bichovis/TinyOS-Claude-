@@ -5802,6 +5802,117 @@ DMA del paso 58 -porque los descriptores llegan por DMA- y la interrupcion 9,
 que hasta ahora esta reclamada y sin usar, porque `GINTMSK` sigue a cero y el
 chip no ha pedido atencion ni una vez.
 
+## Hablar con el otro lado
+
+Tener el puerto habilitado no es hablar. Este paso hace la primera
+conversacion: un canal, una transferencia de control y un `GET_DESCRIPTOR`,
+que es la pregunta con la que todo dispositivo USB dice quien es.
+
+### Lo que arreglo primero, porque estaba mal
+
+**Los avisos que no se podian borrar.** El paso 61 puso `hprt_escribir()` para
+que un leer-poner-escribir sobre `HPRT0` no borrara por accidente los bits que
+se limpian escribiendo un uno. Funcionaba, y con eso solo resulta que tampoco
+se podian borrar **a proposito**. La placa lo dijo con un `HPRT0` que acababa
+en `f`, con las dos banderas de cambio encendidas y sin forma de bajarlas.
+
+Hacen falta las dos funciones: una que proteja y otra que reconozca. Lo que no
+puede haber es solo la primera. Fui demasiado listo en un sitio donde hacia
+falta ser completo.
+
+**Y las FIFO.** El nucleo tiene 4080 palabras que hay que repartir a mano entre
+recepcion, transmision no periodica y periodica, y los valores por defecto de
+este ejemplar no sirven. El reparto se escribe como "profundidad y donde
+empieza", las tres zonas tienen que ir seguidas y sin solaparse, y si dos se
+pisan las transferencias salen con datos de la otra: un sintoma que no se parece
+en nada a la causa.
+
+### La direccion que no es la direccion
+
+Esto es lo que mas me gusta del paso, porque es un fallo que no da error.
+
+El paso 58 consiguio memoria contigua y su direccion **fisica**, que es lo que
+un periferico necesita porque el DMA no pasa por la MMU. Pero en esta placa la
+CPU y los perifericos **no ven la RAM en el mismo sitio**: lo que para el ARM es
+la direccion 0 es, para el bus de la GPU y para los maestros DMA que cuelgan de
+el, la `0xC0000000`.
+
+Hay cuatro alias del mismo byte de RAM -`0x00000000`, `0x40000000`,
+`0x80000000` y `0xC0000000`- y se distinguen en como pasan por las caches de la
+VideoCore. El de DMA es el ultimo, que es coherente con la L2.
+
+```c
+#define BUS(pa)   ((uint32_t)((uint64_t)(pa) | 0xC0000000UL))
+```
+
+Darle al chip la fisica a secas no da un error: da un DMA que escribe en otro
+sitio. La transferencia dice que fue bien -y fue bien, en una direccion que no
+es la tuya- y tu buffer sigue teniendo lo que tenia.
+
+Y ahi esta el detalle que convierte una adivinanza en un diagnostico: **el
+buffer se rellena con un patron antes de cada transferencia**. Si el descriptor
+aparece, la direccion era buena. Si el patron sigue intacto y el chip dice que
+todo fue bien, el DMA fue a otra parte. Sin el patron, "no ha contestado" y "ha
+contestado en otro sitio" se ven exactamente igual, y son dos problemas que no
+tienen nada que ver.
+
+### El descriptor te dice como leer el descriptor
+
+El primer `GET_DESCRIPTOR` pide **ocho bytes**, y no es timidez. Para leer un
+descriptor hay que decirle al controlador cual es el tamanyo maximo de paquete
+del dispositivo, y ese dato esta **dentro del descriptor**, en el byte 7.
+
+Ocho es el minimo que la norma obliga a soportar a todo el mundo. Asi que con
+ocho se lee lo justo para saber cuanto se puede leer, y despues se pide el
+descriptor entero con el tamanyo que acaba de decir. Es circular y tiene salida,
+que es lo bonito.
+
+### Tres transferencias para una
+
+Una transferencia de control son tres del canal: el SETUP dice que se pide, los
+datos van o vienen, y el estado es un paquete vacio con el que el dispositivo
+confirma.
+
+Los PID no son decorativos. El SETUP va con PID de SETUP, y la fase de datos de
+un control empieza **siempre** en DATA1, igual que el estado. Equivocarse ahi da
+un `DATATGLERR`, que es el chip diciendo "esto no es el paquete que esperaba".
+
+Y los errores del canal se traducen a palabras, porque con los nombres delante
+un `HCINT` deja de ser un numero: `STALL` es "el dispositivo no entiende eso",
+`XACTERR` es "no ha contestado o ha contestado mal", `BBLERR` es "ha hablado mas
+de lo que le tocaba". Tres diagnosticos distintos que llevan a tres sitios
+distintos.
+
+De momento se espera **mirando**, no por interrupcion: `GINTMSK` sigue a cero.
+Meter las interrupciones antes de que una transferencia funcione es depurar dos
+cosas a la vez.
+
+### Y contesto
+
+En QEMU, con un dispositivo enchufado a mano:
+
+```
+  [usb] contesta: descriptor de 18 bytes, USB 1.10, paquete maximo 8
+  [usb] es 0409:55aa, clase 9, 1 configuracion
+  [usb] clase 9 es HUB, que es lo que tiene que ser
+```
+
+`0409:55aa` es el hub que QEMU pone por su cuenta. Lo que importa no es quien
+sea: es que dos transferencias de control enteras fueron y volvieron, que el
+descriptor se leyo bien -18 bytes, la version del USB, el tamanyo de paquete- y
+que **la comprobacion del patron paso**, o sea que el DMA aterrizo en nuestro
+buffer y la direccion de bus era la correcta.
+
+En la Pi lo que hay ahi es un LAN9514, y tiene que decir `0424:9514` con clase
+9. El `0424` es SMSC.
+
+### Lo que falta
+
+Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es
+la que usa todo dispositivo recien reseteado-, leerle el descriptor de hub, y
+encender sus puertos. Ahi es donde aparecera la Ethernet, en un puerto interno
+del propio hub.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -5982,6 +6093,17 @@ chip no ha pedido atencion ni una vez.
   separada del planificador, y el driver de la Fundacion usa una FIQ para eso.
 - El driver de USB no pide ninguna interrupcion todavia: `GINTMSK` esta a cero
   y se pregunta mirando los registros. La IRQ 9 esta reclamada y sin usar.
+- El puerto raiz de la Pi enumera a velocidad COMPLETA y deberia ser alta: el
+  LAN9514 es un hub de alta velocidad, asi que el *chirp* del reset no esta
+  saliendo. No bloquea nada -control y bulk funcionan igual, y con todo el bus
+  a velocidad completa tampoco hacen falta transferencias partidas- pero la red
+  ira a 12 Mbit/s en vez de 480. Los sospechosos son la anchura del UTMI+ y el
+  tiempo de turnaround.
+- Solo se usa el canal 0, y de uno en uno. Hay ocho, y usarlos a la vez es lo
+  que hara falta el dia que haya varias transferencias en vuelo.
+- Un solo dispositivo, en la direccion 0, y sin `SET_ADDRESS`: se le habla a la
+  que usa todo dispositivo recien reseteado. Con un hub por delante eso deja de
+  valer en el paso siguiente.
 - Los mensajes del driver de USB salen DESPUES del prompt del shell, porque
   encender el puerto y resetearlo lleva mas de los 100 ms que init espera. Las
   lineas salen enteras -de eso se encargan los pasos 59 y 60- pero llegan

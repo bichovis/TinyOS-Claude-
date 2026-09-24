@@ -38,6 +38,9 @@
 #define GHWCFG2    0x048    /* arquitectura y numero de canales              */
 #define GHWCFG3    0x04C
 #define GHWCFG4    0x050
+#define GRXFSIZ    0x024    /* tamanyo de la FIFO de recepcion               */
+#define GNPTXFSIZ  0x028    /* ...y de la de transmision no periodica        */
+#define HPTXFSIZ   0x100    /* ...y de la periodica                          */
 #define HCFG       0x400    /* configuracion de anfitrion                    */
 #define HFNUM      0x408    /* numero de micro-trama: el reloj del USB        */
 #define HPRT0      0x440    /* EL puerto raiz                                */
@@ -91,6 +94,77 @@
 
 #define HPRT_W1C  (HPRT_CONNDET | HPRT_ENA | HPRT_ENCHNG | HPRT_OVRCURCHNG)
 
+/* --- Los canales, que son las transferencias en vuelo -----------------
+ * Ocho, segun dijo GHWCFG2. Cada uno con su bloque de seis registros. */
+#define HCCHAR(n)    (0x500 + 0x20 * (n))
+#define HCSPLT(n)    (0x504 + 0x20 * (n))
+#define HCINT(n)     (0x508 + 0x20 * (n))
+#define HCINTMSK(n)  (0x50C + 0x20 * (n))
+#define HCTSIZ(n)    (0x510 + 0x20 * (n))
+#define HCDMA(n)     (0x514 + 0x20 * (n))
+
+/* HCCHAR */
+#define HCC_MPS(n)     ((uint32_t)(n) & 0x7FF)
+#define HCC_EP(n)      ((uint32_t)((n) & 0xF) << 11)
+#define HCC_IN         (1u << 15)
+#define HCC_LOWSPEED   (1u << 17)
+#define HCC_TIPO(n)    ((uint32_t)((n) & 3) << 18)
+#define HCC_ADDR(n)    ((uint32_t)((n) & 0x7F) << 22)
+#define HCC_DISABLE    (1u << 30)
+#define HCC_ENABLE     (1u << 31)
+
+#define EP_CONTROL     0
+#define EP_ISO         1
+#define EP_BULK        2
+#define EP_INT         3
+
+/* HCTSIZ */
+#define HCT_BYTES(n)   ((uint32_t)(n) & 0x7FFFF)
+#define HCT_PAQUETES(n) ((uint32_t)((n) & 0x3FF) << 19)
+#define HCT_PID(n)     ((uint32_t)((n) & 3) << 29)
+
+#define PID_DATA0      0
+#define PID_DATA2      1
+#define PID_DATA1      2
+#define PID_SETUP      3
+
+/* HCINT: por que acabo una transferencia */
+#define HCI_XFERCOMPL  (1u << 0)
+#define HCI_CHHLTD     (1u << 1)
+#define HCI_AHBERR     (1u << 2)
+#define HCI_STALL      (1u << 3)
+#define HCI_NAK        (1u << 4)
+#define HCI_ACK        (1u << 5)
+#define HCI_NYET       (1u << 6)
+#define HCI_XACTERR    (1u << 7)
+#define HCI_BBLERR     (1u << 8)
+#define HCI_FRMOVRUN   (1u << 9)
+#define HCI_DATATGLERR (1u << 10)
+
+#define HCI_MALO  (HCI_AHBERR | HCI_STALL | HCI_XACTERR | HCI_BBLERR | \
+                   HCI_FRMOVRUN | HCI_DATATGLERR)
+
+/* --- Y la direccion que hay que darle al chip, que NO es la fisica -----
+ *
+ * Esto es de las cosas que fallan en silencio y cuestan un dia.
+ *
+ * El paso 58 consiguio memoria contigua y su direccion FISICA, que es lo que
+ * un periferico necesita porque no pasa por la MMU. Pero en esta placa la CPU
+ * y los perifericos no ven la RAM en el mismo sitio: lo que para el ARM es la
+ * direccion 0 es, para el bus de la GPU y para los maestros DMA que cuelgan
+ * de el, la 0xC0000000.
+ *
+ * Hay cuatro alias del mismo byte de RAM -0x00000000, 0x40000000, 0x80000000 y
+ * 0xC0000000- y se distinguen en como pasan por las caches de la VideoCore. El
+ * que se usa para DMA es el 0xC0000000, que es coherente con la L2.
+ *
+ * Darle al DWC2 la direccion fisica a secas no da un error: da un DMA que
+ * escribe en otro sitio, y un buffer que sigue teniendo lo que tenia. Por eso
+ * el buffer se rellena con un patron antes de cada transferencia: si el
+ * descriptor aparece, la direccion era buena; si el patron sigue intacto, el
+ * chip ha escrito en otra parte. Sin ese patron, las dos cosas se ven igual. */
+#define BUS(pa)   ((uint32_t)((uint64_t)(pa) | 0xC0000000UL))
+
 static volatile uint32_t *reg;
 
 static uint32_t leer(uint64_t off) { return reg[off / 4]; }
@@ -98,6 +172,22 @@ static void escribir(uint64_t off, uint32_t v) { reg[off / 4] = v; }
 
 /* Escribir HPRT0 sin pisarse los pies. Ver el comentario de arriba. */
 static void hprt_escribir(uint32_t v) { escribir(HPRT0, v & ~HPRT_W1C); }
+
+/* Y reconocer los avisos, que es lo que faltaba.
+ *
+ * hprt_escribir quita los bits que se borran escribiendo un uno, para que un
+ * leer-poner-escribir no los borre por accidente. Con eso solo, resulta que
+ * tampoco se pueden borrar A PROPOSITO: quedan puestos para siempre y el
+ * driver no puede enterarse de un segundo cambio. Se vio en la placa, en un
+ * HPRT0 que acababa en 'f' con las dos banderas de cambio encendidas.
+ *
+ * Asi que hacen falta las dos funciones. Una protege y la otra reconoce, y lo
+ * que no puede haber es solo la primera. */
+static void hprt_reconocer(uint32_t bits)
+{
+    uint32_t v = leer(HPRT0);
+    escribir(HPRT0, (v & ~HPRT_W1C) | (bits & HPRT_W1C & ~HPRT_ENA));
+}
 
 /* Esperar a que un bit se ponga (o se quite), con tope.
  *
@@ -190,6 +280,161 @@ static int nucleo_despertar(void)
     return 1;
 }
 
+/* --- Las FIFO, que no salen bien por defecto ---------------------------
+ *
+ * El nucleo tiene 4080 palabras de FIFO -lo dijo GHWCFG3- y hay que repartirlas
+ * a mano entre recepcion, transmision no periodica y transmision periodica. Los
+ * valores por defecto de este ejemplar no sirven, y los que se usan aqui son
+ * los que el driver de Linux lleva escritos para esta placa concreta.
+ *
+ * El reparto se escribe como "profundidad y donde empieza", y las tres zonas
+ * tienen que ir seguidas y sin solaparse: si dos se pisan, las transferencias
+ * salen con datos de la otra y el sintoma no se parece en nada a la causa. */
+#define FIFO_RX     774
+#define FIFO_NPTX   256
+#define FIFO_PTX    512
+
+static void fifos_repartir(void)
+{
+    escribir(GRXFSIZ,   FIFO_RX);
+    escribir(GNPTXFSIZ, (FIFO_NPTX << 16) | FIFO_RX);
+    escribir(HPTXFSIZ,  (FIFO_PTX  << 16) | (FIFO_RX + FIFO_NPTX));
+
+    /* Y vaciarlas, porque lo que hubiera dentro es de antes del reparto y
+     * ahora esta en el sitio de otro. TXFNUM a 0x10 quiere decir "todas". */
+    escribir(GRSTCTL, (0x10u << 6) | (1u << 5));    /* TXFFLSH */
+    esperar_bit(GRSTCTL, (1u << 5), 0, 5);
+    escribir(GRSTCTL, (1u << 4));                   /* RXFFLSH */
+    esperar_bit(GRSTCTL, (1u << 4), 0, 5);
+}
+
+/* --- Una transferencia por un canal ------------------------------------
+ *
+ * Esto es todo lo que el DWC2 sabe hacer: le dices a quien, por que endpoint,
+ * en que direccion, de que tipo, cuantos bytes y donde ponerlos, y el lo hace.
+ * Una transferencia de USB de las de verdad -un control, por ejemplo- son
+ * varias de estas seguidas.
+ *
+ * Se espera mirando, no por interrupcion. GINTMSK sigue a cero: meter las
+ * interrupciones antes de que una transferencia funcione es depurar dos cosas
+ * a la vez. */
+static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
+                            int addr, int ep, int pid, uint64_t pa, int bytes)
+{
+    int paquetes = bytes ? (bytes + mps - 1) / mps : 1;
+
+    /* Los avisos viejos del canal, fuera. Un canal se reutiliza, y arrancar
+     * con el ACK de la transferencia anterior puesto es creerse que esta ya
+     * termino. */
+    escribir(HCINT(canal), 0xFFFFFFFF);
+    escribir(HCINTMSK(canal), 0);
+    escribir(HCSPLT(canal), 0);         /* sin particion: cuelga del raiz */
+
+    escribir(HCTSIZ(canal), HCT_PID(pid) | HCT_PAQUETES(paquetes) |
+                            HCT_BYTES(bytes));
+    escribir(HCDMA(canal), BUS(pa));
+
+    escribir(HCCHAR(canal), HCC_ENABLE | HCC_ADDR(addr) | HCC_TIPO(tipo) |
+                            (entrada ? HCC_IN : 0) | HCC_EP(ep) | HCC_MPS(mps));
+
+    /* Y esperar. El canal acaba avisando por HCINT, y las dos formas de acabar
+     * son "completada" y "detenida"; lo segundo puede ser bueno o malo, y lo
+     * dice el resto de los bits. */
+    for (int v = 0; v < 2000000; v++) {
+        uint32_t i = leer(HCINT(canal));
+        if (i & (HCI_XFERCOMPL | HCI_CHHLTD | HCI_MALO)) return i;
+    }
+
+    /* Nada en un par de millones de vueltas: se para el canal a mano para no
+     * dejarlo colgado y se dice que no hubo respuesta. */
+    escribir(HCCHAR(canal), leer(HCCHAR(canal)) | HCC_DISABLE);
+    return 0;
+}
+
+/* Por que fallo, en palabras. Con estos nombres delante, un HCINT deja de ser
+ * un numero: STALL es "el dispositivo dice que no entiende eso", XACTERR es
+ * "no ha contestado o ha contestado mal", BBLERR es "ha hablado mas de lo que
+ * le tocaba". Son diagnosticos distintos y llevan a sitios distintos. */
+static void quejarse_canal(const char *que, uint32_t i)
+{
+    printf("  [usb] %s: HCINT = 0x%08x%s%s%s%s%s%s\n", que, (unsigned int)i,
+           (i & HCI_STALL)      ? " STALL"      : "",
+           (i & HCI_XACTERR)    ? " XACTERR"    : "",
+           (i & HCI_BBLERR)     ? " BBLERR"     : "",
+           (i & HCI_NAK)        ? " NAK"        : "",
+           (i & HCI_AHBERR)     ? " AHBERR"     : "",
+           (i & HCI_DATATGLERR) ? " DATATGLERR" : "");
+}
+
+/* --- Una transferencia de control, que son tres -------------------------
+ *
+ * SETUP, datos y estado. El SETUP dice que se pide, los datos van o vienen, y
+ * el estado es un paquete vacio con el que el dispositivo confirma. Las tres
+ * por el mismo canal y el mismo endpoint 0, que es el unico que existe antes
+ * de saber nada del dispositivo.
+ *
+ * Los PID no son decorativos: la fase de datos de un control empieza SIEMPRE
+ * en DATA1 y el estado tambien va en DATA1. Equivocarse ahi da un
+ * DATATGLERR, que es el chip diciendo "esto no es el paquete que esperaba". */
+/* El tramo de DMA, repartido: el paquete de SETUP al principio y los datos 64
+ * bytes mas adelante. Dos zonas y no una porque el chip lee las dos en la
+ * misma transferencia de control y solaparlas seria pisarse. */
+static uint64_t dma_va, dma_pa;
+
+#define OFF_SETUP   0
+#define OFF_DATOS  64
+
+#define PATRON  0xA5      /* con que se rellena para saber si el DMA llego */
+
+static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
+                        uint16_t valor, uint16_t indice, int bytes)
+{
+    volatile uint8_t *setup = (volatile uint8_t *)(dma_va + OFF_SETUP);
+    volatile uint8_t *datos = (volatile uint8_t *)(dma_va + OFF_DATOS);
+
+    /* Los ocho bytes de siempre, en el orden de siempre y en little-endian,
+     * que es el del USB entero. */
+    setup[0] = tipo;
+    setup[1] = peticion;
+    setup[2] = (uint8_t)(valor & 0xFF);
+    setup[3] = (uint8_t)(valor >> 8);
+    setup[4] = (uint8_t)(indice & 0xFF);
+    setup[5] = (uint8_t)(indice >> 8);
+    setup[6] = (uint8_t)(bytes & 0xFF);
+    setup[7] = (uint8_t)(bytes >> 8);
+
+    /* El patron, para poder distinguir "no ha contestado" de "ha contestado en
+     * otro sitio". Ver el comentario de BUS(). */
+    for (int i = 0; i < bytes; i++) datos[i] = PATRON;
+
+    uint32_t r;
+
+    r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_SETUP,
+                    dma_pa + OFF_SETUP, 8);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el SETUP no paso", r); return -1; }
+
+    r = canal_hacer(0, 1, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                    dma_pa + OFF_DATOS, bytes);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("los datos no llegaron", r); return -1; }
+
+    r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                    dma_pa + OFF_DATOS, 0);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el estado no paso", r); return -1; }
+
+    /* ¿Ha escrito alguien aqui? Si sigue todo con el patron, el DMA fue a otra
+     * parte: el chip dijo que la transferencia acabo bien, y acabo bien... en
+     * una direccion que no es esta. */
+    int tocado = 0;
+    for (int i = 0; i < bytes; i++) if (datos[i] != PATRON) { tocado = 1; break; }
+    if (!tocado) {
+        printf("  [usb] la transferencia dice que fue bien y el buffer sigue "
+               "intacto: el DMA no escribe donde creo\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 /* --- Lo demas de la configuracion ------------------------------------- */
 static void modo_anfitrion(void)
 {
@@ -206,6 +451,8 @@ static void modo_anfitrion(void)
     /* El reloj de las lineas lentas: con 0 se le dice "30/60 MHz", que es lo
      * que toca cuando el PHY es UTMI+ de alta velocidad. */
     escribir(HCFG, leer(HCFG) & ~3u);
+
+    fifos_repartir();
 }
 
 /* --- El puerto raiz ---------------------------------------------------
@@ -338,6 +585,8 @@ int main(int argc, char **argv)
     /* --- 2. Memoria para DMA --- */
     uint64_t pa = 0;
     int64_t  va = dma_alloc(PAGINAS_DMA, &pa);
+    dma_va = (uint64_t)va;
+    dma_pa = pa;
     if (va < 0) {
         printf("  [usb] sin memoria para DMA: %s\n", strerror(errno));
         return 1;
@@ -449,12 +698,63 @@ int main(int argc, char **argv)
            (unsigned int)p, velocidad(p),
            (p & HPRT_ENA) ? "habilitado" : "SIN habilitar");
 
-    if (p & HPRT_ENA)
-        printf("  [usb] micro-trama %u: el bus esta vivo\n",
-               (unsigned int)(leer(HFNUM) & 0x3FFF));
+    if (!(p & HPRT_ENA)) {
+        printf("  [usb] el puerto no quedo habilitado; no hay con quien hablar\n");
+        for (;;) sleep(1000);
+    }
 
-    /* Y aqui se para. Lo siguiente es hablar con el: un canal, una
-     * transferencia de control y un GET_DESCRIPTOR, que es donde el hub dira
-     * quien es. */
+    printf("  [usb] micro-trama %u: el bus esta vivo\n",
+           (unsigned int)(leer(HFNUM) & 0x3FFF));
+
+    /* Y reconocer los avisos de cambio, que es lo que faltaba: si no, quedan
+     * puestos para siempre y el driver no puede enterarse del siguiente. */
+    hprt_reconocer(HPRT_CONNDET | HPRT_ENCHNG);
+
+    /* --- 5. Y ahora a hablar ------------------------------------------
+     *
+     * El primer GET_DESCRIPTOR pide OCHO bytes, y no es timidez: todavia no se
+     * sabe cual es el tamanyo maximo de paquete de este dispositivo, y ese dato
+     * esta DENTRO del descriptor, en el byte 7. Ocho es el minimo que la norma
+     * obliga a soportar a todo el mundo, asi que con ocho se puede leer cuanto
+     * se puede leer. El descriptor te dice como leer el descriptor. */
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+
+    if (control_leer(0, 8, 0x80, 6, 0x0100, 0, 8) < 0) {
+        printf("  [usb] el dispositivo no contesta a un GET_DESCRIPTOR\n");
+        for (;;) sleep(1000);
+    }
+
+    int mps0 = d[7];
+    printf("  [usb] contesta: descriptor de %u bytes, USB %x.%02x, "
+           "paquete maximo %d\n",
+           (unsigned int)d[0], (unsigned int)d[3], (unsigned int)d[2], mps0);
+
+    if (mps0 != 8 && mps0 != 16 && mps0 != 32 && mps0 != 64) {
+        printf("  [usb] ese tamanyo de paquete no es legal; me paro aqui\n");
+        for (;;) sleep(1000);
+    }
+
+    /* Y ahora el descriptor entero, con el tamanyo de paquete que acaba de
+     * decir. Son 18 bytes y los interesantes estan del 8 al 11. */
+    if (control_leer(0, mps0, 0x80, 6, 0x0100, 0, 18) < 0) {
+        printf("  [usb] el segundo GET_DESCRIPTOR fallo\n");
+        for (;;) sleep(1000);
+    }
+
+    unsigned vendedor  = (unsigned)(d[8]  | (d[9]  << 8));
+    unsigned producto  = (unsigned)(d[10] | (d[11] << 8));
+
+    printf("  [usb] es %04x:%04x, clase %u, %u configuracion%s\n",
+           vendedor, producto, (unsigned)d[4], (unsigned)d[17],
+           d[17] == 1 ? "" : "es");
+
+    if (vendedor == 0x0424)
+        printf("  [usb] 0x0424 es SMSC: esto es el hub con la Ethernet dentro\n");
+    if (d[4] == 9)
+        printf("  [usb] clase 9 es HUB, que es lo que tiene que ser\n");
+
+    /* Y aqui se para. Lo siguiente es ponerle una direccion con SET_ADDRESS,
+     * leerle el descriptor de hub y encender sus puertos, que es donde
+     * aparecera la Ethernet. */
     for (;;) sleep(1000);
 }
