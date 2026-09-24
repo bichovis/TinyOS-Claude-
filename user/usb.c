@@ -184,12 +184,21 @@
  * chip ha escrito en otra parte. Sin ese patron, las dos cosas se ven igual. */
 #define BUS(pa)   ((uint32_t)((uint64_t)(pa) | 0xC0000000UL))
 
-/* Y como no se puede saber a ciencia cierta cual de las dos quiere ESTE chip
- * sin probarlo, se prueba. Empieza en 1 -la direccion de bus, que es lo que
- * usan tanto Linux como los proyectos de bare metal de esta placa- y si no
- * contesta se reintenta con la fisica a secas. Una adivinanza cuesta un
- * arranque por intento; un experimento, ninguno. */
-static int dma_bus = 1;
+/* Y este chip quiere la FISICA, no la de bus. Lo dijo el experimento, y de
+ * paso me corrigio:
+ *
+ * Con la de bus, HCDMA volvia avanzado ocho bytes y yo lo lei como "el nucleo
+ * leyo los ocho bytes del SETUP". Solo probaba que movio su puntero.
+ * 0xC015C000 esta muy por encima de los 996 MB de RAM de esta placa, asi que
+ * leyo de ninguna parte, avanzo igual y se atasco sin decir nada.
+ *
+ * Con la fisica a secas, la transferencia SALIO -llego a dar un XACTERR, que es
+ * un error de verdad en el cable-, y eso es lo que distingue "no hizo nada" de
+ * "lo hizo y fue mal".
+ *
+ * La leccion: un contador que avanza no prueba que lo que se leyo fuera lo
+ * correcto. Prueba que alguien conto. */
+static int dma_bus = 0;
 
 static volatile uint32_t *reg;
 
@@ -768,10 +777,8 @@ int main(int argc, char **argv)
      *
      * Yo lo descarte con un argumento malo: "los registros se leen bien, asi
      * que esta encendido". Leer registros solo prueba que hay reloj de bus. */
-    if (dev_power(PWR_USB) != 1)
-        printf("  [usb] la GPU no me confirma que el USB este encendido\n");
-    else
-        printf("  [usb] la GPU dice que el USB esta encendido y listo\n");
+    printf("  [usb] la GPU contesta al encendido: 0x%08x\n",
+           (unsigned int)dev_power(PWR_USB));
 
     /* --- 5. Y ahora si: configurar el controlador --- */
     if (!nucleo_despertar()) {
@@ -851,17 +858,24 @@ int main(int argc, char **argv)
      * rendirse. Las dos posibilidades son "el chip quiere la direccion de bus"
      * y "el chip quiere la fisica", y averiguarlo probando cuesta un segundo;
      * averiguarlo a base de arrancar la placa cuesta un arranque por intento. */
-    if (control_leer(0, 8, 0x80, 6, 0x0100, 0, 8) < 0) {
-        printf("  [usb] con la direccion de bus no contesta; pruebo con la "
-               "fisica a secas\n");
-        dma_bus = 0;
+    /* Y con reintentos, que no es pereza: un XACTERR en la primera peticion a
+     * un dispositivo que acaba de salir de un reset es normal. El canal ya
+     * reintenta por su cuenta las veces que diga MC, pero un dispositivo que
+     * todavia se esta despertando puede fallar las tres. Cualquier pila de USB
+     * de verdad reintenta la enumeracion. */
+    int ok = 0;
+    for (int intento = 1; intento <= 4 && !ok; intento++) {
+        if (control_leer(0, 8, 0x80, 6, 0x0100, 0, 8) == 0) { ok = 1; break; }
+        printf("  [usb] intento %d fallido; espero y repito\n", intento);
+        sleep(5);
+    }
 
-        if (control_leer(0, 8, 0x80, 6, 0x0100, 0, 8) < 0) {
-            printf("  [usb] tampoco: el dispositivo no contesta a un "
-                   "GET_DESCRIPTOR de ninguna de las dos formas\n");
-            for (;;) sleep(1000);
-        }
-        printf("  [usb] con la fisica SI: este chip no quiere la de bus\n");
+    if (!ok) {
+        printf("  [usb] el dispositivo no contesta a un GET_DESCRIPTOR\n");
+        printf("  [usb] estado del puerto: HPRT0 = 0x%08x, trama %u\n",
+               (unsigned int)leer(HPRT0),
+               (unsigned int)(leer(HFNUM) & 0x3FFF));
+        for (;;) sleep(1000);
     }
 
     int mps0 = d[7];

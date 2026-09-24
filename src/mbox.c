@@ -136,7 +136,7 @@ int mbox_arm_memory(uint64_t *base, uint64_t *size)
 #define PWR_ON        (1u << 0)
 #define PWR_ESPERAR   (1u << 1)
 
-int mbox_power_on(uint32_t device_id)
+uint32_t mbox_power_on(uint32_t device_id)
 {
     buf[0] = 8 * 4;
     buf[1] = CODE_REQUEST;
@@ -147,11 +147,20 @@ int mbox_power_on(uint32_t device_id)
     buf[6] = PWR_ON | PWR_ESPERAR;
     buf[7] = TAG_END;
 
-    if (!mbox_call(MBOX_CH_PROP)) return 0;
+    if (!mbox_call(MBOX_CH_PROP)) return 0xFFFFFFFFu;   /* ni contesto */
 
-    /* La GPU contesta con el estado que ha quedado. El bit 0 es "encendido" y
-     * el 1, en la RESPUESTA, significa "no existe ese dispositivo". */
-    return (buf[6] & PWR_ON) && !(buf[6] & PWR_ESPERAR);
+    /* Se devuelve el estado TAL CUAL, sin juzgarlo.
+     *
+     * Aqui tenia un "return (estado & ON) && !(estado & bit1)", dando por hecho
+     * que el bit 1 de la respuesta significa "no existe ese dispositivo". La
+     * placa contesto algo que ese juicio convirtio en "no esta encendido",
+     * cuando a la vez el registro GUSBCFG del controlador CAMBIABA de valor,
+     * o sea que la llamada estaba haciendo algo.
+     *
+     * Un booleano se equivoca en silencio; el numero se puede mirar. Cuando no
+     * se esta seguro de como se interpreta una respuesta, lo que hay que
+     * devolver es la respuesta. */
+    return buf[6];
 }
 
 uint32_t mbox_clock_rate(uint32_t clock_id)

@@ -6060,6 +6060,45 @@ antes de que el PHY haya arrancado. La lista de lo que se puede encender vive en
 el kernel, como la del MMIO y la de los relojes: un driver pide "el USB", no un
 numero cualquiera. Darle el buzon entero seria darle el mando de la placa.
 
+### Un contador que avanza no prueba que leyeras bien
+
+El encendido por el buzon cambio cosas, y una de ellas me corrigio.
+
+Primero: **la direccion buena es la fisica, no la de bus**. La ronda anterior yo
+habia concluido lo contrario, razonando que con la de bus `HCDMA` volvia avanzado
+ocho bytes y eso demostraba que el nucleo habia leido el SETUP. **Solo demostraba
+que movio su puntero.** `0xC015C000` esta muy por encima de los 996 MB de RAM de
+esta placa: leyo de ninguna parte, avanzo el contador igual y se atasco sin decir
+nada.
+
+Con la fisica a secas, en cambio, la transferencia **salio**: dio un `XACTERR`,
+que es un error de verdad en el cable. Y esa es la diferencia que importa, porque
+"no hizo nada" y "lo hizo y fue mal" son dos sitios distintos.
+
+La leccion se puede escribir en una linea: un contador que avanza no prueba que
+lo que se leyo fuera lo correcto. Prueba que alguien conto.
+
+### Y un booleano que escondia la respuesta
+
+El encendido decia "la GPU no me confirma que el USB este encendido", y al mismo
+tiempo `GUSBCFG` pasaba de `0x20001400` a `0x20002400` -el turnaround del PHY de
+5 a 9, que es el valor de un UTMI+ de 8 bits-. Ese registro no lo escribo yo. O
+sea que la llamada **si estaba haciendo algo** mientras mi codigo decia que no.
+
+El culpable era mio: devolvia un booleano, `(estado & ON) && !(estado & bit1)`,
+dando por hecho que el bit 1 de la respuesta significa "no existe ese
+dispositivo". En QEMU la respuesta es `0x00000001` y ese juicio acierta; en la
+placa contesto otra cosa y el juicio la convirtio en un "no".
+
+Ahora se devuelve el estado tal cual y se imprime. **Cuando no se esta seguro de
+como se interpreta una respuesta, lo que hay que devolver es la respuesta**: un
+booleano se equivoca en silencio, y un numero se puede mirar.
+
+Y de paso, reintentos. Un `XACTERR` en la primera peticion a un dispositivo que
+acaba de salir de un reset es normal: el canal reintenta por su cuenta las veces
+que diga MC, pero uno que todavia se esta despertando puede fallar las tres.
+Cualquier pila de USB de verdad reintenta la enumeracion.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es

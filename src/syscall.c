@@ -342,7 +342,7 @@ void syscall_dispatch(struct trap_frame *f)
     case SYS_dev_power: {
         if (!current || !current->mmio_va) { ret = -EPERM; break; }
         if (f->x[0] != PWR_USB)            { ret = -EINVAL; break; }
-        ret = mbox_power_on((uint32_t)f->x[0]) ? 1 : 0;
+        ret = (int64_t)mbox_power_on((uint32_t)f->x[0]);
         break;
     }
 
