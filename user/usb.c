@@ -103,8 +103,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("  [usb] DMA: %d paginas en VA 0x%lx -> PA 0x%lx\n",
-           PAGINAS_DMA, (unsigned long)va, (unsigned long)pa);
+    (void)0;
 
     /* Que la fisica este alineada a pagina no es cosmetico: un controlador
      * de DMA con una direccion desalineada escribe donde no debe, y muchos
@@ -132,7 +131,9 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    printf("  [usb] las %d paginas se escriben y se releen bien\n", PAGINAS_DMA);
+    /* Y en silencio si sale bien, que es la regla de esta casa: lo normal no
+      * se anuncia. Arrancando en cada arranque, un driver que recita sus
+      * autopruebas llena la consola de ruido que nadie lee. */
 
     /* Uno por proceso: el segundo intento tiene que fallar, y decir por que. */
     uint64_t otra = 0;
@@ -141,8 +142,7 @@ int main(int argc, char **argv)
     else if (errno != EBUSY)
         printf("  [usb] MAL: el segundo tramo falla con %s, no con EBUSY\n",
                strerror(errno));
-    else
-        printf("  [usb] el segundo tramo dice EBUSY, como debe\n");
+    /* y si dice EBUSY, que es lo que debe, no se dice nada */
 
     /* --- 3. La interrupcion --- */
     int64_t puerto = port_create(-1);
@@ -155,8 +155,8 @@ int main(int argc, char **argv)
         printf("  [usb] MAL: el kernel no me deja reclamar la IRQ %d\n", IRQ_USB);
         return 1;
     }
-    printf("  [usb] IRQ %d reclamada en el puerto %ld\n",
-           IRQ_USB, (long)puerto);
+    printf("  [usb] IRQ %d reclamada; DMA en PA 0x%lx; el DWC2 sigue apagado\n",
+           IRQ_USB, (unsigned long)pa);
 
     /* Y las dos cosas que la tabla NO tiene que dejar hacer.
      *
@@ -169,17 +169,12 @@ int main(int argc, char **argv)
      * pudiera reclamar la del temporizador, podria parar el planificador. */
     if (irq_register(IRQ_UART, (int)puerto) >= 0)
         printf("  [usb] MAL: me ha dejado quitarle la UART al conserver\n");
-    else
-        printf("  [usb] la IRQ de la UART ya tiene duenyo: no me la da\n");
 
     if (irq_register(29, (int)puerto) >= 0)
         printf("  [usb] MAL: me ha dado una IRQ que no esta en la lista\n");
-    else
-        printf("  [usb] una IRQ fuera de la lista: no me la da\n");
 
     /* Y aqui se queda, sin tocar un solo registro de control. Encender el
      * controlador sin saber apagarlo es como se cuelga una placa. */
-    printf("  [usb] cimientos comprobados; el DWC2 sigue apagado\n\n");
 
     for (;;) sleep(1000);
 }

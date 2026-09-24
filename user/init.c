@@ -128,14 +128,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* 2b. Y la semilla del USB. No espera a nadie ni nadie la espera: hoy
-     *     solo comprueba que el kernel sabe conceder una segunda IRQ y
-     *     memoria para DMA, y deja el controlador apagado. Si falla, se
-     *     queja y el sistema sigue igual, que es lo que tiene que pasar con
-     *     un driver de algo que todavia no usa nadie. */
-    if (bootstrap("usb", 0, environ, DEV_USB) < 0)
-        printf("  [init] la semilla de USB no arranca, sigo sin ella\n");
-
     /* 3. Esperarlo, preguntando. */
     int vueltas = 0;
     while (!fs_responde()) {
@@ -150,6 +142,44 @@ int main(int argc, char **argv)
     int n = leer_rc("/etc/rc");
     if (n) printf("  [init] /etc/rc: %d variables\n", n);
     else   printf("  [init] sin /etc/rc, sigo con lo que traigo\n");
+
+    /* 4b. Y la semilla del USB, AL FINAL y no entre los otros dos drivers.
+     *
+     * El orden importa, y lo ensenyo la Pi. Arrancandola justo detras del
+     * servidor de ficheros, sus mensajes salian trenzados letra a letra con
+     * los del conserver y los del fs:
+     *
+     *     ns[rse ]edvider de finhorasvivv  enEE00
+     *
+     * El motivo no es nuevo -es el de siempre: el kernel y el conserver son
+     * dos drivers sobre la misma PL011, y el conserver escribe desde EL0 sin
+     * cerrojo- pero antes no se veia al arrancar porque no habia tres
+     * procesos hablando a la vez en esa ventana. En QEMU tampoco se ve,
+     * porque los tiempos son otros.
+     *
+     * Esto no arregla el trenzado: arregla que lo provoque yo. Un driver de
+     * algo que todavia no usa nadie no tiene por que competir por la consola
+     * mientras arranca el sistema, y arrancarlo cuando los demas ya han
+     * terminado de hablar es gratis. El trenzado de verdad se arregla el dia
+     * que haya UN solo driver de la UART, y eso es la reforma que el README
+     * lleva nombrando desde el paso 8.
+     *
+     * Y el sleep de abajo es exactamente lo que parece: una tirita. Lo
+     * correcto seria que init esperara a que cada servidor este listo antes
+     * de arrancar el siguiente -es lo que ya hace con el de ficheros,
+     * preguntandole por stat("/")- y para eso la semilla necesita algo a lo
+     * que se le pueda preguntar, que hoy no tiene porque todavia no es un
+     * servidor. Cuando lo sea, este sleep se va y se hace como con el fs.
+     *
+     * Lo apunto en vez de disimularlo porque un sleep en un arranque es la
+     * clase de linea que dentro de diez pasos nadie recuerda por que esta.
+     *
+     * No espera a nadie ni nadie la espera: si falla, se queja y el sistema
+     * sigue igual. */
+    if (bootstrap("usb", 0, environ, DEV_USB) < 0)
+        printf("  [init] la semilla de USB no arranca, sigo sin ella\n");
+    else
+        sleep(10);          /* 100 ms: que acabe de hablar antes del shell */
 
     /* 5. Y el interprete, para siempre: si se va, vuelve. Eso es lo que
      *    hace que "salir" no deje la maquina muda. */

@@ -5298,6 +5298,30 @@ es la unica forma de saber si la ventana da al sitio correcto.
   [usb] una IRQ fuera de la lista: no me la da
 ```
 
+### Lo mismo en la Pi, que no dice lo mismo
+
+Los registros de identidad son lo unico que este paso lee, y por eso es
+interesante compararlos: QEMU modela el DWC2, pero no modela ESTE DWC2.
+
+| | QEMU raspi3b | Pi 3B de verdad |
+|---|---|---|
+| `GSNPSID` | `0x4f54294a` -> 2.94a | `0x4f54280a` -> **2.80a** |
+| `GHWCFG2` | `0x250dc016` | `0x228ddd50` |
+| `GHWCFG3` | `0x10000044` | **`0x0ff000e8`** |
+| `GHWCFG4` | `0x00000000` | **`0x1ff00020`** |
+
+Lo que coincide es lo que importaba confirmar: **DMA interno y 8 canales de
+anfitrion** en las dos. Lo que no coincide dice cosas utiles. La version es
+otra -2.80a es la que lleva el chip- y `GHWCFG3` trae en la Pi un campo que
+QEMU deja a cero: sus bits [31:16] son la profundidad de la FIFO de datos, y
+`0x0ff0` son 4080 palabras, o sea **16.320 bytes de FIFO** para repartir entre
+los ocho canales. Ese numero acota cuanto puede haber en vuelo a la vez y
+hara falta en el paso que planifique transferencias.
+
+Que QEMU conteste algo plausible pero distinto es la razon de que este paso
+tenga que probarse en la placa: un driver escrito contra los numeros del
+emulador habria dado por hecho una FIFO de cero bytes.
+
 Dos datos de ahi deciden como habra que escribir el driver. **DMA interno**
 quiere decir que el controlador lee y escribe la RAM el solo, o sea que lo que
 acabamos de anyadir es exactamente lo que hacia falta. Y **ocho canales de
@@ -5438,6 +5462,19 @@ saberlo antes de empezar a escribir el otro.
   letra: `lento a | lento b` saca las dos lineas trenzadas. El descriptor
   de consola no tiene cerrojo, y ponerselo no bastaria mientras el kernel
   y el `conserver` sigan siendo dos drivers sobre la misma UART.
+
+  En la Pi eso se ve **al arrancar**, que es donde mas molesta, porque el
+  conserver y el servidor de ficheros se presentan a la vez:
+
+  ```
+     ns[rse ]edvider de finhorasvivv  enEE00
+  ```
+
+  En QEMU no sale, porque los tiempos son otros. Lo unico que se ha hecho es
+  no meter una tercera voz en esa ventana -la semilla de USB arranca al final,
+  con un `sleep` de 100 ms que es una tirita y esta comentado como tal-. El
+  trenzado de las otras dos sigue ahi y seguira hasta que haya UN solo driver
+  de la UART.
 - No hay `WCONTINUED`: "ha seguido" no es un suceso que nadie observe, asi
   que un `kill -18` a mano deja la lista diciendo "parado" de algo que corre.
   Los unicos SIGCONT de aqui los manda el propio shell con `fg` y `bg`, y
