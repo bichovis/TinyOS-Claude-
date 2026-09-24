@@ -213,6 +213,9 @@ static int dispositivo_baja;  /* 1 = el dispositivo es de BAJA velocidad */
  * chip ha escrito en otra parte. Sin ese patron, las dos cosas se ven igual. */
 #define BUS(pa)   ((uint32_t)((uint64_t)(pa) | 0xC0000000UL))
 
+/* El hub del LAN9514 es siempre la direccion 1: es lo primero que se enumera. */
+#define DIR_HUB   1
+
 /* Y este chip quiere la DE BUS. Esta linea ha cambiado de valor dos veces, y
  * las dos veces por un razonamiento mio que parecia un experimento y no lo era.
  *
@@ -920,6 +923,222 @@ static int hub_estado_puerto(int addr, int mps, int puerto,
     return 0;
 }
 
+/* --- Almacenamiento masivo: un disco al otro lado de un cable ---------------
+ *
+ * Un pendrive no es un dispositivo USB "de discos": es un dispositivo SCSI
+ * -el mismo idioma de los discos de los servidores de los anyos 90- metido
+ * en un sobre USB. El sobre se llama Bulk-Only Transport, BOT, y es de una
+ * simplicidad que se agradece:
+ *
+ *   1. un paquete de 31 bytes por el endpoint bulk OUT: el CBW, "Command
+ *      Block Wrapper", que lleva dentro la orden SCSI (INQUIRY, READ...) y
+ *      dice cuantos bytes van a ir o venir despues;
+ *   2. los datos, si los hay, por el bulk IN o el bulk OUT;
+ *   3. un paquete de 13 bytes por el bulk IN: el CSW, "Command Status
+ *      Wrapper", que dice si la orden salio bien.
+ *
+ * Y nada mas. No hay interrupciones, ni registros, ni estado: cada orden es
+ * un dialogo entero y el siguiente empieza de cero. Es lo que hace que un
+ * driver de pendrive quepa en doscientas lineas, y por lo que todos los
+ * pendrives del mundo funcionan con el mismo driver.
+ *
+ * Las ordenes SCSI que hacen falta para un disco son cuatro: INQUIRY (quien
+ * eres), TEST UNIT READY (estas listo), READ CAPACITY (cuanto mides) y
+ * READ/WRITE(10) (dame/toma estos sectores). Los numeros van en big-endian,
+ * que era lo natural cuando SCSI se escribio. */
+struct disco {
+    int hay, addr, mps0, iface;
+    int ep_in, ep_out, mps_in, mps_out;
+    int tog_in, tog_out;                 /* el DATA0/1 de cada endpoint bulk */
+    int split, puerto, baja;
+    uint32_t sectores, tam_sector;
+    char vendedor[9], producto[17];
+};
+static struct disco disco;
+
+/* Sitios en el tramo de DMA: el CBW y el CSW aparte de los datos, para que
+ * una lectura no pise la orden que la pidio. */
+#define OFF_CBW      1024
+#define OFF_CSW      1088
+#define OFF_SECTOR   8192
+#define SECTORES_MAX   16                /* 8 KB por orden, de sobra */
+
+static uint32_t etiqueta_cbw = 1;
+
+/* Una transferencia bulk con el disco, llevando la cuenta del toggle.
+ *
+ * El DATA0/DATA1 de un endpoint bulk persiste entre transferencias: el
+ * siguiente paquete lleva el PID contrario al ultimo. Se cuenta por paquetes
+ * y no se pregunta al chip, que en el camino partido no lo dice. Un STALL es
+ * el disco diciendo "esa orden no": se limpia el endpoint con CLEAR_FEATURE
+ * (ENDPOINT_HALT) y el toggle vuelve a DATA0, que es lo que manda la norma.
+ * Devuelve los bytes movidos o -1. */
+static int disco_bulk(int entrada, uint64_t pa, int bytes)
+{
+    int  ep  = entrada ? disco.ep_in   : disco.ep_out;
+    int  mps = entrada ? disco.mps_in  : disco.mps_out;
+    int *tog = entrada ? &disco.tog_in : &disco.tog_out;
+
+    split_activo = disco.split; split_hub = DIR_HUB; split_puerto = disco.puerto;
+    dispositivo_baja = disco.baja;
+    uint32_t r = canal_transferir(entrada, EP_BULK, mps, disco.addr, ep,
+                                  *tog ? PID_DATA1 : PID_DATA0, pa, bytes);
+    split_activo = 0;
+
+    if (!(r & HCI_XFERCOMPL)) {
+        if (r & HCI_STALL) {
+            control_escribir(disco.addr, disco.mps0, 0x02, 1, 0,
+                             (uint16_t)(ep | (entrada ? 0x80 : 0)));
+            *tog = 0;
+        }
+        return -1;
+    }
+
+    int hechos = entrada ? ultimo_recibido : bytes;
+    int paquetes = hechos ? (hechos + mps - 1) / mps : 1;
+    *tog ^= (paquetes & 1);
+    return hechos;
+}
+
+/* Una orden SCSI entera: CBW, datos, CSW. Devuelve los bytes de datos que
+ * se movieron, -1 si el transporte fallo, -2 si el disco dijo que no. */
+static int disco_orden(const uint8_t *cb, int cblen, int entrada, uint64_t pa, int bytes)
+{
+    volatile uint8_t *cbw = (volatile uint8_t *)(dma_va + OFF_CBW);
+    volatile uint8_t *csw = (volatile uint8_t *)(dma_va + OFF_CSW);
+    uint32_t tag = etiqueta_cbw++;
+
+    for (int i = 0; i < 31; i++) cbw[i] = 0;
+    cbw[0] = 'U'; cbw[1] = 'S'; cbw[2] = 'B'; cbw[3] = 'C';
+    cbw[4] = (uint8_t)tag;   cbw[5] = (uint8_t)(tag >> 8);
+    cbw[6] = (uint8_t)(tag >> 16); cbw[7] = (uint8_t)(tag >> 24);
+    cbw[8] = (uint8_t)bytes; cbw[9] = (uint8_t)(bytes >> 8);
+    cbw[10] = (uint8_t)(bytes >> 16); cbw[11] = (uint8_t)(bytes >> 24);
+    cbw[12] = entrada ? 0x80 : 0;
+    cbw[13] = 0;                                    /* LUN 0 */
+    cbw[14] = (uint8_t)cblen;
+    for (int i = 0; i < cblen && i < 16; i++) cbw[15 + i] = cb[i];
+
+    if (disco_bulk(0, dma_pa + OFF_CBW, 31) < 0) return -1;
+
+    int hechos = 0;
+    if (bytes) {
+        hechos = disco_bulk(entrada, pa, bytes);
+        if (hechos < 0) hechos = 0;      /* STALL en los datos: el CSW dira */
+    }
+
+    int n = disco_bulk(1, dma_pa + OFF_CSW, 13);
+    if (n < 0) n = disco_bulk(1, dma_pa + OFF_CSW, 13);   /* tras limpiar el STALL */
+    if (n != 13 || csw[0] != 'U' || csw[1] != 'S' || csw[2] != 'B' || csw[3] != 'S')
+        return -1;
+    uint32_t tag2 = csw[4] | (csw[5] << 8) | ((uint32_t)csw[6] << 16) | ((uint32_t)csw[7] << 24);
+    if (tag2 != tag) return -1;
+    if (csw[12] != 0) return -2;
+    return hechos;
+}
+
+static void copiar_recortado(char *dst, const volatile uint8_t *src, int n)
+{
+    int fin = n;
+    while (fin > 0 && (src[fin - 1] == ' ' || src[fin - 1] == 0)) fin--;
+    for (int i = 0; i < fin; i++) dst[i] = (char)src[i];
+    dst[fin] = 0;
+}
+
+/* Quien eres (INQUIRY), estas listo (TEST UNIT READY, con REQUEST SENSE si
+ * dice que no: un pendrive recien enchufado suele contestar "acabo de
+ * arrancar" a la primera) y cuanto mides (READ CAPACITY). */
+static int disco_arrancar(void)
+{
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_SECTOR);
+
+    uint8_t inquiry[6] = { 0x12, 0, 0, 0, 36, 0 };
+    if (disco_orden(inquiry, 6, 1, dma_pa + OFF_SECTOR, 36) < 36) {
+        printf("  [usb] el disco no contesta al INQUIRY\n");
+        return -1;
+    }
+    copiar_recortado(disco.vendedor, d + 8, 8);
+    copiar_recortado(disco.producto, d + 16, 16);
+    printf("  [usb] disco: \"%s %s\", tipo SCSI %d%s\n", disco.vendedor, disco.producto,
+           d[0] & 0x1F, (d[1] & 0x80) ? ", extraible" : "");
+
+    uint8_t listo[6] = { 0x00, 0, 0, 0, 0, 0 };
+    uint8_t sense[6] = { 0x03, 0, 0, 0, 18, 0 };
+    int intento;
+    for (intento = 0; intento < 20; intento++) {
+        if (disco_orden(listo, 6, 0, 0, 0) == 0) break;
+        if (disco_orden(sense, 6, 1, dma_pa + OFF_SECTOR, 18) >= 18 && detallado)
+            printf("  [usb] sense: clave %d asc %02x ascq %02x\n", d[2] & 0xF, d[12], d[13]);
+        sleep(10);
+    }
+    if (intento == 20) { printf("  [usb] el disco no se pone listo\n"); return -1; }
+
+    uint8_t capacidad[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    if (disco_orden(capacidad, 10, 1, dma_pa + OFF_SECTOR, 8) < 8) {
+        printf("  [usb] el disco no dice cuanto mide\n");
+        return -1;
+    }
+    uint32_t ultimo = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | (d[2] << 8) | d[3];
+    disco.tam_sector = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) | (d[6] << 8) | d[7];
+    disco.sectores = ultimo + 1;
+    printf("  [usb] %u sectores de %u bytes: %u MB\n", disco.sectores, disco.tam_sector,
+           (unsigned)(((uint64_t)disco.sectores * disco.tam_sector) >> 20));
+    if (disco.tam_sector != 512) {
+        printf("  [usb] sectores que no son de 512 bytes: no se leerlos\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* Leer o escribir n sectores seguidos (n <= SECTORES_MAX) en el tramo de DMA
+ * de OFF_SECTOR. 0 si va bien. */
+static int disco_leer(uint32_t lba, int n)
+{
+    uint8_t cb[10] = { 0x28, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+                       (uint8_t)(lba >> 8), (uint8_t)lba, 0, (uint8_t)(n >> 8), (uint8_t)n, 0 };
+    return disco_orden(cb, 10, 1, dma_pa + OFF_SECTOR, n * 512) == n * 512 ? 0 : -1;
+}
+
+static int __attribute__((unused)) disco_escribir(uint32_t lba, int n)   /* lo usa el paso 68 */
+{
+    uint8_t cb[10] = { 0x2A, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+                       (uint8_t)(lba >> 8), (uint8_t)lba, 0, (uint8_t)(n >> 8), (uint8_t)n, 0 };
+    return disco_orden(cb, 10, 0, dma_pa + OFF_SECTOR, n * 512) == n * 512 ? 0 : -1;
+}
+
+/* El sector 0, que es donde un disco dice como esta repartido: o una tabla
+ * de particiones (MBR, la firma 0xAA55 al final y cuatro entradas de 16
+ * bytes desde el 446) o directamente un volumen FAT sin tabla, que es como
+ * vienen muchos pendrives de fabrica ("superfloppy"). */
+static void disco_presentar_sector0(void)
+{
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_SECTOR);
+
+    if (disco_leer(0, 1) < 0) { printf("  [usb] no puedo leer el sector 0\n"); return; }
+
+    if (d[510] != 0x55 || d[511] != 0xAA) {
+        printf("  [usb] sector 0 sin firma 0xAA55: %02x %02x %02x ...\n", d[0], d[1], d[2]);
+        return;
+    }
+
+    /* Un BPB empieza por un salto y dice 512 bytes por sector en el 11. Si es
+     * asi, el sector 0 es ya el volumen: no hay tabla. */
+    if ((d[0] == 0xEB || d[0] == 0xE9) && d[11] == 0 && d[12] == 2) {
+        printf("  [usb] sector 0: un volumen FAT directamente, sin tabla de particiones\n");
+        return;
+    }
+
+    printf("  [usb] sector 0: tabla de particiones\n");
+    for (int i = 0; i < 4; i++) {
+        const volatile uint8_t *e = d + 446 + i * 16;
+        if (!e[4]) continue;
+        uint32_t lba = e[8] | (e[9] << 8) | ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+        uint32_t tam = e[12] | (e[13] << 8) | ((uint32_t)e[14] << 16) | ((uint32_t)e[15] << 24);
+        printf("  [usb]   particion %d: tipo 0x%02x, empieza en %u, %u sectores (%u MB)\n",
+               i + 1, e[4], lba, tam, tam >> 11);
+    }
+}
+
 /* --- HID: el idioma de los teclados -------------------------------------------
  *
  * Un dispositivo HID describe con un "report descriptor" el formato de lo que
@@ -943,7 +1162,6 @@ struct hid_ep {
     int hay;
 };
 
-#define DIR_HUB 1
 
 static struct hid_ep teclado, raton;
 
@@ -951,8 +1169,9 @@ static struct hid_ep teclado, raton;
  * diagnostico; "dos mil NAK y ningun NYET" si lo es. */
 static unsigned sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error;
 
-/* Leer la configuracion entera y apuntar donde estan el teclado y el raton. */
-static int hid_descubrir(int addr, int mps)
+/* Leer la configuracion entera y apuntar donde esta lo que se entiende: un
+ * teclado, un raton, un disco. */
+static int descubrir(int addr, int mps)
 {
     volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
 
@@ -975,7 +1194,23 @@ static int hid_descubrir(int addr, int mps)
             printf("  [usb]   interfaz %d: clase %d.%d protocolo %d%s\n",
                    iface, clase, sub, proto,
                    clase == 3 ? (proto == 1 ? " (teclado boot)" :
-                                 proto == 2 ? " (raton boot)" : " (HID)") : "");
+                                 proto == 2 ? " (raton boot)" : " (HID)") :
+                   clase == 8 ? (sub == 6 && proto == 0x50 ? " (disco SCSI, bulk-only)"
+                                                           : " (almacenamiento)") : "");
+        }
+        /* Un disco: clase 8, subclase 6 (ordenes SCSI transparentes) y
+         * protocolo 0x50 (bulk-only). Sus dos endpoints bulk, uno por sentido. */
+        if (tipo == 5 && clase == 8 && sub == 6 && proto == 0x50 && (d[i + 3] & 3) == 2) {
+            int mps_ep = d[i + 4] | (d[i + 5] << 8);
+            printf("  [usb]     endpoint 0x%02x bulk, %d bytes\n", d[i + 2], mps_ep);
+            if (!disco.hay) {
+                disco.addr = addr; disco.mps0 = mps; disco.iface = iface;
+                disco.split = split_activo; disco.puerto = split_puerto;
+                disco.baja = dispositivo_baja;
+            }
+            if (d[i + 2] & 0x80) { disco.ep_in  = d[i + 2] & 0xF; disco.mps_in  = mps_ep; }
+            else                 { disco.ep_out = d[i + 2] & 0xF; disco.mps_out = mps_ep; }
+            if (disco.ep_in && disco.ep_out && disco.addr == addr) disco.hay = 1;
         }
         if (tipo == 5 && clase == 3 && (d[i + 2] & 0x80)) {   /* endpoint IN */
             struct hid_ep *e = (proto == 1) ? &teclado : (proto == 2) ? &raton : 0;
@@ -1002,6 +1237,14 @@ static int hid_descubrir(int addr, int mps)
         if (!es[k]->hay || es[k]->addr != addr) continue;
         control_escribir(addr, mps, 0x21, HID_SET_PROTOCOL, HID_PROTO_BOOT, (uint16_t)es[k]->iface);
         control_escribir(addr, mps, 0x21, HID_SET_IDLE, 0, (uint16_t)es[k]->iface);
+    }
+
+    /* Y si lo que hay es un disco, presentarlo: quien es, cuanto mide y
+     * como esta repartido. */
+    if (disco.hay && disco.addr == addr) {
+        disco.tog_in = disco.tog_out = 0;
+        if (disco_arrancar() < 0) disco.hay = 0;
+        else disco_presentar_sector0();
     }
     return 0;
 }
@@ -1695,7 +1938,7 @@ int main(int argc, char **argv)
 
         /* Si es un HID -clase 0 en el dispositivo y clase 3 en la interfaz-,
          * mirar dentro y dejarlo listo para sondearlo. */
-        if (c2 == 0 && hid_descubrir(siguiente_dir, mps2) == 0 && (teclado.hay || raton.hay))
+        if (c2 == 0 && descubrir(siguiente_dir, mps2) == 0 && (teclado.hay || raton.hay))
             printf("  [usb] HID configurado: %s%s%s\n",
                    teclado.hay ? "teclado" : "", (teclado.hay && raton.hay) ? " y " : "",
                    raton.hay ? "raton" : "");

@@ -6691,6 +6691,63 @@ puesta, y estamos donde estabamos. Con el arreglo, `DESPUES-DEL-ESTRES` sale
 en su sitio, y dos procesos escribiendo a la vez (`c1`) siguen saliendo
 enteros.
 
+## Un disco al otro lado de un cable
+
+David enchufo un pendrive y pidio que cualquier unidad extraible se monte en
+`/mnt`. Son dos cosas: hablar con el disco, y que el servidor de ficheros lo
+use. Este paso es la primera.
+
+### SCSI dentro de un sobre
+
+Un pendrive no es un dispositivo USB "de discos": es un dispositivo SCSI -el
+idioma de los discos de los servidores de los anyos 90- metido en un sobre
+USB. El sobre se llama *Bulk-Only Transport* y es de una simplicidad que se
+agradece: un paquete de 31 bytes por el endpoint bulk OUT (el CBW, que lleva
+dentro la orden SCSI y dice cuantos bytes van a ir o venir), los datos por el
+bulk que toque, y 13 bytes de vuelta por el bulk IN (el CSW: salio bien o
+no). Cada orden es un dialogo entero; el siguiente empieza de cero. No hay
+registros ni estado, y por eso todos los pendrives del mundo funcionan con
+el mismo driver de doscientas lineas.
+
+Las ordenes que hacen falta son cuatro: INQUIRY (quien eres: "QEMU QEMU
+HARDDISK"), TEST UNIT READY (estas listo; un pendrive recien enchufado suele
+decir que no a la primera y hay que pedirle el *sense* y volver), READ
+CAPACITY (cuanto mides, en big-endian, que era lo natural cuando SCSI se
+escribio) y READ/WRITE(10) (estos sectores).
+
+### Lo que si hay que llevar: el toggle
+
+Lo unico con estado es el DATA0/DATA1 de cada endpoint bulk, que persiste
+entre transferencias: el siguiente paquete lleva el PID contrario al ultimo.
+`disco_bulk` lo cuenta por paquetes -en el camino partido el chip no lo
+dice- y un STALL, que es el disco diciendo "esa orden no", se limpia con
+CLEAR_FEATURE(ENDPOINT_HALT) y el toggle vuelve a DATA0, como manda la
+norma.
+
+### Descubrirlo
+
+`hid_descubrir` pasa a llamarse `descubrir`: lee la configuracion una vez y
+apunta lo que entiende, sea un teclado, un raton o un disco (clase 8,
+subclase 6 -SCSI transparente-, protocolo 0x50 -bulk-only-, y sus dos
+endpoints bulk). Tras SET_CONFIGURATION, si hay disco se le pregunta quien
+es, si esta listo y cuanto mide, y se lee su sector 0: una tabla de
+particiones (firma 0xAA55, cuatro entradas de 16 bytes desde el 446) o un
+volumen FAT directamente, que es como vienen muchos de fabrica.
+
+En QEMU (`-device usb-storage` con una imagen de 32 MB particionada con
+`diskutil`):
+
+    [usb]   interfaz 0: clase 8.6 protocolo 80 (disco SCSI, bulk-only)
+    [usb]     endpoint 0x81 bulk, 64 bytes
+    [usb]     endpoint 0x02 bulk, 64 bytes
+    [usb] disco: "QEMU QEMU HARDDISK", tipo SCSI 0
+    [usb] 65536 sectores de 512 bytes: 32 MB
+    [usb] sector 0: tabla de particiones
+    [usb]   particion 1: tipo 0x06, empieza en 63, 65457 sectores (31 MB)
+
+Los numeros coinciden con lo que puso `diskutil`. Falta la segunda mitad:
+que el servidor de ficheros lea esos sectores y los monte en `/mnt`.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
