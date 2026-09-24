@@ -5980,6 +5980,47 @@ tambien para decidir si el bit se enciende, y ponerla no provoca ninguna
 interrupcion porque para eso hace falta ademas `GINTMSK.HChInt`, que sigue a
 cero.
 
+### El experimento contesto, y con precision
+
+```
+  primer intento  (bus):    HCDMA = 0xc015c008
+  segundo intento (fisica): HCDMA = 0x0015c000
+```
+
+El paquete de SETUP esta en `0x15c000`. En el primer intento el nucleo **avanzo
+el puntero ocho bytes**: leyo los ocho bytes por DMA. En el segundo no lo movio.
+Asi que la direccion de bus es la correcta -el `0xC0000000` va- y el DMA
+funciona.
+
+Y eso acota el problema a un sitio muy pequenyo: el nucleo **tiene los datos y
+no los transmite**. `GAHBCFG` con el DMA encendido, `HCCHAR` y `HCTSIZ` bien,
+`HAINT` a cero.
+
+Con eso delante, `HCCHAR = 0x80000008` tiene un agujero: los bits 21:20, que
+son **MC/EC**. En una transferencia periodica son "cuantos paquetes por trama";
+en una no periodica -un control, un bulk- son el numero de transacciones que el
+canal tiene que hacer. Y tienen que ser al menos una.
+
+Yo no los ponia, asi que valian cero. Y cero no es "el valor por defecto": es
+**"no hagas ninguna transaccion"**. El nucleo leia los ocho bytes, se los
+quedaba en la FIFO y no tenia nada que hacer con ellos. Ni los transmitia ni
+daba error, porque no habia error: habia cero transacciones pedidas y hizo cero.
+
+En QEMU funcionaba igual, que a estas alturas ya no sorprende: su modelo no
+cuenta transacciones.
+
+### Y un punto ciego que llevaba tres iteraciones teniendo
+
+`GUSBCFG` lo escribo y **nunca lo leia de vuelta**. Tres arranques dando por
+hecho que mis escrituras se sostenian, cuando la anomalia que arrastro -que el
+puerto enumere a velocidad completa teniendo un hub de alta velocidad- se
+explicaria sola si `PHYSEL` siguiera puesto.
+
+Ahora se imprime decodificado. No se si sera la respuesta, pero llevaba tres
+rondas sin mirar el registro que decide justamente eso, y eso es de las cosas
+que hay que dejar escritas: **cuando algo no cuadra, lo primero es leer de vuelta
+lo que crees que escribiste.**
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es

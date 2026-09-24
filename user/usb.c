@@ -112,6 +112,22 @@
 #define HCC_IN         (1u << 15)
 #define HCC_LOWSPEED   (1u << 17)
 #define HCC_TIPO(n)    ((uint32_t)((n) & 3) << 18)
+/* --- El campo que me faltaba -------------------------------------------
+ *
+ * Bits 21:20. En una transferencia periodica es "cuantos paquetes por trama";
+ * en una no periodica -un control, un bulk- es el numero de transacciones que
+ * el canal tiene que hacer, o sea cuantas veces reintentar. Y tiene que ser
+ * AL MENOS UNA.
+ *
+ * Yo no lo ponia, asi que valia cero, y cero no es "el valor por defecto": es
+ * "no hagas ninguna transaccion". El nucleo leia por DMA los ocho bytes del
+ * SETUP -eso se veia, porque HCDMA avanzaba a 0x...008- y se quedaba con ellos
+ * en la FIFO sin nada que hacer. Ni los transmitia ni daba error: no habia
+ * nada que transmitir.
+ *
+ * En QEMU funcionaba igual, que a estas alturas ya no sorprende: su modelo no
+ * cuenta transacciones. */
+#define HCC_MC(n)      ((uint32_t)((n) & 3) << 20)
 #define HCC_ADDR(n)    ((uint32_t)((n) & 0x7F) << 22)
 #define HCC_DISABLE    (1u << 30)
 #define HCC_ENABLE     (1u << 31)
@@ -357,8 +373,9 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
                             HCT_BYTES(bytes));
     escribir(HCDMA(canal), dma_bus ? BUS(pa) : (uint32_t)pa);
 
-    escribir(HCCHAR(canal), HCC_ENABLE | HCC_ADDR(addr) | HCC_TIPO(tipo) |
-                            (entrada ? HCC_IN : 0) | HCC_EP(ep) | HCC_MPS(mps));
+    escribir(HCCHAR(canal), HCC_ENABLE | HCC_MC(1) | HCC_ADDR(addr) |
+                            HCC_TIPO(tipo) | (entrada ? HCC_IN : 0) |
+                            HCC_EP(ep) | HCC_MPS(mps));
 
     /* Y esperar. El canal acaba avisando por HCINT, y las dos formas de acabar
      * son "completada" y "detenida"; lo segundo puede ser bueno o malo, y lo
@@ -747,8 +764,19 @@ int main(int argc, char **argv)
     puerto_encender();
 
     uint32_t p = leer(HPRT0);
+    /* GUSBCFG leido de VUELTA, que es un punto ciego que llevaba tres
+     * iteraciones teniendo: lo escribo y nunca compruebo que se sostenga. Si
+     * PHYSEL siguiera puesto -el PHY serie de velocidad completa- el puerto
+     * enumeraria a velocidad completa sin remedio, que es exactamente lo que
+     * lleva pasando. */
+    uint32_t ucfg = leer(GUSBCFG);
     printf("  [usb] nucleo en modo anfitrion; HPRT0 = 0x%08x\n",
            (unsigned int)p);
+    printf("  [usb] GUSBCFG = 0x%08x: PHY %s, %s, modo %s\n",
+           (unsigned int)ucfg,
+           (ucfg & USB_PHYSEL_FS) ? "SERIE de velocidad completa" : "UTMI+/ULPI",
+           (ucfg & USB_ULPI_SEL)  ? "ULPI" : "UTMI+",
+           (ucfg & USB_FORCEHOST) ? "anfitrion forzado" : "segun el pin ID");
 
     if (!puerto_esperar_conexion()) {
         /* En la Pi aqui hay un LAN9514 soldado, asi que esto no deberia pasar;
