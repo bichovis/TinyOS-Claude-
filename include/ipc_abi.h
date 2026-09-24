@@ -43,8 +43,19 @@ struct message {
 #define CMSG_PRINT     1
 #define CMSG_IRQ       2    /* lo manda el KERNEL: ha llegado una interrupcion */
 
-/* La unica interrupcion que un proceso puede pedir, por ahora. */
+/* Las interrupciones que un proceso puede reclamar.
+ *
+ * Sigue siendo una lista escrita a mano, y eso no ha cambiado: un sistema
+ * serio la sacaria de un arbol de dispositivos, donde cada periferico dice
+ * que IRQ usa y el kernel se la concede a quien lo maneje. Lo que ha
+ * cambiado es que ya son DOS y que el kernel guarda una tabla en vez de una
+ * variable, que es la diferencia entre "esta escrito a mano" y "esta
+ * escrito a mano Y ademas solo cabe uno".
+ *
+ * La del temporizador no esta aqui ni lo estara: dejar que un proceso se
+ * quede con ella es dejarle parar el planificador. */
 #define IRQ_UART      57
+#define IRQ_USB        9    /* el DWC2, que en la Pi 3B lleva TODO detras  */
 
 /* --- Numeros de llamada al sistema ------------------------------------ */
 #define SYS_write         1    /* (fd, buffer, bytes) -> escritos | -1     */
@@ -123,6 +134,37 @@ struct message {
 #define SYS_pipe         22    /* (int fds[2]) -> 0 | -1                     */
 #define SYS_close        23    /* (fd) -> 0 | -1                             */
 #define SYS_dup2         24    /* (viejo, nuevo) -> nuevo | -1               */
+
+/* --- Memoria para DMA -------------------------------------------------
+ *
+ * Un driver de EL0 no puede usar su monton para hablar con un periferico, y
+ * por dos motivos que no tienen nada que ver entre si:
+ *
+ *   1. El monton da memoria CACHEABLE, y un periferico que escribe por DMA
+ *      no pasa por las caches de la CPU.
+ *   2. El monton da memoria virtualmente seguida, no FISICAMENTE seguida.
+ *      Al periferico se le da una direccion fisica y el no sabe traducir:
+ *      un buffer de 16 KB que la MMU presenta junto pero esta repartido en
+ *      cuatro paginas sueltas hace que el DMA escriba en tres sitios que no
+ *      son suyos. Eso no da un error, da corrupcion en otro proceso.
+ *
+ * Asi que hace falta una peticion distinta: paginas seguidas de verdad, sin
+ * cachear, y que el kernel diga DONDE ESTAN en memoria fisica, porque es el
+ * unico que lo sabe y el driver lo necesita para darselo al chip.
+ *
+ * Y eso ultimo es lo delicado de un microkernel. Dar una direccion fisica
+ * es dar un poder: quien sepa escribir en un registro de DMA con una
+ * direccion arbitraria puede escribir en cualquier sitio, incluido el
+ * kernel. La MMU deja de protegerte porque el DMA no pasa por la MMU. En
+ * una maquina moderna eso lo ataja una IOMMU, que es una MMU para
+ * perifericos; la Pi 3 no tiene, asi que la unica frontera posible es no
+ * darsela a cualquiera: solo a quien ya tiene un periferico concedido, o
+ * sea a un driver. Un proceso normal recibe -EPERM.
+ *
+ * Devuelve la direccion VIRTUAL del tramo y escribe la FISICA donde se le
+ * diga. Uno por proceso: si hace falta mas de un buffer, el driver reparte
+ * el suyo, que ademas es como funciona un "DMA pool" de verdad. */
+#define SYS_dma_alloc    52    /* (paginas, uint64_t *pa) -> VA | -errno   */
 
 /* --- Para los drivers de EL0 ------------------------------------------
  * Un proceso no puede recibir interrupciones: las interrupciones son de
@@ -208,6 +250,7 @@ struct message {
 #define DEV_NINGUNO       0
 #define DEV_UART          1
 #define DEV_EMMC          2
+#define DEV_USB           3    /* el DWC2 en 0x3F980000 */
 
 /* --- Grupos de procesos, o el trabajo en vez del proceso --------------
  *

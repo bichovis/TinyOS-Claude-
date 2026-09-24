@@ -77,11 +77,43 @@ static int leer_rc(const char *ruta)
     return puestas;
 }
 
+/* Recoger a cualquiera que haya muerto, sin bloquearse y sin preguntar por
+ * nadie en concreto. No imprime: un manejador de senyal no puede llamar a
+ * printf, que no es reentrante. Y no hace falta contar nada -de un driver que
+ * se muere no hay codigo de salida que a init le sirva-, solo enterrarlo. */
+static void enterrar(int sig)
+{
+    (void)sig;
+
+    /* Con tope, como todo bucle cuya salida decide otro. */
+    for (int v = 0; v < 32; v++)
+        if (waitpid_ya(PID_CUALQUIERA, 0, 0) < 0) return;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
     printf("\n  [init] soy el pid %lu, y arranco el sistema\n", getpid());
+
+    /* Y lo primero de todo: enterrar.
+     *
+     * Esto faltaba, y lo destapo el paso 58 al intentar comprobar que las
+     * paginas de DMA de un driver vuelven cuando el driver muere. No
+     * volvian, y no era un fallo del kernel: el recolector no toca un zombi
+     * que tenga padre vivo -existe para que su padre lea su codigo de
+     * salida- e init no esperaba a nadie mas que al interprete. Un driver
+     * que se muriera se quedaba de zombi PARA SIEMPRE, con su memoria, su
+     * ranura de tarea y, ahora, su tramo de DMA.
+     *
+     * Es el problema clasico del proceso 1, y tiene la solucion clasica: un
+     * init entierra. Con SIGCHLD se entera en el acto (paso 54) y con
+     * PID_CUALQUIERA puede recoger sin saber a quien (paso 55), que es justo
+     * lo que hace falta aqui: init no lleva una lista de sus drivers.
+     *
+     * Y con SIG_REANUDAR, porque init se pasa la vida dentro de un waitpid
+     * bloqueante y no quiere que se le rompa cada vez que muere alguien. */
+    signal_banderas(SIGCHLD, enterrar, SIG_REANUDAR);
 
     /* 1. La consola primero. Hasta que este, todo lo que se imprima sale
      *    por la via de emergencia del kernel. */
@@ -95,6 +127,14 @@ int main(int argc, char **argv)
         printf("  [init] no arranca el servidor de ficheros\n");
         return 1;
     }
+
+    /* 2b. Y la semilla del USB. No espera a nadie ni nadie la espera: hoy
+     *     solo comprueba que el kernel sabe conceder una segunda IRQ y
+     *     memoria para DMA, y deja el controlador apagado. Si falla, se
+     *     queja y el sistema sigue igual, que es lo que tiene que pasar con
+     *     un driver de algo que todavia no usa nadie. */
+    if (bootstrap("usb", 0, environ, DEV_USB) < 0)
+        printf("  [init] la semilla de USB no arranca, sigo sin ella\n");
 
     /* 3. Esperarlo, preguntando. */
     int vueltas = 0;

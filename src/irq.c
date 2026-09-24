@@ -64,7 +64,30 @@
 #define DISABLE_IRQS_1        (IC_BASE + 0x1C)
 #define DISABLE_IRQS_2        (IC_BASE + 0x20)
 
-#define IRQ_UART              57          /* la PL011 es la fuente 57      */
+/* IRQ_UART (57) e IRQ_USB (9) los define ipc_abi.h: son parte del contrato
+ * con los drivers de EL0, no un detalle interno de este fichero.
+ *
+ * Las 64 fuentes del controlador [1] viven en dos bancos de 32, y cada
+ * registro tiene su pareja. Hasta este paso todo esto estaba escrito a mano
+ * para el 57 -banco 2, bit 25- en los cinco sitios que lo tocaban. Con dos
+ * fuentes y una en cada banco, eso deja de valer. */
+static void irq_abrir(uint64_t irq)
+{
+    if (irq < 32) mmio_write(ENABLE_IRQS_1, 1u << irq);
+    else          mmio_write(ENABLE_IRQS_2, 1u << (irq - 32));
+}
+
+static void irq_cerrar(uint64_t irq)
+{
+    if (irq < 32) mmio_write(DISABLE_IRQS_1, 1u << irq);
+    else          mmio_write(DISABLE_IRQS_2, 1u << (irq - 32));
+}
+
+static int irq_pendiente(uint32_t p1, uint32_t p2, uint64_t irq)
+{
+    return (irq < 32) ? (p1 & (1u << irq)) != 0
+                      : (p2 & (1u << (irq - 32))) != 0;
+}
 
 /* Una cuenta por nucleo: sumar sobre la misma variable desde cuatro
  * manejadores seria justo el error que el paso 13b acaba de ensenyar. */
@@ -83,9 +106,14 @@ void irq_init(void)
      *   bits [3:2] = nucleo que recibe las FIQ                            */
     mmio_write(GPU_INT_ROUTING, 0);
 
-    /* [1] Habilitar la fuente 57 (UART0). Como 57 >= 32, va en el banco 2
-     *     y el bit dentro del banco es 57 - 32 = 25. */
-    mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
+    /* [1] Habilitar la de la UART, y SOLO esa.
+     *
+     * Es la unica que el kernel sabe atender por si mismo -tiene su propio
+     * driver de PL011- asi que puede estar abierta desde el arranque. Las
+     * demas se abren cuando alguien las reclama y se cierran cuando la
+     * suelta, porque una fuente abierta que nadie atiende es un sistema
+     * girando en el manejador para siempre. */
+    irq_abrir(IRQ_UART);
 
     irq_init_core();                 /* y lo que le toca al nucleo 0 */
 }
@@ -131,7 +159,35 @@ void irq_send_resched(uint64_t core)
  *
  * Solo se puede pedir la de la UART. Dejar que un proceso se quedara con
  * la del temporizador seria dejarle parar el planificador. */
-static int irq_puerto = -1;
+/* Una tabla, y no una variable.
+ *
+ * Aqui habia un solo hueco -'irq_puerto'- y una comprobacion que decia
+ * "solo la UART". Con dos drivers de EL0 eso no vale: el USB de la Pi 3B
+ * lleva detras la red y el almacenamiento externo, asi que el dia que haya
+ * un driver de USB habra DOS procesos esperando interrupciones distintas.
+ *
+ * Sigue siendo pequenya y sigue estando escrita a mano. Lo que ya no es, es
+ * un unico hueco. */
+#define MAX_IRQS_EL0   4
+
+static struct {
+    uint64_t irq;                 /* 0 = hueco libre */
+    int      puerto;
+} irqs_el0[MAX_IRQS_EL0];
+
+/* Y la lista de lo que se puede reclamar. Es la frontera de privilegio de
+ * las interrupciones, y por eso esta aqui y no la elige quien llama. */
+static int reclamable(uint64_t irq)
+{
+    return irq == IRQ_UART || irq == IRQ_USB;
+}
+
+static int hueco_de(uint64_t irq)
+{
+    for (int i = 0; i < MAX_IRQS_EL0; i++)
+        if (irqs_el0[i].irq == irq) return i;
+    return -1;
+}
 
 /* Avisos que no cupieron en la cola del driver. Si esto no es cero, el
  * driver no da abasto. */
@@ -139,24 +195,48 @@ uint64_t irq_avisos_perdidos;
 
 int irq_register(uint64_t irq, int puerto)
 {
-    if (irq != IRQ_UART || puerto < 0) return -1;
-    if (irq_puerto >= 0) return -1;      /* ya la lleva otro */
-    irq_puerto = puerto;
+    if (!reclamable(irq) || puerto < 0) return -1;
+    if (hueco_de(irq) >= 0)             return -1;   /* ya la lleva otro */
+
+    int libre = hueco_de(0);
+    if (libre < 0) return -1;                        /* no caben mas */
+
+    irqs_el0[libre].irq    = irq;
+    irqs_el0[libre].puerto = puerto;
+
+    /* Abrirla AL RECLAMARLA. La de la UART ya estaba abierta y volver a
+     * abrirla no hace danyo; las demas no lo estaban, porque hasta ahora no
+     * habia nadie que supiera atenderlas. */
+    irq_abrir(irq);
     return 0;
 }
 
-/* El proceso que la tenia ha muerto: el kernel la recupera y la reabre. */
+/* El proceso que la tenia ha muerto: el kernel recupera sus fuentes.
+ *
+ * Lo que se hace con cada una NO es lo mismo, y es la diferencia entre las
+ * dos clases de interrupcion que hay aqui: la de la UART se vuelve a abrir,
+ * porque el kernel tiene driver propio y puede seguir el solo -es lo que
+ * hace que matar al conserver no deje la maquina sin teclado-. Cualquier
+ * otra se CIERRA, porque no hay nadie detras: dejarla abierta sin quien la
+ * atienda es colgar la maquina en el manejador. */
 void irq_release_port(int puerto)
 {
-    if (irq_puerto != puerto) return;
-    irq_puerto = -1;
-    mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
+    for (int i = 0; i < MAX_IRQS_EL0; i++) {
+        if (irqs_el0[i].irq == 0 || irqs_el0[i].puerto != puerto) continue;
+
+        uint64_t irq = irqs_el0[i].irq;
+        irqs_el0[i].irq    = 0;
+        irqs_el0[i].puerto = -1;
+
+        if (irq == IRQ_UART) irq_abrir(irq);
+        else                 irq_cerrar(irq);
+    }
 }
 
 int irq_ack(uint64_t irq)
 {
-    if (irq != IRQ_UART) return -1;
-    mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
+    if (hueco_de(irq) < 0) return -1;    /* no es tuya, no la reabres */
+    irq_abrir(irq);
     return 0;
 }
 
@@ -184,31 +264,38 @@ void irq_handle(void)
     /* Las IRQ de perifericos van todas al nucleo 0 (GPU_INT_ROUTING), asi
      * que este bit solo se enciende alli. */
     if (src & SRC_GPU) {
-        /* Segunda pregunta: dentro del controlador [1], quien fue. */
+        /* Segunda pregunta: dentro del controlador [1], quien fue. Se leen
+         * los dos bancos una sola vez, no uno por cada fuente registrada. */
+        uint32_t p1 = mmio_read(IRQ_PENDING_1);
         uint32_t p2 = mmio_read(IRQ_PENDING_2);
-        if (p2 & (1u << (IRQ_UART - 32))) {
-            if (irq_puerto >= 0) {
-                /* Hay un driver en EL0 esperandola: se le avisa y se cierra
-                 * hasta que diga que ya.
-                 *
-                 * Y si el aviso NO se puede entregar -la cola del puerto
-                 * llena- hay que volver a abrirla inmediatamente. Esto no
-                 * es una precaucion teorica: enmascarar y no avisar deja la
-                 * fuente cerrada esperando un irq_ack que nadie va a
-                 * hacer, y el teclado se muere para siempre sin un solo
-                 * mensaje de error. Es la version con interrupciones del
-                 * mismo fallo de siempre: dos pasos que tienen que pasar
-                 * los dos o ninguno. */
-                mmio_write(DISABLE_IRQS_2, 1u << (IRQ_UART - 32));
 
-                if (port_notify(irq_puerto, CMSG_IRQ) < 0) {
-                    irq_avisos_perdidos++;
-                    mmio_write(ENABLE_IRQS_2, 1u << (IRQ_UART - 32));
-                }
-            } else {
-                uart_irq();              /* todavia la lleva el kernel */
+        /* Las que tienen duenyo en EL0. */
+        for (int i = 0; i < MAX_IRQS_EL0; i++) {
+            uint64_t irq = irqs_el0[i].irq;
+            if (!irq || !irq_pendiente(p1, p2, irq)) continue;
+
+            /* Se le avisa y se CIERRA hasta que diga que ya.
+             *
+             * Y si el aviso NO se puede entregar -la cola del puerto
+             * llena- hay que volver a abrirla inmediatamente. Esto no es
+             * una precaucion teorica: enmascarar y no avisar deja la
+             * fuente cerrada esperando un irq_ack que nadie va a hacer, y
+             * el teclado se muere para siempre sin un solo mensaje de
+             * error. Es la version con interrupciones del mismo fallo de
+             * siempre: dos pasos que tienen que pasar los dos o ninguno. */
+            irq_cerrar(irq);
+
+            if (port_notify(irqs_el0[i].puerto, CMSG_IRQ) < 0) {
+                irq_avisos_perdidos++;
+                irq_abrir(irq);
             }
         }
+
+        /* Y la UART cuando todavia la lleva el kernel, que es el caso de
+         * antes de que init arranque el conserver -y el de despues, si el
+         * conserver se muere-. */
+        if (irq_pendiente(p1, p2, IRQ_UART) && hueco_de(IRQ_UART) < 0)
+            uart_irq();
     }
 
     /* Punto seguro para cambiar de hilo: el contexto del hilo interrumpido

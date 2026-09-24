@@ -686,6 +686,22 @@ void syscall_dispatch(struct trap_frame *f)
         ret = uart_modo((int)(int64_t)f->x[0]);
         break;
 
+    /* Un tramo de DMA. Devuelve la virtual y escribe la fisica donde le
+     * digan; sin puntero, la fisica no se cuenta -que es legitimo: un
+     * driver puede querer el tramo solo para hablar consigo mismo-. */
+    case SYS_dma_alloc: {
+        uint64_t fisica = 0;
+        int64_t  va = task_dma_alloc(f->x[0], &fisica);
+
+        if (va > 0 && f->x[1]) {
+            if (!user_rango(f->x[1], sizeof(uint64_t))) { ret = -EFAULT; break; }
+            if (copy_to_user(f->x[1], &fisica, sizeof(fisica)) != 0)
+                { ret = -EFAULT; break; }
+        }
+        ret = va;
+        break;
+    }
+
     case SYS_mmio_base:
         /* El kernel concede el MMIO al crear el proceso; aqui solo le
          * decimos en que direccion virtual se lo dejo. Un sistema serio

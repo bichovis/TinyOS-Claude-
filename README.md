@@ -5180,6 +5180,184 @@ mecanismo ya esta: no hay contadores (`3dd`, `5G`), ni copiar y pegar (`yy`,
 cual: las expresiones regulares son el otro programa que habria que escribir, y
 no es este.
 
+## Los cimientos de un driver de USB
+
+Esto no conduce USB. Lo que hace es quitar las dos cosas que hacian imposible
+escribir un driver de USB en EL0, y probar que ya no estan.
+
+Y hace falta empezar por ahi porque en la Pi 3B el USB no es "un puerto mas".
+Del controlador DWC2 cuelga un LAN9514, que es a la vez el hub de los cuatro
+conectores **y la tarjeta de red**. Sin USB no hay red ni almacenamiento
+externo, y hasta la Ethernet esta detras del hub interno: no hay atajo por
+ningun lado.
+
+### Una tabla, y no una variable
+
+`irq_register()` decia esto:
+
+```c
+    if (irq != IRQ_UART || puerto < 0) return -1;
+    if (irq_puerto >= 0) return -1;      /* ya la lleva otro */
+```
+
+Una fuente cableada y **un** hueco. Con el conserver dentro, no cabia nadie
+mas. Ahora son una tabla de cuatro y una lista de lo reclamable con dos
+entradas: la UART y el USB.
+
+La lista sigue escrita a mano, y eso no ha cambiado -un sistema serio la
+sacaria de un arbol de dispositivos-. Lo que ha cambiado es que ya no es
+*"esta escrito a mano Y ADEMAS solo cabe uno"*. La del temporizador no esta
+ni estara: dejar que un proceso se quede con ella es dejarle parar el
+planificador.
+
+Y al soltarla hay una asimetria que merece mirarse, porque es la unica parte
+de esto que no es mecanica:
+
+```c
+        if (irq == IRQ_UART) irq_abrir(irq);
+        else                 irq_cerrar(irq);
+```
+
+La de la UART **se vuelve a abrir** cuando muere su driver, porque el kernel
+tiene driver propio de PL011 y puede seguir el solo: es lo que hace que matar
+al conserver no deje la maquina sin teclado. Cualquier otra **se cierra**,
+porque detras no hay nadie, y una fuente abierta sin quien la atienda es la
+maquina girando en el manejador para siempre. La misma operacion, dos
+respuestas opuestas, y la diferencia es si existe un plan B.
+
+### Memoria que un periferico pueda escribir
+
+Un driver en EL0 no puede usar su monton para hablar con un chip, y por tres
+motivos que no tienen nada que ver entre si:
+
+**Tiene que estar SEGUIDA de verdad.** Al periferico se le da UNA direccion
+fisica y un tamanyo; el no traduce nada. Un buffer de 64 KB que la MMU
+presenta junto pero esta repartido en dieciseis paginas sueltas hace que el
+DMA escriba en quince sitios que no son suyos. Y eso no da un error: da
+corrupcion en un tercero, que es la peor clase de fallo que existe.
+
+**No puede estar cacheada.** El periferico escribe la RAM por su cuenta, sin
+pasar por las caches de la CPU. Si la pagina fuera cacheable, la CPU leeria
+de su cache lo que el chip ya cambio en la RAM, o escribiria en la cache algo
+que el chip nunca llega a ver. La alternativa es mantenimiento de cache a
+mano en cada transferencia -limpiar antes de que lea el dispositivo,
+invalidar antes de leer nosotros- y equivocarse una vez da un fallo que
+aparece una de cada mil veces. No cachear es mas lento de acceder e imposible
+de hacer mal.
+
+El indice ya estaba puesto en el MAIR desde hace pasos, con su comentario:
+
+```c
+#define MT_NORMAL_NC     3   /* RAM sin cachear (DMA, por ejemplo) */
+```
+
+Escrito, explicado y sin usar hasta hoy.
+
+**Y el driver tiene que saber DONDE ESTA en fisica**, que es lo unico de los
+tres que no puede averiguar por su cuenta.
+
+### Y ahi esta la pregunta incomoda del microkernel
+
+Dar una direccion fisica es dar un poder, y no uno pequenyo: **el DMA no pasa
+por la MMU**. Quien pueda escribir una direccion arbitraria en el registro de
+DMA de un periferico puede escribir en cualquier sitio, incluido el kernel. La
+proteccion de memoria, que es lo que sostiene todo lo demas, deja de valer.
+
+En una maquina moderna eso lo ataja una IOMMU, que es literalmente una MMU
+para perifericos: el chip tambien traduce, y solo ve lo que se le ha
+concedido. La Pi 3 no tiene. Asi que la unica frontera posible es no darsela a
+cualquiera, y la regla sale de una que ya existia:
+
+```c
+    if (!t->mmio_va) return -EPERM;
+```
+
+"Tienes un periferico concedido" es lo mismo que "eres un driver", y eso lo
+decide el kernel al crear el proceso, y solo init puede pedirlo. Un programa
+normal recibe `EPERM`, y `malo` lo comprueba.
+
+No es una frontera bonita -un driver malicioso sigue pudiendo escribir en el
+kernel por DMA- pero es la unica que este hardware permite, y conviene tenerlo
+escrito en vez de descubrirlo el dia que algo raro pase.
+
+### Lo que el chip contesto
+
+La semilla no escribe ni un bit de control: encender un controlador sin saber
+apagarlo es como se cuelga una placa. Solo lee los registros de identidad, que
+es la unica forma de saber si la ventana da al sitio correcto.
+
+```
+  [usb] soy el pid 8; MMIO del DWC2 en 0x10000000
+  [usb] GSNPSID = 0x4f54294a  -> Synopsys DWC2, version 2.94a
+  [usb] GHWCFG2 = 0x250dc016  -> DMA interno, 8 canales de anfitrion
+  [usb] DMA: 16 paginas en VA 0x18000000 -> PA 0x156000
+  [usb] las 16 paginas se escriben y se releen bien
+  [usb] el segundo tramo dice EBUSY, como debe
+  [usb] IRQ 9 reclamada en el puerto 3
+  [usb] la IRQ de la UART ya tiene duenyo: no me la da
+  [usb] una IRQ fuera de la lista: no me la da
+```
+
+Dos datos de ahi deciden como habra que escribir el driver. **DMA interno**
+quiere decir que el controlador lee y escribe la RAM el solo, o sea que lo que
+acabamos de anyadir es exactamente lo que hacia falta. Y **ocho canales de
+anfitrion** son todas las transferencias que puede tener en vuelo a la vez,
+para todo lo que cuelgue del hub: ocho. De ahi sale que este controlador
+necesite un planificador por software, que es la parte dificil que viene
+despues.
+
+### El fallo que encontro la prueba, y no estaba donde yo miraba
+
+Para comprobar que las paginas de DMA vuelven al morir el driver, matamos el
+proceso y miramos las paginas libres antes y despues:
+
+```
+  paginas libres : 245375
+  kill 8 9
+  paginas libres : 245375      <- no ha vuelto nada
+```
+
+Y no era el codigo de limpieza. Era que **`reap()` no llegaba a correr**: el
+recolector no toca un zombi que tenga padre vivo -existe para que su padre lea
+su codigo de salida- e init no esperaba a nadie mas que al interprete. Un
+driver que se muriera se quedaba de zombi **para siempre**, con su imagen, su
+pila, su ranura de tarea y ahora tambien su tramo de DMA.
+
+Es el problema clasico del proceso 1, y tiene la solucion clasica: un init
+entierra. Lo bonito es que las dos piezas que hacian falta llevaban dos pasos
+puestas sin que se les hubiera visto el sentido: **SIGCHLD** para enterarse en
+el acto (paso 54) y **PID_CUALQUIERA** para recoger sin saber a quien (paso
+55), que es justo lo que hace falta aqui porque init no lleva una lista de sus
+drivers. Y `SIG_REANUDAR`, porque init se pasa la vida dentro de un `waitpid`
+bloqueante y no quiere que se le rompa cada vez que muere alguien.
+
+Seis lineas en `init.c`:
+
+```
+  paginas libres : 245375
+  kill 8 9
+  paginas libres : 245405      <- treinta paginas
+```
+
+Treinta: las dieciseis de DMA, mas la imagen, la pila y las tablas de pagina.
+
+### Lo que viene, y donde esta lo dificil
+
+Lo que queda no es mas de lo mismo. El DWC2 de la Pi **no tiene planificador
+hardware para las transferencias partidas** (*split transactions*), y todo lo
+que no sea alta velocidad detras del hub hay que planificarlo por software,
+micro-trama a micro-trama, con plazos de **125 microsegundos**. El driver de
+la propia Fundacion lo hace desde una FIQ.
+
+Aqui el tick del planificador son **10 milisegundos**: ochenta veces largo. Y
+eso no es un numero que se suba, porque subirlo a 8 kHz para atender USB
+significa interrumpir los cuatro nucleos ocho mil veces por segundo. Es justo
+el motivo de que exista la FIQ y de que el driver de la Pi la use.
+
+O sea que el paso que hace falta antes de mover un solo byte por USB no es de
+USB: es una fuente de tiempo fina, separada del planificador. Y conviene
+saberlo antes de empezar a escribir el otro.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -5324,9 +5502,24 @@ no es este.
 - El buffer de teclas se queda en el kernel aunque el driver este fuera.
   Es deliberado (ver "El teclado, tambien en EL0"), pero significa que el
   kernel sigue sabiendo que es una consola.
-- Solo se puede pedir la interrupcion de la UART. La lista de fuentes que
-  un proceso puede reclamar esta escrita a mano en `irq_register()`; un
-  sistema serio la sacaria de un arbol de dispositivos.
+- La lista de interrupciones que un proceso puede reclamar sigue escrita a
+  mano en `irq_register()` -ahora son dos, la UART y el USB, y caben cuatro a
+  la vez-. Un sistema serio la sacaria de un arbol de dispositivos, donde cada
+  periferico dice que IRQ usa.
+- No hay IOMMU, y por tanto no hay proteccion contra un driver que haga DMA
+  donde no debe: una direccion fisica es la llave para saltarse la MMU, porque
+  el DMA no pasa por ella. La unica frontera es a quien se le da -solo a quien
+  ya tiene un periferico concedido- y eso protege de los programas normales,
+  no de un driver equivocado.
+- Un tramo de DMA por proceso, y hasta 4 MB. Si un driver necesita varios
+  buffers, reparte el suyo, que es como funciona un "DMA pool" de verdad.
+- La memoria de DMA se pide y no se devuelve hasta que el proceso muere: no
+  hay `dma_free`. Un driver la pide al arrancar y la tiene para siempre, que
+  es lo que hace un driver, pero no es una regla que el kernel imponga.
+- El tick son 10 ms, y el USB de la Pi necesita planificar transferencias
+  partidas cada 125 us. Antes de mover un byte por USB hace falta una fuente
+  de tiempo fina y separada del planificador; el driver de la Fundacion usa
+  una FIQ para eso.
 - El servidor entiende FAT16 y FAT32, pero nada de FAT12 ni exFAT, y
   escribe los nombres en 8.3.
 - El entorno son 16 variables y 512 bytes de texto por proceso, en un

@@ -45,6 +45,7 @@ static struct task tasks[MAX_TASKS];
 static uint64_t    next_pid = CORES;
 
 static void mapeos_limpiar(struct task *t);
+static void dma_limpiar(struct task *t);
 
 /* Cuantos hilos han existido. Sirve para poner en contexto cuantos han
  * llegado a pedir la FPU: sin el denominador, el numero no dice nada. */
@@ -455,6 +456,7 @@ static void reap(struct task *t)
 
     fp_release(t);              /* sus 528 bytes, si llego a necesitarlos */
     mapeos_limpiar(t);
+    dma_limpiar(t);
 
     t->pgd     = 0;
     t->asid    = 0;
@@ -761,6 +763,72 @@ int task_munmap(uint64_t base)
         return 0;
     }
     return -1;
+}
+
+/* --- Memoria para que un periferico escriba en ella -------------------
+ *
+ * Tres propiedades, y ninguna la sabe dar el monton:
+ *
+ *   SEGUIDA de verdad. Al chip se le da UNA direccion fisica y un tamanyo;
+ *   el no traduce nada. Un buffer que la MMU presenta junto pero esta
+ *   repartido en paginas sueltas hace que el DMA escriba en memoria de
+ *   otro, y eso no da un error: da corrupcion en un tercero.
+ *
+ *   SIN CACHEAR. El periferico no pasa por las caches de la CPU (ver
+ *   MM_USER_DMA en mm.h).
+ *
+ *   Y el driver tiene que saber DONDE ESTA en fisica, que es lo unico de
+ *   los tres que no puede averiguar por su cuenta.
+ *
+ * La frontera es la misma que la del MMIO y por el mismo motivo: dar una
+ * direccion fisica es dar la capacidad de saltarse la MMU, porque el DMA no
+ * pasa por ella. Solo a quien ya tiene un periferico concedido. */
+int64_t task_dma_alloc(uint64_t paginas, uint64_t *pa)
+{
+    struct task *t = current;
+    if (!t || !t->pgd) return -EINVAL;
+
+    /* "Tienes un periferico" es lo mismo que "eres un driver", y es una
+     * frontera que ya existia: la concede el kernel al crear el proceso y
+     * solo init puede pedirla. */
+    if (!t->mmio_va) return -EPERM;
+
+    if (paginas == 0) return -EINVAL;
+    if (paginas > (USER_DMA_MAX - USER_DMA_BASE) / PAGE_SIZE) return -EINVAL;
+    if (t->dma_pa) return -EBUSY;        /* uno por proceso: que lo reparta */
+
+    uint64_t fisica = pmm_alloc_contig(paginas);
+    if (!fisica) return -ENOMEM;
+
+    for (uint64_t i = 0; i < paginas; i++) {
+        if (vmm_map_in(t->pgd, USER_DMA_BASE + i * PAGE_SIZE,
+                       fisica + i * PAGE_SIZE, MM_USER_DMA) < 0) {
+            /* A medias no se queda: lo que se mapeo se desmapea y las
+             * paginas vuelven ENTERAS. Un tramo contiguo devuelto a trozos
+             * deja de ser un tramo contiguo, y el siguiente que pida uno se
+             * encuentra el agujero. */
+            for (uint64_t k = 0; k < i; k++)
+                vmm_unmap_in(t->pgd, USER_DMA_BASE + k * PAGE_SIZE);
+            pmm_free_contig(fisica, paginas);
+            return -ENOMEM;
+        }
+    }
+
+    t->dma_pa   = fisica;
+    t->dma_pags = paginas;
+
+    if (pa) *pa = fisica;
+    return (int64_t)USER_DMA_BASE;
+}
+
+/* Al morir. Va donde van los mapeos porque es lo mismo: memoria que tenia
+ * el proceso y que no va a devolver nadie mas. */
+static void dma_limpiar(struct task *t)
+{
+    if (!t->dma_pa) return;
+    pmm_free_contig(t->dma_pa, t->dma_pags);
+    t->dma_pa   = 0;
+    t->dma_pags = 0;
 }
 
 static void mapeos_limpiar(struct task *t)
@@ -1200,6 +1268,7 @@ extern const uint8_t  user_conserver[];  extern const uint64_t user_conserver_si
 extern const uint8_t  user_fs[];         extern const uint64_t user_fs_size;
 extern const uint8_t  user_sh[];         extern const uint64_t user_sh_size;
 extern const uint8_t  user_init[];       extern const uint64_t user_init_size;
+extern const uint8_t  user_usb[];        extern const uint64_t user_usb_size;
 
 struct empotrado {
     const char     *nombre;
@@ -1212,6 +1281,7 @@ static const struct empotrado empotrados[] = {
     { "fs",        user_fs,        &user_fs_size        },
     { "sh",        user_sh,        &user_sh_size        },
     { "init",      user_init,      &user_init_size      },
+    { "usb",       user_usb,       &user_usb_size       },
     { 0, 0, 0 }
 };
 
@@ -1225,6 +1295,7 @@ static uint64_t dispositivo_a_fisica(uint64_t dev)
     switch (dev) {
     case DEV_UART: return UART0_PHYS;
     case DEV_EMMC: return EMMC_PHYS;
+    case DEV_USB:  return USB_PHYS;
     default:       return 0;
     }
 }
@@ -2167,6 +2238,8 @@ int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
     t->reanudable   = 0;
     t->parada_sig      = 0;
     t->parada_avisada  = 0;
+    t->dma_pa          = 0;   /* el tramo era del programa anterior */
+    t->dma_pags        = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
     /* Y sin coma flotante, por lo mismo. Lo que hubiera en esos registros
@@ -2181,6 +2254,7 @@ int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
      * paginas ya estan muertas -el espacio de direcciones entero se
      * sustituye-, asi que esto solo borra el apunte. */
     mapeos_limpiar(t);
+    dma_limpiar(t);
 
     /* El directorio actual NO se toca, y esa ausencia es la regla: el
      * programa cambia, el sitio donde estabas no. Es lo que hace que
@@ -2345,6 +2419,13 @@ int task_fork(struct trap_frame *f)
     t->waiting_for  = 0;
     t->parada_sig      = 0;   /* el hijo nace corriendo, no parado */
     t->parada_avisada  = 0;
+
+    /* Y el tramo de DMA NO se hereda, aunque el mapeo si se copie: es del
+     * padre, y el que lo devuelve al morir tiene que ser uno solo. Dos
+     * procesos apuntando al mismo tramo contiguo es una doble liberacion
+     * esperando a que muera el segundo. */
+    t->dma_pa          = 0;
+    t->dma_pags        = 0;
     t->parent       = padre->pid;
 
     /* El grupo se hereda, como el directorio actual: un hijo forma parte
@@ -2457,6 +2538,8 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->waiting_for  = 0;
     t->parada_sig      = 0;
     t->parada_avisada  = 0;
+    t->dma_pa          = 0;   /* las ranuras se reciclan */
+    t->dma_pags        = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
     /* Nace sin FPU. Si la quiere, que la pida atrapando. */
@@ -2470,6 +2553,7 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     t->cwd[1] = 0;
 
     mapeos_limpiar(t);
+    dma_limpiar(t);
 
     /* Entrada, salida y errores a la consola. Si quien lo arranca quiere
      * otra cosa, que los cambie despues. */

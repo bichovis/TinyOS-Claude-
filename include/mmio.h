@@ -32,6 +32,13 @@
  * partir de ahi habla con la tarjeta sin pasar por el kernel. */
 #define EMMC_PHYS   (PERIPHERAL_PA + 0x300000)
 
+/* El controlador USB: un Synopsys DesignWare DWC2 en modo anfitrion. En la
+ * Pi 3B no es "un puerto mas": de el cuelga un LAN9514, que es a la vez el
+ * hub de los cuatro conectores Y la tarjeta de red. O sea que sin USB no
+ * hay red, y sin hub no hay USB, porque hasta la Ethernet esta detras del
+ * hub interno. */
+#define USB_PHYS    (PERIPHERAL_PA + 0x980000)
+
 
 /* Los "ARM local peripherals" (timers y mailboxes por nucleo) viven fuera
  * del bloque anterior, en 0x40000000. */

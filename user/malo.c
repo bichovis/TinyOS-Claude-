@@ -10,6 +10,8 @@
  * cuando falla, un arreglo devuelve el control al bucle de copia.
  */
 #include <stdio.h>
+#include <errno.h>
+#include <string.h>
 #include <stdlib.h>
 #include "syscall.h"
 
@@ -38,6 +40,21 @@ int main(int argc, char **argv)
     printf("  spawn con memoria sin mapear  : %ld\n",
            (long)spawn(vacio, 4096, argv, environ));
 
-    printf("  --- y sigo vivo para contarlo ---\n");
+    /* --- Y la frontera nueva del paso 58 -------------------------------
+     *
+     * Memoria para DMA. Este programa NO es un driver -no tiene ningun
+     * periferico concedido- asi que no puede tener una direccion fisica.
+     *
+     * La regla parece burocratica y no lo es: una direccion fisica es la
+     * llave para saltarse la MMU, porque el DMA no pasa por ella. Un
+     * proceso que pudiera pedir un tramo y conocer su fisica sabria donde
+     * cae la RAM, y con un periferico cualquiera podria escribir en el
+     * kernel. Una IOMMU lo ataja en el hardware; la Pi 3 no tiene. */
+    uint64_t pa = 0;
+    printf("\n  --- y la direccion fisica, que no es para cualquiera ---\n");
+    printf("  dma_alloc siendo un programa normal : %ld (%s)\n",
+           (long)dma_alloc(4, &pa), strerror(errno));
+
+    printf("\n  --- y sigo vivo para contarlo ---\n");
     return 0;
 }

@@ -129,6 +129,28 @@
 #define MM_USER_DATA (PTE_VALID | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL) \
                       | PTE_AP_RW_ALL | PTE_PXN | PTE_UXN | PTE_nG)
 
+/* --- Memoria para DMA ------------------------------------------------
+ *
+ * Un periferico que hace DMA escribe en la RAM POR SU CUENTA, sin pasar por
+ * la MMU ni por las caches de la CPU. De ahi salen las dos unicas cosas
+ * raras de este descriptor, y las dos son obligatorias:
+ *
+ * MT_NORMAL_NC en vez de MT_NORMAL. Si la pagina fuera cacheable, la CPU
+ * podria estar leyendo de su cache lo que el periferico ya ha cambiado en
+ * la RAM, o al reves: escribir en la cache algo que el periferico nunca
+ * llega a ver. La alternativa es hacer mantenimiento de cache a mano en
+ * cada transferencia -limpiar antes de que lea el dispositivo, invalidar
+ * antes de leer nosotros- y equivocarse una vez da un fallo que aparece
+ * una de cada mil veces. No cachear es mas lento de acceder e imposible
+ * de hacer mal, y para un primer driver esa es la eleccion correcta.
+ *
+ * Y sin PTE_SH_INNER: la arquitectura ya trata la memoria Normal-NC como
+ * compartida con todo el mundo, porque no hay nada que coherenciar.
+ *
+ * Lo demas es como MM_USER_DATA: la escribe EL0 y no se ejecuta nunca. */
+#define MM_USER_DMA  (PTE_VALID | PTE_AF | PTE_ATTR(MT_NORMAL_NC)             \
+                      | PTE_AP_RW_ALL | PTE_PXN | PTE_UXN | PTE_nG)
+
 /* Un fichero mapeado: se lee, no se escribe y no se ejecuta.
  *
  * De solo lectura porque no hay nada que escriba los cambios de vuelta al
@@ -160,6 +182,12 @@
 /* Ficheros mapeados. Encima de la pila, que crece hacia abajo, asi que
  * entre las dos zonas queda un hueco de 256 MB que nadie puede alcanzar
  * por accidente. */
+/* Y los buffers de DMA de un driver, entre el MMIO y la pila. Un tramo
+ * aparte y no dentro del monton porque tiene que ser FISICAMENTE seguido y
+ * no cacheable, que son dos propiedades que el monton no sabe dar. */
+#define USER_DMA_BASE    0x18000000UL      /* buffers de DMA de un driver  */
+#define USER_DMA_MAX     0x18400000UL      /* ...y hasta aqui: 4 MB        */
+
 #define USER_MMAP_BASE   0x30000000UL      /* aqui empiezan los ficheros   */
 #define USER_MMAP_MAX    0x38000000UL      /* ...y aqui se acaban: 128 MB  */
 #define USER_LIMIT       0x40000000UL      /* nada de usuario por encima   */

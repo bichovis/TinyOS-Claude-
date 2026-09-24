@@ -298,6 +298,15 @@ int64_t console_stop(void)  { return syscall2(SYS_console_stop, 0, 0); }
  *     ... pedir la contrasenya ...
  *     termios(antes);
  */
+/* Un tramo de memoria para DMA: paginas SEGUIDAS y sin cachear. Devuelve la
+ * direccion virtual y deja la fisica en *pa, que es la que hay que darle al
+ * periferico. Solo para drivers: un proceso normal recibe EPERM.
+ *
+ * Uno por proceso. Si un driver necesita varios buffers, reparte el suyo,
+ * que ademas es como funciona un "DMA pool" de verdad. */
+static inline int64_t dma_alloc(uint64_t paginas, uint64_t *pa)
+{ return revisar(syscall2(SYS_dma_alloc, paginas, (uint64_t)pa)); }
+
 static inline int64_t termios(int modo)
 { return syscall2(SYS_termios, (uint64_t)(int64_t)modo, 0); }
 

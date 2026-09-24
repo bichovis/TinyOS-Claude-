@@ -130,6 +130,14 @@ struct task {
      * 'parada_avisada' se limpia en task_parar, o sea en cada parada nueva.
      * Asi una que se repite -SIGCONT y otro SIGTTIN despues- vuelve a ser
      * noticia, y la misma no lo es dos veces. */
+    /* --- Su tramo de DMA, si es un driver y lo pidio ---------------------
+     * Uno por proceso. Se apunta la fisica y cuantas paginas para poder
+     * devolverlas al morir: es memoria que el PMM dio SEGUIDA, y si no
+     * vuelve entera no vuelve, porque el siguiente que pida un tramo
+     * contiguo se encontrara el agujero. */
+    uint64_t    dma_pa;       /* 0 si no tiene */
+    uint64_t    dma_pags;
+
     int         parada_sig;   /* la senyal que lo detuvo                     */
     int         parada_avisada; /* 1 si un waitpid ya conto esta parada      */
 
@@ -275,6 +283,11 @@ int64_t task_mmap(const char *ruta, uint64_t *tam);
 int64_t task_mmap_anon(uint64_t bytes);
 int     task_mmap_fault(uint64_t direccion);  /* 1 si lo ha resuelto        */
 int     task_munmap(uint64_t base);
+
+/* Un tramo de memoria para DMA: paginas SEGUIDAS y sin cachear, mapeadas en
+ * el espacio del proceso. Devuelve la direccion virtual y deja la fisica en
+ * *pa, o un errno negativo. Solo para drivers (ver SYS_dma_alloc). */
+int64_t task_dma_alloc(uint64_t paginas, uint64_t *pa);
 struct fichero *task_fd(int fd);              /* el de este proceso, o 0    */
 int  task_fd_alloc(struct fichero *f);        /* el primer hueco libre      */
 int  task_fd_close(int fd);
