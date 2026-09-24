@@ -66,9 +66,24 @@ struct message {
  * puede enterarse de que uno ha terminado sin quedarse bloqueado en el, y
  * un hijo al que nadie recoge se queda de zombi. Devuelve -EAGAIN si ese
  * proceso sigue vivo, que con el convenio del paso 48 no se confunde con
- * ningun codigo de salida. */
+ * ningun codigo de salida, y -ECHILD si por quien preguntas no es hijo
+ * tuyo -o ya lo recogiste-, que es lo que le dice a un bucle que ya no
+ * queda nada por recoger. */
 #define WNOHANG           1
 #define WUNTRACED         2   /* avisame tambien si se PARA, no solo si muere */
+
+/* "Cualquiera de mis hijos", que es el -1 de Unix.
+ *
+ * Hasta aqui waitpid exigia un pid concreto, y el shell podia porque se
+ * acuerda de los pid de cada trabajo. Un manejador de SIGCHLD no puede:
+ * la senyal dice que ALGO cambio, no que cambio, y no hay ninguna senyal
+ * por hijo -son un bit, y un bit no se apunta dos veces-. Asi que si el
+ * manejador no puede preguntar "¿quien ha sido?", dos hijos que mueran
+ * juntos se cuentan como uno y el otro se queda de zombi.
+ *
+ * El signo vuelve a servir de lo mismo que en kill: distinguir un pid de
+ * algo que no es un pid, sin salirse del numero. */
+#define PID_CUALQUIERA   (-1)
 
 /* Que le paso al proceso por el que preguntabas.
  *
@@ -84,7 +99,7 @@ struct message {
 #define SYS_freepages    17    /* () -> paginas de 4 KB libres en el sistema */
 #define SYS_exec         18    /* (buffer, bytes, argv[], envp[]) -> no vuelve*/
 #define SYS_kill         19    /* (pid, senyal) -> 0 | -1                    */
-#define SYS_signal       20    /* (senyal, manejador, trampolin) -> 0 | -1   */
+#define SYS_signal       20    /* (senyal, manejador, trampolin, banderas)   */
 #define SYS_sigreturn    21    /* lo llama el trampolin, no el programa      */
 #define SYS_pipe         22    /* (int fds[2]) -> 0 | -1                     */
 #define SYS_close        23    /* (fd) -> 0 | -1                             */
@@ -342,11 +357,37 @@ struct estado {
 #define SIGINT        2    /* Ctrl-C, la interrupcion del teclado           */
 #define SIGKILL       9    /* fulminante, no se atrapa ni se ignora         */
 #define SIGTERM      15    /* "haz el favor de irte", si se atrapa          */
+#define SIGCHLD      17    /* un hijo tuyo ha muerto, o se ha parado        */
 #define SIGCONT      18    /* sigue donde estabas                           */
 #define SIGSTOP      19    /* parate; tampoco se atrapa                     */
 #define SIGTSTP      20    /* Ctrl-Z: parate, pero esta si se atrapa        */
 #define SIGTTIN      21    /* has leido del teclado desde el segundo plano  */
 #define SIGTTOU      22    /* ...y esta seria por escribir (ver el README)  */
+
+/* SIGCHLD es distinta de todas las anteriores, y no por lo que hace sino
+ * por QUIEN la pide: nadie. SIGINT sale de una tecla, SIGTERM de un kill
+ * que alguien escribio, SIGTTIN de una lectura que el propio proceso
+ * intento. SIGCHLD llega porque OTRO proceso -un hijo- cambio de estado,
+ * en un momento que el padre no eligio y no puede prever.
+ *
+ * De ahi salen sus dos rarezas, que parecen arbitrarias y no lo son:
+ *
+ * 1. Su accion por defecto es NO HACER NADA. Todas las demas matan al que
+ *    no las atrapa, porque todas las demas las pidio alguien. Si esta
+ *    matara, cualquier programa que se bifurcara moriria al terminar su
+ *    hijo, o sea que fork() seria inutilizable sin saber de senyales.
+ *
+ * 2. Necesita SIG_REANUDAR. Una senyal interrumpe las llamadas al sistema
+ *    que estaban bloqueadas -es como se sale de una lectura que no iba a
+ *    volver- y con Ctrl-C eso es justo lo que se busca. Aqui no: que un
+ *    hijo termine no tiene nada que ver con la lectura que su padre tenga
+ *    a medias, y romperla seria contarle un fallo que no ha ocurrido.
+ *
+ *    Y no se puede decidir de una vez para todas, porque las dos
+ *    respuestas son correctas para senyales distintas. Por eso en Unix es
+ *    una bandera POR SENYAL, y por eso existe sigaction: signal() a secas
+ *    no tenia donde ponerla. */
+#define SIG_REANUDAR      1   /* reanuda la llamada que interrumpio (SA_RESTART) */
 
 /* Mandar una senyal a un GRUPO entero: kill(-pgid, sig). El signo es el
  * convenio de Unix, y no es un truco sucio: un pid y un pgid viven en el

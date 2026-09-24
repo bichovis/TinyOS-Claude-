@@ -24,8 +24,17 @@ static void trampolin(void)
     __builtin_unreachable();
 }
 
+int signal_banderas(int sig, void (*manejador)(int), int banderas)
+{
+    return (int)syscall4(SYS_signal, (uint64_t)sig, (uint64_t)manejador,
+                         (uint64_t)trampolin, (uint64_t)banderas);
+}
+
+/* signal() a secas no reanuda nada, que es la semantica de System V y la
+ * que hace falta para Ctrl-C: ahi romper la lectura ES lo que se busca.
+ * Quien quiera lo otro tiene que decirlo, y eso es exactamente la
+ * diferencia entre signal() y sigaction() en un Unix de verdad. */
 int signal(int sig, void (*manejador)(int))
 {
-    return (int)syscall3(SYS_signal, (uint64_t)sig,
-                         (uint64_t)manejador, (uint64_t)trampolin);
+    return signal_banderas(sig, manejador, 0);
 }

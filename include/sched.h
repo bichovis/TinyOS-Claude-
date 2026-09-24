@@ -91,6 +91,7 @@ struct task {
 
     /* --- Senyales --- */
     uint32_t    sig_pending;  /* las que tiene pendientes, una por bit       */
+    uint32_t    sig_reanudar; /* de cuales pidio SIG_REANUDAR, una por bit   */
     uint64_t    sig_handler[SIG_MAX];  /* 0 = la accion por defecto          */
     uint64_t    sig_tramp;    /* por donde vuelve un manejador               */
     uint64_t    sig_frame;    /* donde guardo su contexto, 0 si no hay       */
@@ -98,6 +99,18 @@ struct task {
     uint64_t    waiting_for;  /* a que pid espera, 0 si a ninguno            */
     struct waitqueue *wq;     /* en que cola duerme, 0 si no duerme          */
     int         interrumpido; /* 1 si lo desperto una senyal y no un aviso   */
+
+    /* Para reanudar una llamada que una senyal corto por la mitad. Lo unico
+     * que hace falta guardar es el x0 que traia, porque es el unico
+     * registro que el kernel pisa al contestar: el valor de retorno va
+     * ahi. Linux lleva este mismo apunte y lo llama orig_x0.
+     *
+     * 'reanudable' se pone solo cuando una llamada devuelve -EINTR, y se
+     * borra al salir a EL0. Si se dejara puesto, la proxima senyal que
+     * llegara por una interrupcion del reloj -en medio de codigo de
+     * usuario cualquiera- rebobinaria un PC que no apunta a ningun svc. */
+    uint64_t    reanudar_x0;
+    int         reanudable;
     uint64_t    parent;       /* quien lo creo: el que recogera su salida    */
 
     /* El grupo, o sea el TRABAJO del que forma parte. Se hereda en el
@@ -214,8 +227,9 @@ void task_exit_con(int64_t codigo);   /* y apunta lo que devolvio */
 /* Espera y recoge su salida. Devuelve 0 y deja el codigo en 'codigo' y en
  * 'que' el W_SALIDA o W_PARADO correspondiente, o un errno negativo:
  * -EINTR si una senyal corto la espera, -EAGAIN si se pidio WNOHANG y ese
- * proceso sigue vivo. */
-int  task_wait(uint64_t pid, int64_t *codigo, int *que, int banderas);
+ * proceso sigue vivo, -ECHILD si no hay tal hijo. Con PID_CUALQUIERA vale
+ * cualquiera de los hijos del que pregunta. */
+int  task_wait(int64_t pid, int64_t *codigo, int *que, int banderas);
 uint64_t task_sbrk(int64_t delta); /* mueve el tope del monton del proceso  */
 int  task_fork(struct trap_frame *f);   /* duplica el proceso actual         */
 int  task_exec(const uint8_t *image, uint64_t size, const struct args *args,
@@ -256,7 +270,12 @@ int  task_alive(uint64_t pid);   /* ¿sigue existiendo?                      */
 
 /* --- Senyales --------------------------------------------------------- */
 int  task_signal(uint64_t pid, int sig);       /* apuntarsela a un proceso  */
-int  task_set_handler(int sig, uint64_t manejador, uint64_t trampolin);
+int  task_set_handler(int sig, uint64_t manejador, uint64_t trampolin,
+                      int banderas);
+
+/* Lo llama el despacho de llamadas cuando una devuelve -EINTR: apunta que
+ * esta se puede volver a intentar, y con que x0. Ver 'reanudable'. */
+void task_marcar_reanudable(uint64_t x0);
 void task_set_console(uint64_t pgid);          /* que GRUPO esta en primer plano */
 int  task_set_pgid(uint64_t pid, uint64_t pgid);
 int  task_dar_consola(uint64_t pgid);          /* y quien puede darla */

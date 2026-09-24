@@ -946,13 +946,41 @@ static void kcopy(void *dst, const void *src, uint64_t n);   /* mas abajo */
 #define ES_PARADA(s) ((s) == SIGSTOP || (s) == SIGTSTP || \
                       (s) == SIGTTIN || (s) == SIGTTOU)
 
-int task_signal(uint64_t pid, int sig)
+/* Apuntarle una senyal a un proceso, CON EL CERROJO YA COGIDO.
+ *
+ * Existe como funcion aparte porque los tres sitios que avisan al padre de
+ * un cambio de estado -morir, pararse- lo hacen desde dentro de la seccion
+ * critica, y algunos sin posibilidad de salir de ella: task_exit_con no
+ * suelta este cerrojo nunca, se lo lleva el hilo que entre detras. Llamar
+ * ahi al task_signal de siempre seria pedir un cerrojo que ya tenemos, o
+ * sea colgar el nucleo.
+ *
+ * Devuelve 1 si la senyal se apunto. */
+static int signal_locked(struct task *t, int sig)
 {
-    if (sig <= 0 || sig >= SIG_MAX) return -1;
-
-    uint64_t flags = sched_lock_irqsave();
-    struct task *t = by_pid(pid);
     int ok = 0;
+
+    /* --- Lo que se va a ignorar no llega a molestar -------------------
+     *
+     * Y esto no es un ahorro: es la diferencia entre que el sistema
+     * funcione y que no.
+     *
+     * Apuntar una senyal hace DOS cosas. Una es dejar el bit; la otra,
+     * abajo, es sacar al proceso de donde estuviera dormido, porque una
+     * senyal tiene que poder interrumpir una espera que no iba a acabar.
+     * Esa segunda parte ocurre aunque la senyal acabe sin hacer nada.
+     *
+     * Con SIGCHLD eso rompe a quien no ha pedido nada. init espera a su
+     * interprete con un waitpid bloqueante y no atrapa SIGCHLD; si cada
+     * proceso que muere en el sistema lo sacara de ahi, su waitpid
+     * volveria con -EINTR, init creeria que el interprete se ha ido y
+     * arrancaria otro. Un servidor de ficheros terminando mataria la
+     * sesion.
+     *
+     * Asi que ignorar tiene que significar "como si no hubiera llegado", y
+     * eso incluye no despertar a nadie. Linux hace esta misma comprobacion
+     * antes de encolar la senyal, y se llama sig_ignored(). */
+    if (t && sig == SIGCHLD && !t->sig_handler[SIGCHLD]) return 0;
 
     if (t && t->state != TASK_ZOMBIE && t->pgd) {
         /* Parar y seguir se ANULAN entre si, y hay que hacerlo al
@@ -1010,19 +1038,57 @@ int task_signal(uint64_t pid, int sig)
         ok = 1;
     }
 
+    return ok;
+}
+
+int task_signal(uint64_t pid, int sig)
+{
+    if (sig <= 0 || sig >= SIG_MAX) return -1;
+
+    uint64_t flags = sched_lock_irqsave();
+    int ok = signal_locked(by_pid(pid), sig);
     sched_unlock_irqrestore(flags);
     return ok ? 0 : -1;
 }
 
-int task_set_handler(int sig, uint64_t manejador, uint64_t trampolin)
+/* Avisar al padre de que este hijo ha cambiado de estado. Con el cerrojo
+ * cogido, porque se llama desde donde se cambia el estado.
+ *
+ * Se llama SIEMPRE, sin preguntar si al padre le interesa: quien decide si
+ * el aviso sirve para algo es signal_locked, que ya sabe distinguir un
+ * padre que atrapa SIGCHLD de uno que no. Repetir aqui esa comprobacion
+ * seria tener la misma regla escrita en dos sitios.
+ *
+ * Lo que si se comprueba es que el padre siga ahi: un huerfano no tiene a
+ * quien avisar. En Unix lo adoptaria init; aqui el recolector se lo lleva
+ * directamente, que para lo que hay es lo mismo. */
+static void avisar_al_padre(struct task *hijo)
+{
+    if (!hijo->parent) return;
+    signal_locked(by_pid(hijo->parent), SIGCHLD);
+}
+
+int task_set_handler(int sig, uint64_t manejador, uint64_t trampolin,
+                     int banderas)
 {
     if (!current || !current->pgd)       return -1;
     if (sig <= 0 || sig >= SIG_MAX)      return -1;
     if (sig == SIGKILL)                  return -1;   /* esa no se atrapa */
 
     current->sig_handler[sig] = manejador;
+    if (banderas & SIG_REANUDAR) current->sig_reanudar |=  1u << sig;
+    else                         current->sig_reanudar &= ~(1u << sig);
     if (trampolin) current->sig_tramp = trampolin;
     return 0;
+}
+
+/* Lo llama syscall_dispatch cuando una llamada devuelve -EINTR. Ver
+ * 'reanudable' en sched.h. */
+void task_marcar_reanudable(uint64_t x0)
+{
+    if (!current) return;
+    current->reanudar_x0 = x0;
+    current->reanudable  = 1;
 }
 
 void task_set_console(uint64_t pgid) { consola_pgid = pgid; }
@@ -1238,6 +1304,7 @@ int task_parar(void)
     uint64_t flags = sched_lock_irqsave();
 
     current->state = TASK_STOPPED;
+    avisar_al_padre(current);       /* y esto es la NOTICIA de que se paro */
     wq_wake_all(&exit_wq);          /* que el padre se entere ANTES */
     schedule_locked();
 
@@ -1358,8 +1425,18 @@ static int pila_escribible(uint64_t sp, uint64_t n)
 void signal_deliver(struct trap_frame *f)
 {
     struct task *t = current;
+    if (!t) return;
 
-    if (!t || !t->pgd || !t->sig_pending) return;
+    /* Lo PRIMERO, y pase lo que pase debajo: esta marca solo vale para la
+     * vuelta a EL0 que la puso. Si sobreviviera a una salida sin senyales,
+     * la proxima que llegara -por una interrupcion del reloj, en medio de
+     * codigo de usuario cualquiera- rebobinaria un PC que no apunta a
+     * ningun svc y el proceso se iria a ejecutar lo que hubiera cuatro
+     * bytes antes. */
+    int reanudable = t->reanudable;
+    t->reanudable  = 0;
+
+    if (!t->pgd || !t->sig_pending) return;
     if (t->sig_frame) return;            /* ya hay una en curso: sin anidar */
 
     for (int s = 1; s < SIG_MAX; s++) {
@@ -1372,6 +1449,18 @@ void signal_deliver(struct trap_frame *f)
          * que el proceso ya estaba corriendo, y entonces no hay nada que
          * continuar. */
         if (s == SIGCONT && !t->sig_handler[s]) continue;
+
+        /* Y SIGCHLD sin manejador tampoco, que es la unica de las que
+         * matan por defecto que no mata.
+         *
+         * No es una excepcion caprichosa: es la unica senyal que el kernel
+         * manda sin que nadie la pida. Si matara, un programa cualquiera
+         * que se bifurcara -sin saber que existen las senyales, que es lo
+         * normal- moriria en cuanto su hijo terminara. La accion por
+         * defecto de una senyal tiene que ser razonable para quien no sabe
+         * que esa senyal existe, y "morirte porque tu hijo acabo" no lo
+         * es. */
+        if (s == SIGCHLD && !t->sig_handler[s]) continue;
 
         /* Ni SIGKILL ni SIGSTOP se atrapan, y por el mismo motivo: son las
          * dos unicas garantias que le quedan a quien esta fuera. Una es
@@ -1413,6 +1502,29 @@ void signal_deliver(struct trap_frame *f)
          * de los procesos no toca la coma flotante en su vida, y hacerles
          * pagar 528 bytes de pila en cada senyal seria cobrarles por algo
          * que no usan. Es la misma pereza del paso 30, ahora en la pila. */
+        /* --- Reanudar la llamada que esta senyal interrumpio ---------
+         *
+         * El proceso estaba dentro de una llamada al sistema bloqueado
+         * esperando algo, la senyal lo saco de ahi y la llamada devolvio
+         * -EINTR. Si quien atrapa la senyal pidio SIG_REANUDAR, ese -EINTR
+         * no tiene que llegar nunca a verse: no ha fallado nada.
+         *
+         * Y se deshace donde se deshacen estas cosas, que es en el marco de
+         * excepcion. Se repone el x0 que traia la llamada -el unico
+         * registro que el kernel pisa, porque ahi va el resultado- y se
+         * rebobina el PC cuatro bytes, que en AArch64 es exactamente una
+         * instruccion: la del propio svc. Al volver del manejador, el
+         * proceso ejecuta otra vez la llamada que ya habia hecho, con los
+         * mismos argumentos, y no se entera.
+         *
+         * Tiene que ser AQUI y no despues de sigreturn, porque lo que
+         * restaura sigreturn es esta copia: el rebobinado se guarda con el
+         * resto del contexto y vuelve con el. */
+        if (reanudable && (t->sig_reanudar & (1u << s))) {
+            f->x[0] = t->reanudar_x0;
+            f->elr -= 4;
+        }
+
         int con_fp = (t->fp_state != 0);
         uint64_t marco = sizeof(struct trap_frame) + (con_fp ? FP_STATE_SIZE : 0);
 
@@ -1500,7 +1612,44 @@ int task_alive(uint64_t pid)
  *
  * Que la tarea haya desaparecido del todo tambien vale como "termino": el
  * recolector puede haber pasado por ahi antes de que nos despertaramos. */
-int task_wait(uint64_t pid, int64_t *codigo, int *que, int banderas)
+/* ¿De cual de mis hijos hay noticias? Con el cerrojo cogido.
+ *
+ * Devuelve el hijo del que hay algo que contar, o 0 si no hay ninguno con
+ * noticias, y deja en *hijos si existe al menos uno. Esa segunda respuesta
+ * es la que hace falta para distinguir las dos formas de no tener nada:
+ * "espera, que ya vendra" y "no esperes, que no hay nadie". La primera es
+ * un bloqueo o un -EAGAIN; la segunda es -ECHILD.
+ *
+ * Confundirlas cuelga un bucle: un manejador de SIGCHLD que recoge hasta
+ * que no quede nada preguntaria para siempre si "no queda nada" y "aun no"
+ * contestaran lo mismo. */
+static struct task *hijo_con_noticias(int64_t pid, int banderas, int *hijos)
+{
+    *hijos = 0;
+
+    for (int i = CORES; i < MAX_TASKS; i++) {
+        struct task *t = &tasks[i];
+
+        if (t->state == TASK_UNUSED || !t->pgd)        continue;
+        if (t->parent != current->pid)                 continue;
+
+        /* Un pid concreto: tiene que ser ESE, y tiene que ser hijo mio.
+         * Que la comprobacion del parentesco valga para los dos casos sale
+         * de recorrer la tabla en vez de ir directo por pid, y es lo que
+         * hace que preguntar por un ajeno conteste -ECHILD y no su codigo
+         * de salida. Un proceso no tiene derecho a enterrar a nadie mas. */
+        if (pid != PID_CUALQUIERA && t->pid != (uint64_t)pid) continue;
+
+        *hijos = 1;
+
+        if (t->state == TASK_ZOMBIE)                             return t;
+        if (t->state == TASK_STOPPED && (banderas & WUNTRACED))  return t;
+    }
+
+    return 0;
+}
+
+int task_wait(int64_t pid, int64_t *codigo, int *que, int banderas)
 {
     uint64_t flags = sched_lock_irqsave();
     int      ret   = 0;
@@ -1509,23 +1658,31 @@ int task_wait(uint64_t pid, int64_t *codigo, int *que, int banderas)
      * Ctrl-C supiera a quien seguir, y ya no sirve para eso; lo que si
      * hace todavia es decir que este proceso esta parado en un hijo, y
      * quien pregunta sin bloquearse no lo esta. */
-    if (current && !(banderas & WNOHANG)) current->waiting_for = pid;
+    if (current && !(banderas & WNOHANG)) current->waiting_for = (uint64_t)pid;
 
     if (que) *que = W_SALIDA;
 
     for (;;) {
-        struct task *t = by_pid(pid);
+        int hijos = 0;
+        struct task *t = current ? hijo_con_noticias(pid, banderas, &hijos) : 0;
 
-        if (!t) {                          /* ya no existe: nada que contar */
+        if (!hijos) {                      /* no hay tal hijo, ni lo habra  */
             if (codigo) *codigo = -1;
+            ret = -ECHILD;
             break;
         }
 
-        if (t->state == TASK_ZOMBIE) {
+        if (t && t->state == TASK_ZOMBIE) {
             if (codigo) *codigo = t->exit_code;
 
             /* Recogido. Ahora si se lo puede llevar el recolector: el
-             * zombi existia precisamente para que su padre leyera esto. */
+             * zombi existia precisamente para que su padre leyera esto.
+             *
+             * Y de paso deja de ser hijo, que es lo que impide recogerlo
+             * dos veces: el segundo waitpid ya no lo encuentra en la tabla
+             * como hijo de nadie y contesta -ECHILD. Sin eso, dos
+             * recolectores -el manejador de SIGCHLD y el bucle principal-
+             * podrian contar la misma muerte dos veces. */
             t->parent = 0;
             wq_wake_one(&reaper_wq);
             break;
@@ -1543,7 +1700,7 @@ int task_wait(uint64_t pid, int64_t *codigo, int *que, int banderas)
          *
          * Y NO se recoge: un proceso parado no es un zombi, va a volver.
          * Lo unico que se hace es contarlo. */
-        if (t->state == TASK_STOPPED && (banderas & WUNTRACED)) {
+        if (t) {                           /* parado, que es lo que queda */
             if (codigo) *codigo = 0;
             if (que)    *que    = W_PARADO;
             break;
@@ -1572,6 +1729,7 @@ void task_exit_con(int64_t codigo)
     (void)flags;                 /* este cerrojo no lo soltamos nosotros */
     current->exit_code = codigo;
     current->state     = TASK_ZOMBIE;
+    avisar_al_padre(current);
     /* Si era un servidor, sus puertos mueren con el. Hay que despertar a
      * quien estuviera esperando o se quedaria bloqueado para siempre
      * esperando a alguien que ya no existe. */
@@ -1969,10 +2127,12 @@ int task_exec(const uint8_t *image, uint64_t size, const struct args *args,
 
     /* Un programa nuevo empieza sin senyales pendientes y sin manejadores:
      * los que habia eran del programa anterior y ya no existen. */
-    t->sig_pending = 0;
-    t->sig_frame   = 0;
-    t->sig_fp      = 0;
-    t->sig_tramp   = 0;
+    t->sig_pending  = 0;
+    t->sig_reanudar = 0;
+    t->sig_frame    = 0;
+    t->sig_fp       = 0;
+    t->sig_tramp    = 0;
+    t->reanudable   = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
     /* Y sin coma flotante, por lo mismo. Lo que hubiera en esos registros
@@ -2133,12 +2293,23 @@ int task_fork(struct trap_frame *f)
      * atrapar lo mismo- pero las senyales pendientes no: son del padre, y
      * el hijo no tiene por que pagarlas. */
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = padre->sig_handler[s];
-    t->sig_tramp   = padre->sig_tramp;
-    t->sig_pending = 0;
-    t->sig_frame   = 0;
-    t->sig_fp      = 0;
-    t->waiting_for = 0;
-    t->parent      = padre->pid;
+    t->sig_tramp    = padre->sig_tramp;
+
+    /* Las banderas van CON el manejador y se heredan con el: son parte de
+     * como quiere el programa que se le entregue esa senyal, no de lo que
+     * tenia pendiente. */
+    t->sig_reanudar = padre->sig_reanudar;
+    t->sig_pending  = 0;
+    t->sig_frame    = 0;
+    t->sig_fp       = 0;
+
+    /* Y esto NO se hereda, que es facil de pasar por alto: el hijo no esta
+     * dentro de la llamada del padre. Sale del fork por otro camino -no
+     * vuelve por signal_deliver- asi que si se copiara la marca se
+     * quedaria puesta para siempre. */
+    t->reanudable   = 0;
+    t->waiting_for  = 0;
+    t->parent       = padre->pid;
 
     /* El grupo se hereda, como el directorio actual: un hijo forma parte
      * del mismo TRABAJO que su padre mientras nadie diga lo contrario. Es
@@ -2241,11 +2412,13 @@ int task_create_user(const char *name, const uint8_t *image, uint64_t size,
     /* Las ranuras se reciclan, asi que lo de las senyales hay que
      * limpiarlo a mano: un manejador que quedara puesto apuntaria al
      * codigo de un programa que ya no existe. */
-    t->sig_pending = 0;
-    t->sig_frame   = 0;
-    t->sig_fp      = 0;
-    t->sig_tramp   = 0;
-    t->waiting_for = 0;
+    t->sig_pending  = 0;
+    t->sig_reanudar = 0;
+    t->sig_frame    = 0;
+    t->sig_fp       = 0;
+    t->sig_tramp    = 0;
+    t->reanudable   = 0;
+    t->waiting_for  = 0;
     for (int s = 0; s < SIG_MAX; s++) t->sig_handler[s] = 0;
 
     /* Nace sin FPU. Si la quiere, que la pida atrapando. */

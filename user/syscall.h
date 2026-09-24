@@ -101,6 +101,12 @@ static inline uint64_t freepages(void) { return (uint64_t)syscall2(SYS_freepages
  * defecto. SIGKILL no se puede atrapar. */
 int signal(int sig, void (*manejador)(int));
 
+/* Lo mismo, diciendo COMO se quiere que llegue. Es el sigaction del pobre,
+ * y existe por SIG_REANUDAR: la unica bandera que hay, la unica que hace
+ * falta, y la unica forma de que SIGCHLD no rompa lo que el proceso
+ * estuviera haciendo mientras su hijo terminaba. */
+int signal_banderas(int sig, void (*manejador)(int), int banderas);
+
 static inline int64_t kill(uint64_t pid, int sig)
 { return syscall2(SYS_kill, pid, (uint64_t)sig); }
 
@@ -125,21 +131,22 @@ static inline void *sbrk(int64_t delta)
 
 /* Esperar a que termine un proceso y recoger su codigo de salida. Vuelve
  * -1 si ya no existe o si nos interrumpio una senyal. */
-static inline int64_t waitpid(uint64_t pid) { return syscall3(SYS_waitpid, pid, 0, 0); }
+static inline int64_t waitpid(int64_t pid)
+{ return syscall3(SYS_waitpid, (uint64_t)pid, 0, 0); }
 
 /* Esperar sabiendo QUE paso. 'que' recibe W_SALIDA o W_PARADO, porque un
  * proceso detenido no ha terminado y confundir las dos cosas hace que
  * quien espera siga adelante dejando atras algo que sigue existiendo. */
-static inline int64_t waitpid_que(uint64_t pid, int *que, int banderas)
-{ return syscall3(SYS_waitpid, pid, (uint64_t)banderas, (uint64_t)que); }
+static inline int64_t waitpid_que(int64_t pid, int *que, int banderas)
+{ return syscall3(SYS_waitpid, (uint64_t)pid, (uint64_t)banderas, (uint64_t)que); }
 
 /* Preguntar sin quedarse esperando. Devuelve el codigo de salida, o
  * -EAGAIN si ese proceso sigue vivo. Es lo que necesita un shell para
  * enterarse de que un trabajo de segundo plano ha terminado sin bloquearse
  * en el, y de paso para recogerlo: un hijo que nadie espera se queda de
  * zombi. */
-static inline int64_t waitpid_ya(uint64_t pid)
-{ return syscall3(SYS_waitpid, pid, WNOHANG, 0); }
+static inline int64_t waitpid_ya(int64_t pid)
+{ return syscall3(SYS_waitpid, (uint64_t)pid, WNOHANG, 0); }
 
 /* El grupo, o sea el trabajo. Con pid 0 se refiere a uno mismo, y con
  * pgid 0 el grupo pasa a llamarse como el propio pid: "formo el mio". */

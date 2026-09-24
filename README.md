@@ -4512,6 +4512,297 @@ En Unix, una senyal del terminal tira tambien la entrada pendiente. Aqui
 faltaba, y el sintoma no apunta a la causa: el shell no tiene forma de
 saber que habia algo que tirar, porque eso ya no es suyo.
 
+## El kernel avisa, o la primera senyal que nadie pidio
+
+Habia un sintoma apuntado en las limitaciones desde el paso 52, y de los
+que solo se ven en la Pi porque hacen falta milisegundos de verdad:
+
+```
+/ $ wc &
+  [1] en el fondo  wc
+/ $ jobs
+  [1] corriendo  9  wc        <- miente: wc esta parado
+/ $ jobs
+  [1] parado     9  wc        <- ahora si
+```
+
+`wc &` arranca al fondo, intenta leer el teclado, se gana un `SIGTTIN` y se
+detiene. Pero el shell se enteraba de los cambios de estado de sus hijos
+**preguntando**, y solo justo antes de sacar un prompt. El `jobs` inmediato
+salia con la foto anterior, porque entre el "en el fondo" y el prompt aun no
+se habia parado nadie.
+
+Y el que miente no es `jobs`: es el modelo entero. Preguntar antes del
+prompt significa que el shell se entera cuando le apetece mirar, no cuando
+ocurren las cosas, y de ahi salen las tres cosas que estaban mal: la lista
+desfasada, los zombis que esperan a que vuelvas del cafe, y una recogida que
+solo funciona porque el shell se acuerda de los pid de todos sus hijos.
+
+Lo que falta es que el kernel hable. Es `SIGCHLD`, y trae consigo un
+problema nuevo que las once senyales anteriores no tenian.
+
+### Una senyal que nadie pidio
+
+Repasemos de donde salian las que ya habia. `SIGINT` y `SIGTSTP`, de una
+tecla. `SIGTERM` y `SIGKILL`, de un `kill` que alguien escribio. `SIGTTIN`,
+de una lectura que el propio proceso intento hacer. `SIGSEGV` no existe
+aqui, pero seria de una direccion que el propio proceso toco.
+
+Todas las pidio alguien, y en casi todas ese alguien esta mirando.
+
+`SIGCHLD` no. Llega porque OTRO proceso -un hijo- cambio de estado, en un
+instante que el padre no eligio y no puede prever. Y de esa diferencia, que
+parece filosofica, salen sus dos rarezas, que parecen arbitrarias:
+
+**Su accion por defecto es no hacer nada.** Todas las demas matan al que no
+las atrapa. Esta no puede: la accion por defecto de una senyal tiene que ser
+razonable para quien no sabe que esa senyal existe, y "morirte porque tu hijo
+acabo" no lo es. Si matara, `fork()` seria inutilizable sin saber de
+senyales.
+
+**Y hace falta poder decir que no interrumpa.** Una senyal saca al proceso de
+la llamada al sistema en la que estuviera bloqueado, y esa llamada vuelve con
+`-EINTR`. Con Ctrl-C eso es justo lo que se busca: romper la lectura ES el
+objetivo. Aqui no tiene nada que ver: que un hijo termine no le incumbe a la
+lectura que su padre tenga a medias, y romperla es contarle un fallo que no
+ha ocurrido.
+
+Las dos respuestas son correctas, para senyales distintas. Por eso en Unix
+es una bandera POR SENYAL y no una politica del sistema, y por eso existe
+`sigaction`: `signal()` a secas no tenia donde ponerla. Aqui la bandera es
+`SIG_REANUDAR` -el `SA_RESTART` de siempre- y se pide con
+`signal_banderas()`. `signal()` sigue significando lo de antes, que es lo
+que Ctrl-C necesita.
+
+### Lo que se va a ignorar no puede llegar a molestar
+
+Este es el fallo que habria tirado el sistema entero, y lo bonito es que no
+se ve mirando SIGCHLD: se ve mirando quien mas tiene hijos.
+
+Apuntar una senyal hace dos cosas. Una es dejar el bit. La otra es sacar al
+proceso de donde estuviera dormido, porque una senyal tiene que poder
+interrumpir una espera que no iba a acabar sola. Y esa segunda parte ocurria
+aunque la senyal acabara sin hacer nada.
+
+`init` espera a su interprete con un `waitpid` bloqueante y no atrapa
+`SIGCHLD`. Si cada proceso que muere en el sistema lo sacara de ahi, su
+`waitpid` volveria con `-EINTR`, init creeria que el interprete se ha ido y
+arrancaria otro. Un servidor de ficheros terminando mataria la sesion.
+
+Asi que ignorar tiene que significar **como si no hubiera llegado**, y eso
+incluye no despertar a nadie. La comprobacion va antes de apuntar el bit, no
+al entregarlo:
+
+```c
+if (t && sig == SIGCHLD && !t->sig_handler[SIGCHLD]) return 0;
+```
+
+Linux tiene esta misma linea y en el mismo sitio; se llama `sig_ignored()`.
+Hasta este paso no hacia falta, porque no habia ninguna senyal que el kernel
+mandara por su cuenta a alguien que no la esperaba.
+
+### Reanudar una llamada partida por la mitad
+
+Rebobinar una llamada al sistema es mas facil de lo que parece, y el motivo
+es que en AArch64 las instrucciones miden todas cuatro bytes: el `ELR_EL1`
+que se guardo apunta justo detras del `svc`, asi que restarle cuatro apunta
+al `svc`. Al volver del manejador, el proceso vuelve a ejecutar la llamada
+que ya habia hecho.
+
+Lo unico que falta es el x0 que traia, y falta porque el kernel lo pisa: el
+valor de retorno va ahi. Los demas argumentos -x1 a x7- siguen intactos en
+el marco, porque nadie los toca. Asi que se guarda uno solo, y se guarda en
+el unico sitio por donde salen todas las llamadas:
+
+```c
+if (ret == -EINTR) task_marcar_reanudable(a0);
+```
+
+Linux lleva este mismo apunte y lo llama `orig_x0`. El `a0` de ahi no hubo
+que inventarlo: ya estaba en una variable local porque hacia falta para otra
+cosa.
+
+Y la marca se borra **al salir a EL0, siempre**, lo primero de
+`signal_deliver` y antes de cualquier comprobacion. Dejarla puesta es la
+forma de romperlo todo: la siguiente senyal que llegara -por una
+interrupcion del reloj, en medio de codigo de usuario cualquiera- rebobinaria
+un PC que no apunta a ningun `svc`, y el proceso se iria a ejecutar lo que
+hubiera cuatro bytes antes.
+
+El rebobinado se escribe en el marco ANTES de copiarlo a la pila del
+proceso, y eso no es un detalle de orden: lo que restaura `sigreturn` es esa
+copia. Si se rebobinara despues, se rebobinaria un marco que ya nadie va a
+leer.
+
+Se ve funcionando en que no se ve nada:
+
+```
+/ $ lento 2 x &
+  [1] en el fondo  lento 2 x
+/ $ ec                         <- media orden escrita, sin Enter
+  [x] terminado                <- el hijo muere AQUI, con la linea a medias
+ho la-linea-sobrevivio         <- se termina de escribir
+la-linea-sobrevivio            <- y ejecuta la orden entera
+```
+
+Sin `SIG_REANUDAR`, en el momento en que muere el hijo el `fgets` del shell
+habria vuelto con `EINTR`, el shell habria dado la linea por cortada y
+habria sacado un prompt nuevo en medio. La media orden no se habria perdido
+-desde el paso 53 vive en el kernel, y una senyal de estas no la tira- pero
+el usuario habria visto un prompt aparecer por su cuenta mientras escribia.
+
+### Recoger en el manejador, contar en el prompt
+
+Aqui esperaba yo que el manejador de `SIGCHLD` imprimiera "[1] hecho", y
+esta bien que no lo haga, por un motivo que no tiene nada que ver con la
+estetica.
+
+`printf` no es reentrante. Escribe en el cubo de `stdout`, y si la senyal
+llega justo cuando el bucle principal estaba a medias de otro `printf`, las
+dos escrituras se pisan. Un manejador de senyal solo puede llamar a un
+punado de funciones -en Unix hay una lista, y `printf` no esta en ella-
+porque puede aparecer en cualquier punto del programa, incluido el medio de
+una.
+
+Asi que se parte en dos lo que antes era una funcion:
+
+- **`recoger()`** decide y apunta, y no imprime nada. La llama el manejador
+  en cuanto un hijo cambia de estado.
+- **`anunciar()`** lo cuenta, y solo la llama el bucle principal justo antes
+  del prompt.
+
+Y resulta que eso es exactamente lo que hace bash: se entera en el acto y lo
+dice en el prompt siguiente. Yo creia que era una cortesia para no
+ensuciarte la linea que estas escribiendo; es que el manejador no puede
+hablar.
+
+El resultado es que el `jobs` inmediato ya dice la verdad -la tabla se
+actualizo cuando `wc` se paro, no cuando al shell le toco mirar- y el
+anuncio sigue saliendo en un sitio limpio.
+
+### La ventana en que al manejador no le toca
+
+Mientras el bucle principal espera a un trabajo de primer plano, esta
+esperando a un hijo CONCRETO y quiere el codigo de salida de ese. Si el
+manejador se pusiera a recoger por su cuenta, podria llevarse justo a ese, y
+el `waitpid` de arriba volveria con `-ECHILD`: el shell se quedaria sin
+saber como acabo lo que acabas de ejecutar.
+
+En Unix esto se arregla bloqueando la senyal alrededor del trozo delicado,
+con `sigprocmask`. Aqui no hay mascaras, asi que lo unico que se puede hacer
+es que el manejador sepa cuando no le toca: una variable `no_molestes`
+puesta alrededor de las esperas de primer plano. La senyal se pierde, y no
+pasa nada grave, porque el `recoger()` del prompt siguiente encuentra lo que
+quedara.
+
+Que una senyal se pueda perder asi es, por si hacia falta el argumento, la
+razon de que `sigprocmask` exista.
+
+### Cualquiera de mis hijos, y el noveno trabajo
+
+`waitpid` pedia un pid concreto, y el shell podia porque se acuerda de los
+pid de cada trabajo. Menos de uno.
+
+`anotar()` devuelve 0 cuando ya no caben mas trabajos -la tabla son ocho- y
+**ninguno de los cuatro sitios que la llaman mira ese valor**. Asi que el
+noveno trabajo de fondo se bifurca, corre, termina... y se queda de zombi
+para siempre, porque el unico que podia enterrarlo era el que no se acordo de
+apuntarlo. Una ranura de la tabla de tareas y su memoria, perdidas hasta que
+muera el shell, que no muere nunca.
+
+Eso es lo que `PID_CUALQUIERA` sabe hacer y un pid concreto no: recoger sin
+saber a quien. No hace falta preguntar quien era, porque de estos no hay
+nada que contar -nadie los apunto- y lo unico que se les debe es el
+entierro.
+
+Dos cosas del barrido no son obvias:
+
+**Va despues del recorrido de la tabla.** "Cualquiera" incluye a los que si
+conocemos, asi que si se barriera primero, los trabajos apuntados perderian
+su codigo de salida en manos de quien no sabe de quien era.
+
+**Y va sin `WUNTRACED`.** Un hijo parado contestaria en cada vuelta -nadie
+lleva la cuenta de si ya se aviso de esa parada, y eso ya estaba en las
+limitaciones- y el bucle no acabaria nunca. Aqui solo se entierra; pararse no
+es morirse.
+
+### Una prueba que falla cuando debe, otra vez
+
+El zombi que se escapa no se ve: no hay `ps`. Lo que si se ve es lo que
+acaba pasando cuando se escapan varios, y para medirlo hay que quedarse sin
+ranuras a proposito.
+
+Ocho `wc &` llenan la tabla de trabajos -cada uno se para con su `SIGTTIN`- y
+a partir del noveno, cada trabajo de fondo que se lance corre sin que nadie
+lo apunte. Con el barrido puesto, diez seguidos funcionan y el shell sigue
+vivo. Sin el:
+
+```
+  no caben mas trabajos        x7
+  no he podido bifurcarme      <- y aqui se acabaron las ranuras
+  no he podido bifurcarme
+  no he podido bifurcarme
+```
+
+Siete zombis, veinte ranuras de tarea y cuatro ocupadas por init, los dos
+servidores y el shell. Las cuentas salen, y la prueba mide algo: la comprobe
+desactivando el barrido a mano, que es la unica forma de saber que una prueba
+verde no esta verde por casualidad.
+
+### El arbitro no puede dejarse quitar el teclado
+
+Poner el aviso destapo un agujero que llevaba ahi desde el paso 52, y que
+este paso no causa pero si permite ver con claridad: **un Ctrl-Z en el prompt
+paraba el shell para siempre**. No lo atrapaba, la accion por defecto lo
+detenia, e init espera a que su interprete TERMINE y no a que se pare. Nadie
+lo reanimaba. La maquina se quedaba muda y se arreglaba apagando.
+
+Lo comprobe compilando el commit anterior: se portaba igual antes y despues,
+asi que no lo traia el paso 54.
+
+La tentacion era arreglarlo desde init, que ahora se enteraria -para eso
+acabo de ponerle el aviso-. Y es el sitio equivocado: init no tiene por que
+opinar sobre si un interprete quiere estar parado. El que tiene que decidir
+eso es el propio shell, y lo que decide cualquier shell de verdad es que a el
+no le pare nadie. No es que no le importe la senyal: es que **el reparte el
+teclado, y quien hace de arbitro no puede dejarse quitar por el juego**. Es
+exactamente la misma regla que ya justificaba atrapar `SIGINT`, y no me di
+cuenta de que era la misma hasta tener las dos delante.
+
+Asi que una linea, y el mismo manejador vacio que ya servia para Ctrl-C:
+
+```c
+signal(SIGINT,  tragar);
+signal(SIGTSTP, tragar);
+```
+
+Lo interesante son las dos cosas que NO hay que hacer ahi.
+
+**No es un SIG_IGN, y aqui eso es lo correcto y no un atajo.** Un manejador
+vacio y un `SIG_IGN` de verdad no son lo mismo: el primero interrumpe la
+llamada que estuviera bloqueada, y el segundo no llega ni a molestar -es la
+misma distincion que acaba de aparecer con SIGCHLD-. Aqui hace falta que la
+interrumpa, porque el driver del terminal **ya tiro la linea que estabas
+escribiendo** antes de saber quien iba a atender la senyal, igual que hace
+con Ctrl-C. Si el shell no se enterara, se quedaria en pantalla una orden a
+medias que ya no existe en ningun sitio. Que la lectura vuelva con `EINTR` es
+lo que le dice "redibuja". El resultado es que Ctrl-Z en el prompt se porta
+como Ctrl-C, que es lo unico que puede hacer: tirar la linea y empezar otra.
+
+**Y `SIGTTIN` y `SIGTTOU` no se tocan, que es la diferencia con bash.** Alli
+se ignoran las tres, porque a bash se le puede arrancar desde el fondo de
+otro shell. Aqui el interprete esta siempre en primer plano -init le da la
+consola al nacer y el la recupera despues de cada trabajo- asi que nunca va a
+leer el teclado sin tener derecho. Y atraparlas con un manejador vacio seria
+PEOR que no hacerlo: un shell del fondo que leyera se quedaria girando
+-lectura, `EINTR`, prompt, lectura- en vez de pararse, que es justo la
+proteccion que `SIGTTIN` existe para dar. Copiar a bash las tres lineas
+habria cambiado un agujero que no se puede alcanzar por otro que si.
+
+Ctrl-Z sobre un hijo de primer plano no cambia, y no porque se haya tenido
+cuidado: la senyal va al GRUPO que tiene la consola, que en ese momento es el
+del hijo y no el del shell. El manejador nuevo no se entera de que existe.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -4568,11 +4859,9 @@ saber que habia algo que tirar, porque eso ya no es suyo.
   contesta W_PARADO pero no cual fue la senyal.
 - `WUNTRACED` avisa de que un proceso esta parado cada vez que se
   pregunta, no solo la primera. El shell lo tapa anunciandolo solo al
-  cambiar de estado; un Unix lo lleva en el propio proceso.
-- No hay `SIGCHLD`, asi que los cambios de estado se descubren preguntando
-  antes de cada prompt y no en el momento en que ocurren. En la Pi eso se
-  ve: un `wc &` aparece como "corriendo" en el `jobs` inmediato y como
-  "parado" en el prompt siguiente.
+  cambiar de estado; un Unix lo lleva en el propio proceso. Y es lo que
+  impide barrer con `PID_CUALQUIERA | WUNTRACED`: un hijo parado contestaria
+  en cada vuelta y el bucle no acabaria.
 - La contraprueba de `anyadir` depende del tiempo: pierde 19 lineas de 60
   en QEMU y 7 en la Pi, con la misma ventana. Si algun dia dejara de
   perder ninguna, no seria que el `lseek` se ha arreglado, seria que la
@@ -4583,12 +4872,40 @@ saber que habia algo que tirar, porque eso ya no es suyo.
   letra: `lento a | lento b` saca las dos lineas trenzadas. El descriptor
   de consola no tiene cerrojo, y ponerselo no bastaria mientras el kernel
   y el `conserver` sigan siendo dos drivers sobre la misma UART.
-- Los trabajos terminados se recogen solo al sacar el prompt. Un Unix se
-  entera en el acto con `SIGCHLD`; aqui, si te vas a tomar un cafe con el
-  shell parado esperando una orden, el zombi espera contigo.
-- `task_wait` sigue pidiendo un pid concreto: no hay `wait(-1)` ni
-  "cualquiera de mis hijos". El shell puede porque se acuerda de los pid
-  de cada trabajo.
+- `waitpid` con `PID_CUALQUIERA` no dice QUIEN ha sido: devuelve el codigo
+  de salida, y el pid no cabe en el mismo numero. El de Unix devuelve el pid
+  y pone el estado aparte, que es justo la forma de poder usarlo para llevar
+  una lista de trabajos. Aqui solo sirve para lo que no hace falta
+  identificar -enterrar-, y el shell sigue recorriendo su tabla con pids
+  concretos para todo lo demas.
+- Un codigo de salida negativo se confunde con un errno. `waitpid` devuelve
+  los dos en el mismo entero, asi que un hijo que salga con -11 es
+  indistinguible de un `-EAGAIN`, y de hecho un proceso al que mata una
+  senyal sale con -1, que es `-EPERM`. El barrido lo soporta porque
+  equivocarse ahi solo le cuesta acabar una vuelta antes, y el prompt
+  siguiente barre otra vez; para cualquier otra cosa habria que separar los
+  dos como se separo el "que paso".
+- No hay `sigprocmask`: una senyal no se puede bloquear, solo atrapar o no.
+  El shell lo suple con una variable que apaga su propio manejador mientras
+  espera en primer plano, y el precio es que esa senyal se pierde. Funciona
+  porque hay una red detras -el `recoger()` del prompt- y no porque sea
+  equivalente.
+- `SIG_REANUDAR` es la unica bandera que hay, y no hay `SIG_IGN`: para
+  ignorar una senyal hay que atraparla con un manejador que no haga nada, que
+  no es lo mismo -un manejador vacio interrumpe las llamadas bloqueadas, y
+  `SIG_IGN` no llega ni a molestar-. El shell se apoya en esa diferencia a
+  proposito para Ctrl-C y Ctrl-Z, pero no siempre sale a favor: un programa
+  que quisiera ignorar una senyal sin que se le rompan las lecturas no puede.
+  Tampoco hay `sigaction` de verdad, ni `sa_mask`, ni `SIGINFO`.
+- El manejador de `SIGTSTP` del shell se HEREDA en el fork y solo se borra en
+  el exec, asi que hay una ventana de unos microsegundos -entre bifurcarse y
+  convertirse en el programa- en la que un hijo se tragaria un Ctrl-Z en vez
+  de pararse. bash pone los manejadores en su sitio en el hijo justo despues
+  del fork; aqui no, porque para alcanzarla habria que pulsar la tecla dentro
+  de esa ventana.
+- Se reanuda solo la llamada que devolvio `-EINTR`, y solo reponiendo x0. Con
+  las llamadas de ahora basta, porque el kernel no pisa ningun otro
+  argumento; el dia que alguna escriba en x1 habria que guardar mas.
 - `strtol` sigue sin detectar desbordamiento, aunque ya hay `ERANGE` donde
   ponerlo.
 - `errno` es una variable global y no una por hilo. Con un solo hilo por

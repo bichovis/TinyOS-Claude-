@@ -373,7 +373,7 @@ void syscall_dispatch(struct trap_frame *f)
     /* Decir que hacer cuando llegue una. El trampolin lo pone la libreria
      * de usuario, no el programa: es por donde vuelve el manejador. */
     case SYS_signal:
-        ret = task_set_handler((int)f->x[0], f->x[1], f->x[2]);
+        ret = task_set_handler((int)f->x[0], f->x[1], f->x[2], (int)f->x[3]);
         break;
 
     /* Lo llama el trampolin cuando el manejador termina. Devuelve el x0
@@ -597,7 +597,8 @@ void syscall_dispatch(struct trap_frame *f)
     case SYS_waitpid: {
         int64_t codigo = -1;
         int     que    = W_SALIDA;
-        int     r      = task_wait(f->x[0], &codigo, &que, (int)f->x[1]);
+        int     r      = task_wait((int64_t)f->x[0], &codigo, &que,
+                                  (int)f->x[1]);
 
         /* El "que paso" va aparte, en memoria del que pregunta, porque en
          * el valor de retorno ya no cabe: ahi esta el numero. Si no da un
@@ -691,6 +692,18 @@ void syscall_dispatch(struct trap_frame *f)
         ret = -1;
         break;
     }
+
+    /* Si la llamada se va con -EINTR, es que una senyal la saco de en medio
+     * y no que haya fallado nada. Apuntarlo aqui -que es el unico sitio por
+     * donde salen todas- le da a signal_deliver la opcion de reanudarla si
+     * quien atrapa la senyal lo pidio. El x0 original es 'a0', que ya
+     * estaba en una variable local porque hacia falta para otra cosa: el
+     * frame ya no lo tiene, porque en x0 va el resultado.
+     *
+     * Es el equivalente de orig_x0 en Linux, y esta aqui por el mismo
+     * motivo: el unico registro que el kernel se ve obligado a pisar es
+     * justo uno de los argumentos. */
+    if (ret == -EINTR) task_marcar_reanudable(a0);
 
     /* El valor de retorno se deja en el frame. kernel_exit lo restaurara en
      * x0 al hacer el 'eret', asi que el proceso lo recibe como si fuera el

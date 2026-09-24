@@ -435,10 +435,18 @@ static int preparar(struct orden *o, const char *linea)
  */
 #define MAX_TRABAJOS  8
 
+/* Lo que hay que contar de un trabajo la proxima vez que se saque un
+ * prompt. Ver 'recoger' y 'anunciar': quien se entera y quien lo dice ya no
+ * son el mismo. */
+#define AVISO_NADA     0
+#define AVISO_PARADO   1
+#define AVISO_HECHO    2
+
 static struct trabajo {
     int      usado;
     int      numero;                 /* el [1] que se ensenya */
     int      parado;                 /* detenido, que no es terminado */
+    int      aviso;                  /* noticia pendiente de contar */
     uint64_t pgid;
     uint64_t pids[2];
     int      npids;
@@ -457,6 +465,7 @@ static struct trabajo *anotar(uint64_t pgid, uint64_t p1, uint64_t p2,
         struct trabajo *t = &trabajos[i];
         t->usado  = 1;
         t->parado = parado;
+        t->aviso  = AVISO_NADA;      /* las ranuras se reciclan */
         t->numero = siguiente_numero++;
         t->pgid   = pgid;
         t->npids  = 0;
@@ -493,14 +502,53 @@ static struct trabajo *buscar_trabajo(const char *arg)
 
 /* Recoger los que hayan terminado, SIN esperar a ninguno.
  *
- * Se llama antes de cada prompt, que es el unico momento en que el shell
- * no esta haciendo otra cosa. Un Unix de verdad se entera por SIGCHLD en
- * cuanto pasa; esto se entera un poco tarde, y para lo que hay que
- * ensenyar da igual.
+ * Lo llaman DOS: el manejador de SIGCHLD, en cuanto un hijo cambia de
+ * estado, y el bucle principal antes de cada prompt. El segundo dejo de ser
+ * el que se entera y paso a ser una red: recoge lo que el manejador no
+ * pudo -mientras 'no_molestes' estaba puesto- y lo que pasara si algun dia
+ * se pierde una senyal.
  *
- * Lo que NO da igual es recogerlos: un hijo al que su padre nunca espera
- * se queda de zombi hasta que el padre muere, y un shell no muere nunca.
+ * Y NO IMPRIME NADA, que es la unica razon por la que se puede llamar desde
+ * un manejador. printf no es reentrante: escribe en el cubo de stdout, y si
+ * la senyal llega justo cuando el bucle principal estaba a medias de otro
+ * printf, las dos escrituras se pisan. Por eso lo que aqui se decide se
+ * APUNTA, y lo cuenta 'anunciar' desde el bucle principal.
+ *
+ * Es exactamente lo que hace bash: se entera en el acto y lo dice en el
+ * prompt siguiente. Parecia una cortesia para no ensuciar la linea que
+ * estas escribiendo, y resulta que es lo que hace seguro al manejador.
  */
+/* --- Y los hijos que la tabla no conoce -------------------------------
+ *
+ * Que existan es un descuido con nombre: 'anotar' devuelve 0 cuando ya no
+ * caben mas trabajos, y ninguno de los cuatro sitios que la llaman mira ese
+ * valor. Asi que el noveno trabajo de fondo se bifurca, corre, termina... y
+ * se queda de zombi para siempre, porque el unico que podia enterrarlo era
+ * el que no se acordo de apuntarlo. Un slot de la tabla de tareas y su
+ * memoria, perdidos hasta que muera el shell, que no muere nunca.
+ *
+ * Esto es lo que PID_CUALQUIERA sabe hacer y un pid concreto no: recoger
+ * sin saber a quien. No hace falta preguntar quien era, porque de estos no
+ * hay nada que contar -nadie los apunto- y lo unico que se les debe es el
+ * entierro.
+ *
+ * Va DESPUES del recorrido de la tabla, y el orden importa: "cualquiera"
+ * incluye a los que si conocemos, y si se barriera primero, los trabajos
+ * apuntados perderian su codigo de salida en manos de quien no sabe de
+ * quien era. */
+static void barrer_ajenos(void)
+{
+    /* Con tope, que es la regla de cualquier bucle cuya condicion de salida
+     * la decide otro. Y SIN WUNTRACED, que es la parte sutil: un hijo
+     * parado contestaria en cada vuelta -nadie lleva la cuenta de si ya se
+     * aviso de esa parada- y el bucle no acabaria nunca. Aqui solo se
+     * entierra; parar no es morirse. */
+    for (int v = 0; v < MAX_TRABAJOS * 2 + 4; v++) {
+        int64_t r = waitpid_ya(PID_CUALQUIERA);
+        if (r == -EAGAIN || r == -ECHILD) return;
+    }
+}
+
 static void recoger(void)
 {
     for (int i = 0; i < MAX_TRABAJOS; i++) {
@@ -541,15 +589,63 @@ static void recoger(void)
         if (se_paro) {
             if (!t->parado) {
                 t->parado = 1;
-                printf("  [%d] parado   %s\n", t->numero, t->orden);
+                t->aviso  = AVISO_PARADO;
             }
         } else if (!quedan) {
-            printf("  [%d] hecho    %s\n", t->numero, t->orden);
-            t->usado = 0;
+            /* La ranura NO se libera aqui: hace falta viva para poder
+             * contar que ha terminado. La suelta 'anunciar'. */
+            t->aviso = AVISO_HECHO;
         } else {
             t->parado = 0;               /* alguien le dio un SIGCONT */
         }
     }
+
+    barrer_ajenos();
+}
+
+/* Y contarlo, ya en el bucle principal, donde se puede imprimir.
+ *
+ * Va justo antes del prompt y no en otro sitio, asi que ninguna noticia
+ * aparece en medio de la linea que estas escribiendo. */
+static void anunciar(void)
+{
+    for (int i = 0; i < MAX_TRABAJOS; i++) {
+        struct trabajo *t = &trabajos[i];
+        if (!t->usado || t->aviso == AVISO_NADA) continue;
+
+        if (t->aviso == AVISO_PARADO) {
+            printf("  [%d] parado   %s\n", t->numero, t->orden);
+            t->aviso = AVISO_NADA;
+        } else {
+            printf("  [%d] hecho    %s\n", t->numero, t->orden);
+            t->usado = 0;                /* ahora si */
+        }
+    }
+}
+
+/* --- El manejador, y la unica ventana en que no le toca ----------------
+ *
+ * Mientras el bucle principal espera a un trabajo de primer plano, esta
+ * esperando a un hijo CONCRETO y quiere el codigo de salida de ese. Si el
+ * manejador se pusiera a recoger por su cuenta con PID_CUALQUIERA, podria
+ * llevarse justo a ese, y el waitpid de arriba volveria con -ECHILD: el
+ * shell se quedaria sin saber como acabo lo que acaba de ejecutar.
+ *
+ * En Unix esto se arregla bloqueando la senyal alrededor del trozo
+ * delicado, con sigprocmask. Aqui no hay mascaras -son un paso que no se
+ * ha dado- asi que lo unico que se puede hacer es que el manejador sepa
+ * cuando no le toca. La senyal se pierde, y no pasa nada: el 'recoger' del
+ * prompt siguiente encuentra lo que quedara.
+ *
+ * Que una senyal se pueda perder asi es, por si hacia falta el argumento,
+ * la razon de que sigprocmask exista. */
+static volatile int no_molestes;
+
+static void sigchld(int sig)
+{
+    (void)sig;
+    if (no_molestes) return;
+    recoger();
 }
 
 static void listar_trabajos(void)
@@ -575,6 +671,7 @@ static void listar_trabajos(void)
 static int64_t en_primer_plano(uint64_t pgid, uint64_t p1, uint64_t p2,
                                int *parado)
 {
+    no_molestes = 1;                 /* de estos me encargo yo */
     consola(pgid);
 
     int64_t codigo = 0;
@@ -595,6 +692,7 @@ static int64_t en_primer_plano(uint64_t pgid, uint64_t p1, uint64_t p2,
      * manda a partir de ahora es el shell otra vez, y si se le olvidara
      * recuperarla el teclado apuntaria a un grupo que no la va a usar. */
     consola(mi_grupo);
+    no_molestes = 0;
     return codigo;
 }
 
@@ -610,6 +708,7 @@ static void al_frente(struct trabajo *t)
 {
     printf("  %s\n", t->orden);
 
+    no_molestes = 1;
     consola(t->pgid);
     kill(-(int64_t)t->pgid, SIGCONT);
 
@@ -624,6 +723,7 @@ static void al_frente(struct trabajo *t)
     }
 
     consola(mi_grupo);
+    no_molestes = 0;
 
     if (parado) { t->parado = 1; printf("\n  [%d] parado   %s\n", t->numero, t->orden); }
     else {
@@ -642,9 +742,13 @@ static void al_fondo(struct trabajo *t)
 }
 
 /* No hace nada, y eso es lo que tiene que hacer: lo unico que se busca es
- * que la accion por defecto -morirse- no ocurra. La linea a medias se
- * pierde y sale un prompt nuevo. */
-static void sigint(int sig) { (void)sig; }
+ * que no ocurra la accion por defecto. La linea a medias se pierde y sale un
+ * prompt nuevo.
+ *
+ * Lo comparten Ctrl-C y Ctrl-Z, que piden lo mismo del shell por motivos
+ * distintos: la primera para que no lo mate, la segunda para que no lo pare.
+ * Ver donde se instalan. */
+static void tragar(int sig) { (void)sig; }
 
 static void quejarse(const char *que)
 {
@@ -916,12 +1020,58 @@ int main(int argc, char **argv)
      *
      * Atraparla y no hacer nada es exactamente lo que hace cualquier
      * shell: la linea a medias se pierde y sale un prompt limpio. */
-    signal(SIGINT, sigint);
+    signal(SIGINT, tragar);
+
+    /* Y tiene que sobrevivir tambien a su propio Ctrl-Z, que es la otra
+     * mitad de la misma idea y faltaba desde el paso 52.
+     *
+     * Un Ctrl-Z en el prompt le llegaba al shell, que no lo atrapaba, y la
+     * accion por defecto lo DETENIA. Ahi se acababa la sesion: init espera a
+     * que su interprete TERMINE, no a que se pare, asi que nadie lo reanimaba
+     * y la maquina se quedaba muda para siempre. Se arreglaba apagando.
+     *
+     * Quien reparte el teclado no puede dejarse quitar por el. Es la misma
+     * regla que ya valia para SIGINT, y por eso cualquier shell de verdad
+     * ignora las senyales del terminal: no es que no le importen, es que el
+     * es el arbitro.
+     *
+     * Y se ignora con un manejador vacio en vez de con un SIG_IGN de verdad
+     * -que aqui no existe- porque en este caso concreto es lo CORRECTO y no
+     * un atajo. Un manejador vacio interrumpe la lectura y SIG_IGN no, y
+     * aqui hace falta que la interrumpa: el terminal ya tiro la linea que
+     * estabas escribiendo -eso lo hace el driver, antes de saber quien va a
+     * atender la senyal- asi que el shell TIENE que volver a dibujar el
+     * prompt. Con un SIG_IGN quedaria en pantalla una orden a medias que ya
+     * no existe en ningun sitio.
+     *
+     * SIGTTIN y SIGTTOU no se tocan, y esa es la diferencia con bash. Alli
+     * hacen falta porque a bash se le puede arrancar desde el fondo de otro
+     * shell; aqui el interprete esta siempre en primer plano -init le da la
+     * consola al nacer, y el la recupera despues de cada trabajo- asi que
+     * nunca va a leer el teclado sin tener derecho. Y atraparlas seria peor
+     * que no hacerlo: con un manejador vacio, un shell del fondo que leyera
+     * se quedaria girando -lectura, EINTR, prompt, lectura- en vez de
+     * pararse, que es justo la proteccion que SIGTTIN existe para dar. */
+    signal(SIGTSTP, tragar);
+
+    /* Y ahora el aviso de que un hijo ha cambiado de estado.
+     *
+     * Con SIG_REANUDAR, y eso es la mitad del paso: sin la bandera, cada
+     * hijo que terminara mientras el usuario escribe le romperia la lectura
+     * de la linea al shell. Con ella, el manejador se cuela, recoge, y la
+     * lectura sigue donde estaba: el usuario no se entera de que ha pasado
+     * nada, que es lo correcto, porque no ha pasado nada que le incumba a
+     * la linea que esta escribiendo. */
+    signal_banderas(SIGCHLD, sigchld, SIG_REANUDAR);
 
     for (;;) {
-        /* Antes del prompt, y no en otro sitio: es el unico momento en que
-         * el shell no esta esperando a nadie. */
+        /* Recoger sigue estando aqui, pero ya no como forma de enterarse:
+         * de eso se ocupa el manejador en cuanto pasa. Esto es la red que
+         * pilla lo que ocurriera mientras 'no_molestes' estaba puesto. */
         recoger();
+
+        /* Y contar lo que haya, que es lo que el manejador no podia hacer. */
+        anunciar();
 
         /* El prompt lleva el directorio: sin eso, con subdirectorios, se
          * pierde uno a la segunda orden. */
