@@ -33,4 +33,15 @@ void uart_irq(void);
 void uart_push(const char *buf, uint64_t n);
 extern uint64_t uart_perdidos;       /* teclas tiradas por falta de sitio */                /* lo llama irq.c cuando salta la IRQ   */
 int  uart_read(char *out);          /* saca un byte del buffer: 1=hay, 0=no */
-int  uart_getc_blocking(void);   /* -1 si lo interrumpe una senyal */      /* duerme el hilo hasta que llegue algo */
+
+/* Hasta n bytes de lo legible, durmiendo si no hay nada. 0 = se acabo la
+ * entrada (Ctrl-D), -1 = lo interrumpio una senyal. */
+int64_t uart_leer(char *dst, uint64_t n);
+
+/* El modo del terminal: T_ECO, T_CANONICO. Devuelve el que habia; con -1
+ * solo consulta. Ver la disciplina de linea en uart.c. */
+int  uart_modo(int nuevo);
+
+/* Tirar la entrada pendiente: la linea a medias y lo ya entregado. Lo
+ * llaman Ctrl-C y Ctrl-Z. */
+void uart_descartar_entrada(void);

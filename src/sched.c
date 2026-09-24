@@ -1247,8 +1247,19 @@ int task_parar(void)
     return abortar ? -1 : 0;
 }
 
-void task_console_interrupt(void) { task_signal_grupo(consola_pgid, SIGINT); }
-void task_console_stop(void)      { task_signal_grupo(consola_pgid, SIGTSTP); }
+/* Las dos tiran lo que hubiera a medias: una senyal del terminal cancela
+ * tambien la orden que estabas escribiendo. */
+void task_console_interrupt(void)
+{
+    uart_descartar_entrada();
+    task_signal_grupo(consola_pgid, SIGINT);
+}
+
+void task_console_stop(void)
+{
+    uart_descartar_entrada();
+    task_signal_grupo(consola_pgid, SIGTSTP);
+}
 
 /* ¿El grupo de quien pregunta es el que tiene la consola?
  *

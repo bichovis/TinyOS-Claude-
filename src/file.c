@@ -195,11 +195,23 @@ static int64_t consola_read(uint64_t uva, uint64_t n)
      * una senyal en mitad de la lectura se confunde con el fin de la
      * entrada, el shell se despide y se va. Es literalmente lo que pasaba
      * al escribir este paso. */
-    int c = uart_getc_blocking();
-    if (c < 0) return -EINTR;               /* senyal */
+    /* Una linea entera, no un caracter.
+     *
+     * Hasta este paso esto devolvia UN byte por llamada, asi que escribir
+     * "cat hola.txt" eran doce excepciones, doce cambios de privilegio y
+     * doce vueltas por la tabla de vectores. Ahora la disciplina de linea
+     * no suelta nada hasta el Enter, asi que cuando hay algo que leer hay
+     * una linea entera y el viaje es uno.
+     *
+     * No se ha optimizado nada. Sale de haber puesto la decision de
+     * "cuando hay algo que leer" donde le tocaba. */
+    char tmp[BOUNCE];
+    if (n > BOUNCE) n = BOUNCE;
 
-    char b = (char)c;
-    return (int64_t)copiar_a_usuario(uva, &b, 1);
+    int64_t hay = uart_leer(tmp, n);
+    if (hay <= 0) return hay;               /* 0 = se acabo, -EINTR = senyal */
+
+    return (int64_t)copiar_a_usuario(uva, tmp, (uint64_t)hay);
 }
 
 /* --- Ficheros: el kernel como CLIENTE del servidor -------------------

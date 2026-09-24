@@ -77,17 +77,22 @@ static void decidir(FILE *f)
 
     if (f->modo & M_ESCRIBIR) { f->modo |= M_LINEA; return; }
 
-    /* Leer del terminal SIN cubo.
+    /* Y leer del terminal CON cubo, que hasta el paso 53 no se podia.
      *
-     * Aqui el motivo no es el rendimiento, es de quien son los
-     * caracteres. El terminal lo comparten todos los procesos por turnos:
-     * si el shell se guarda 512 bytes "por si acaso", se esta quedando
-     * con lo que el usuario escribio para el programa que viene despues,
-     * y ese programa se queda esperando algo que ya no llegara nunca.
+     * El motivo de no poder nunca fue el rendimiento: era de quien son
+     * los caracteres. El terminal lo comparten todos los procesos por
+     * turnos, y un shell que se guardara 512 bytes "por si acaso" se
+     * estaria quedando con lo que el usuario escribio para el programa
+     * que viene despues, que se quedaria esperando algo que ya no llega.
      *
-     * De un fichero se puede leer de golpe porque el fichero es tuyo. Del
-     * terminal no. */
-    f->modo |= M_SINBUF;
+     * Lo que ha cambiado no esta aqui: es que ahora una lectura del
+     * terminal devuelve UNA LINEA como mucho. Con esa frontera, el cubo
+     * no puede robar nada, porque lo que se lleva es exactamente lo que
+     * se escribio para ti.
+     *
+     * Asi que la regla sigue siendo la misma -de un fichero puedes leer
+     * de golpe porque el fichero es tuyo- y lo que ha pasado es que ahora
+     * una linea del terminal tambien lo es. */
 }
 
 /* --- Vaciar ------------------------------------------------------------ */
@@ -98,6 +103,11 @@ static void decidir(FILE *f)
  * diferencia entre este numero y la cantidad de caracteres escritos, y
  * un numero que puedes imprimir convence mas que un parrafo. */
 unsigned long stdio_escrituras = 0;
+
+/* Y cuantas veces hemos bajado a LEER. Desde el paso 53 este numero mide
+ * algo distinto que antes: no cuantas veces se llena el cubo, sino
+ * cuantas lineas se han tecleado. */
+unsigned long stdio_lecturas = 0;
 
 static int escribir_todo(int fd, const char *s, int n)
 {
@@ -205,6 +215,7 @@ static int rellenar(FILE *f)
      * fflush(stdout) antes de cada scanf: la lectura lo hace por ti. */
     fflush(stdout);
 
+    stdio_lecturas++;
     int64_t k = read(f->fd, f->buf, (f->modo & M_SINBUF) ? 1 : BUFSIZ);
     if (k < 0) { f->modo |= M_ERROR; return -1; }
     if (k == 0) { f->modo |= M_EOF;  return 0; }

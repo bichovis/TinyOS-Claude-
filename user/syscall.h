@@ -273,6 +273,16 @@ static inline int64_t console_int(void)   { return syscall2(SYS_console_int, 0, 
 static inline
 int64_t console_stop(void)  { return syscall2(SYS_console_stop, 0, 0); }
 
+/* El modo del terminal. Devuelve el que habia, asi que guardar y reponer
+ * es el mismo par de llamadas:
+ *
+ *     int antes = termios(termios(-1) & ~T_ECO);
+ *     ... pedir la contrasenya ...
+ *     termios(antes);
+ */
+static inline int64_t termios(int modo)
+{ return syscall2(SYS_termios, (uint64_t)(int64_t)modo, 0); }
+
 /* Crear un proceso a partir de una imagen que tenemos en memoria.
  *
  * Que esto sea una llamada al sistema y no una funcion del kernel es lo

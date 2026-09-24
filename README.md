@@ -107,6 +107,7 @@ Tres cosas que QEMU perdona y el silicio no:
 | 50   | Anyadir al final: O_APPEND y `>>`           | hecho  |
 | 51   | Grupos de procesos, segundo plano y Ctrl-C  | hecho  |
 | 52   | Detenido: Ctrl-Z, fg, bg y SIGTTIN          | hecho  |
+| 53   | La disciplina de linea: eco, borrado, Ctrl-D| hecho  |
 
 ## Estructura
 
@@ -4346,6 +4347,171 @@ programa no se para al nacer, se para la primera vez que pregunta por el
 teclado.** Eso no se deduce mirando la lista de trabajos, y en QEMU los
 tiempos lo tapaban.
 
+## Entre la tecla y el programa
+
+Los pasos 51 y 52 hicieron la mitad del terminal que reparte **senyales**:
+quien recibe el Ctrl-C, quien esta delante, quien esta detenido. Falta la
+otra mitad, que es la que procesa **lineas**.
+
+Hasta aqui, el eco y el borrado los hacia el shell:
+
+    int k = getchar();
+    if (c == 8 || c == 127) { if (n) { n--; printf("\b \b"); } continue; }
+    if (c >= ' ') { linea[n++] = c; printf("%s", eco); }
+
+Funcionaba, y estaba en el sitio equivocado. Se ve en cuanto se intenta
+escribir un programa que pida una contrasenya: **no hay forma de apagar el
+eco**, porque el eco no existe en ningun sitio concreto. Lo hace cada
+programa por su cuenta, asi que apagarlo exigiria que todos supieran
+hacerlo, y bastaria uno que no lo supiera para que la contrasenya se
+viera en pantalla.
+
+Y hay un segundo sintoma, mas callado: el shell tenia edicion de linea y
+**ningun otro programa la tenia**. Escribir un backspace en un `wc` metia
+un byte 127 en el texto.
+
+### La disciplina de linea
+
+Lo que hay entre la tecla y el programa es algo mas que un cable, y en
+Unix se llama *line discipline*. Vive en el kernel -ni en el driver del
+hardware ni en el programa- porque es lo unico que esta a la vez entre
+todos los teclados posibles y todos los programas posibles.
+
+    static void disciplina(char c)
+
+Un solo sitio donde se decide que significa cada tecla:
+
+| tecla | que es |
+|-------|--------|
+| Enter | cierra la linea y la entrega |
+| Backspace / DEL | deshace el ultimo caracter, y lo despinta |
+| Ctrl-U | tira la linea entera |
+| Ctrl-D | **entrega ya lo que tengas** |
+
+De esa tabla sale sola una cosa que todo el mundo usa y casi nadie sabe
+explicar: **Ctrl-D no es un caracter, es "entrega ya".** Si no tienes nada
+que entregar, lo que se entrega es el final de la entrada. Por eso a mitad
+de linea no cierra nada y dos seguidos si.
+
+Y el borrado deja de ser un caracter que alguien tenga que entender: el
+programa recibe la linea **ya corregida** y no llega a enterarse de que
+hubo correcciones, igual que no se entera de que el usuario se lo penso
+dos veces.
+
+### El eco, y por que no puede ser del programa
+
+    #define T_ECO        1
+    #define T_CANONICO   2
+
+Dos banderas, porque son dos decisiones distintas. `T_ECO` es si se pinta
+lo que se teclea; `T_CANONICO` es si se entrega por lineas dejando
+corregir antes. Un `stty` de verdad lleva treinta banderas; estas dos son
+las que cambian lo que un programa **puede hacer**, y las demas cambian
+detalles.
+
+`clave` es el programa que lo demuestra, y lo interesante es lo que **no**
+tiene dentro: no hace eco, no entiende un backspace y no ha oido hablar de
+Ctrl-D. Y aun asi puedes corregir lo que escribes, y aun asi la
+contrasenya no se ve:
+
+    / $ clave
+      nombre: david vidal
+      clave (no se vera):
+      has dicho que eres "david vidal"
+      y la clave tiene 10 caracteres
+
+Diez caracteres que nunca aparecieron. Lo unico que hace el programa es:
+
+    int antes = termios(-1);
+    termios(antes & ~T_ECO);
+    fgets(...);
+    termios(antes);                  /* pase lo que pase */
+
+Esa ultima linea no es cortesia. El terminal es uno y lo comparten todos,
+asi que un programa que se va con el eco apagado deja el shell escribiendo
+a ciegas. Es la misma clase de obligacion que cerrar un descriptor.
+
+Y solo lo puede tocar quien esta en primer plano, con la misma regla que
+el Ctrl-C: si un proceso de segundo plano pudiera cambiarlo, podria
+apagarte el eco y marcharse.
+
+### El modo crudo, que es la otra mitad
+
+Apagar `T_CANONICO` es lo que necesita un editor de pantalla: cada tecla
+en cuanto se pulsa, sin esperar al Enter y sin que nadie corrija por ti.
+Se nota en que el backspace deja de borrar y pasa a ser un numero:
+
+      ahora en crudo: pulsa teclas, y 'q' para salir
+      ab[97] [98] ^?[127] q
+
+Ahi esta la frontera, y se ve de un vistazo: en canonico el 127 **hace**
+algo, en crudo el 127 **es** algo.
+
+## Una linea como mucho, y el cubo que dejo de robar
+
+El paso 49 dejo una decision incomoda: del terminal se lee **sin cubo**,
+de uno en uno. El motivo no era el rendimiento, era de quien son los
+caracteres — si el shell se guardara 512 bytes "por si acaso", se estaria
+quedando con lo que el usuario escribio para el programa que viene
+despues.
+
+Ese peligro desaparece con una linea de mas en la lectura:
+
+    if ((term_modo & T_CANONICO) && c == '\n') break;
+
+**Una linea como mucho, aunque quepan mas y aunque las pidan.** Con la
+linea como frontera, el cubo no puede robar nada, porque lo que se lleva
+es exactamente lo que se escribio para el. La regla de siempre no ha
+cambiado -de un fichero puedes leer de golpe porque el fichero es tuyo- y
+lo que ha pasado es que ahora **una linea del terminal tambien lo es**.
+
+Comprobado de la unica forma que vale, con dos lectores seguidos:
+
+    / $ wc
+    hola que tal
+    ^D
+      1 lineas, 13 bytes
+
+El shell leyo `wc` y ni toco `hola que tal`, aunque las dos llegaron
+juntas y aunque ahora lee con un cubo de 512 bytes.
+
+Y de propina, el numero:
+
+      nombre: david vidal
+      (esa linea son 12 caracteres y ha costado 1 viaje al kernel)
+
+Doce antes, uno ahora. La mejora de velocidad es un **efecto secundario**
+de una decision sobre de quien son los caracteres, y es la segunda vez que
+pasa lo mismo en este proyecto: la primera fue el cubo de escritura del
+paso 49.
+
+## Dos cosas que se me olvidaron al mover el eco de sitio
+
+Las dos aparecieron en la misma prueba y las dos son de lo mismo: cuando
+una responsabilidad cambia de casa, se lleva consigo obligaciones que
+antes se cumplian solas.
+
+**La primera fue un `-1`.** `uart_leer` devolvia -1 al interrumpirla una
+senyal, donde el codigo viejo convertia eso en `-EINTR`. Resultado: cada
+Ctrl-C en el prompt convencia al shell de que se habia acabado la entrada,
+y se despedia educadamente. Es **exactamente** el fallo del paso 51, dos
+pasos despues, en la funcion que lo sustituyo.
+
+**La segunda no tiene precedente y es mas interesante:**
+
+    / $ hol^C
+    / $ pwd
+      HOLPWD.ELF: no lo encuentro.
+
+La media orden sobrevivio al Ctrl-C y se pego a la siguiente. Antes esto
+no podia pasar: la linea a medias vivia en el shell, y el shell la perdia
+al volver a empezar **sin que nadie tuviera que hacer nada**. Ahora vive
+en el kernel, y ahi no se pierde sola.
+
+En Unix, una senyal del terminal tira tambien la entrada pendiente. Aqui
+faltaba, y el sintoma no apunta a la causa: el shell no tiene forma de
+saber que habia algo que tirar, porque eso ya no es suyo.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -4378,12 +4544,25 @@ tiempos lo tapaban.
   segundo plano que escribe ensucia la pantalla y nadie lo para. Unix hace
   lo mismo salvo que se lo pidas con `stty tostop`, y el motivo es que
   escribir desde el fondo es molesto pero no te quita nada; leer, si.
-- No hay `stty` ni modo canonico, asi que tampoco hay Ctrl-D: el terminal
-  no sabe convertir una tecla en fin de fichero. Un `wc` en primer plano
-  lee hasta que lo matas.
-- Las teclas de control estan escritas a mano en los dos drivers (3 para
-  Ctrl-C, 26 para Ctrl-Z) y no se pueden cambiar. En Unix eso es una tabla
-  del terminal, no una constante del driver.
+- Las teclas de control siguen escritas a mano: Ctrl-C y Ctrl-Z en los dos
+  drivers, y el resto en la disciplina de linea. En Unix son una tabla del
+  terminal que se puede cambiar con `stty`; aqui son constantes.
+- La edicion de linea es un backspace y un Ctrl-U. No hay historial, ni
+  mover el cursor, ni borrar una palabra. Todo eso vive en la misma
+  disciplina y son mas casos del mismo `switch`, no un mecanismo nuevo.
+- El terminal es UNO y global: un solo modo, una sola linea a medias, un
+  solo buffer. En Unix cada terminal tiene el suyo, y lo que aqui es una
+  variable estatica alli cuelga del descriptor. Con una UART y una
+  consola, la diferencia no se ve.
+- La linea son 128 caracteres y lo que pase de ahi se descarta en
+  silencio. Un terminal de verdad pita.
+- No hay `ICRNL` ni `ONLCR` configurables: el `\r` del terminal se
+  convierte siempre en `\n` al entrar, y el `\n` en `\r\n` al salir.
+  Estan bien para este cable y no se pueden apagar.
+- `T_ECO` y `T_CANONICO` se guardan y se reponen a mano. Si un programa
+  muere entre las dos llamadas -un Ctrl-C mientras pide la contrasenya-
+  el terminal se queda como lo dejo. Un Unix tampoco lo arregla solo:
+  por eso existe el `stty sane` que todos hemos tecleado a ciegas.
 - Un trabajo parado por `SIGTTIN` no dice por que esta parado: la lista
   ensenya "parado" igual que si lo hubieras parado tu con Ctrl-Z. `waitpid`
   contesta W_PARADO pero no cual fue la senyal.

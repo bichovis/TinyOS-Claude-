@@ -107,6 +107,29 @@ struct message {
 #define SYS_console_int  28   /* () -> Ctrl-C al grupo de primer plano      */
 #define SYS_console_stop 50   /* () -> Ctrl-Z al grupo de primer plano      */
 
+/* --- El modo del terminal ---------------------------------------------
+ *
+ * Con -1 solo se consulta; en los dos casos devuelve el modo que HABIA,
+ * que es lo que necesita quien quiere dejarlo como se lo encontro.
+ *
+ * Son dos banderas y no una porque son dos decisiones distintas:
+ *
+ *   T_ECO       ¿se pinta lo que se teclea? Apagarlo es lo que hace
+ *               falta para pedir una contrasenya, y solo tiene sentido
+ *               que se apague AQUI: si cada programa pintara lo que lee,
+ *               apagarlo exigiria que todos supieran hacerlo.
+ *
+ *   T_CANONICO  ¿se entrega por lineas, dejando corregir antes de
+ *               entregar? Apagarlo es lo que necesita un editor de
+ *               pantalla, que quiere cada tecla en cuanto se pulsa.
+ *
+ * Un "stty" de verdad lleva treinta banderas. Estas dos son las que
+ * cambian lo que un programa puede hacer; las demas cambian detalles. */
+#define SYS_termios      51   /* (modo | -1) -> el modo anterior            */
+
+#define T_ECO             1
+#define T_CANONICO        2
+
 /* Abrir un fichero de la tarjeta y quedarselo en un descriptor. Es lo que
  * hace falta para que el shell pueda redirigir con > y <. */
 #define SYS_open         29   /* (nombre, modo) -> fd | -1                  */

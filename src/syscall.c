@@ -668,6 +668,15 @@ void syscall_dispatch(struct trap_frame *f)
         ret = 0;
         break;
 
+    /* El modo del terminal es del TERMINAL, no de quien pregunta: hay uno
+     * y lo comparten todos. Por eso solo lo toca quien esta delante, con
+     * la misma regla que el Ctrl-C. Si lo pudiera cambiar un proceso de
+     * segundo plano, podria dejarte el eco apagado y marcharse. */
+    case SYS_termios:
+        if (!task_en_primer_plano()) { ret = -EPERM; break; }
+        ret = uart_modo((int)(int64_t)f->x[0]);
+        break;
+
     case SYS_mmio_base:
         /* El kernel concede el MMIO al crear el proceso; aqui solo le
          * decimos en que direccion virtual se lo dejo. Un sistema serio

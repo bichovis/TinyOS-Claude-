@@ -38,12 +38,174 @@
 #define INT_RT        (1 << 6)            /* RTIM/RTMIS: receive timeout    */
 
 /* Buffer circular entre la interrupcion (productor) y el kernel (consumidor).
- * 'volatile' porque el handler lo modifica a espaldas del hilo principal. */
-#define RXBUF_SIZE    64
+ * 'volatile' porque el handler lo modifica a espaldas del hilo principal.
+ *
+ * OJO A LO QUE HAY AQUI DENTRO: desde este paso, lo que entra en rxbuf no
+ * es lo que se ha tecleado, es lo que YA SE PUEDE LEER. Entre una cosa y
+ * la otra esta la disciplina de linea, mas abajo. */
+#define RXBUF_SIZE   256
 static volatile char     rxbuf[RXBUF_SIZE];
 static volatile uint32_t rx_head;         /* donde escribe la IRQ           */
 static volatile uint32_t rx_tail;         /* donde lee el kernel            */
 static struct waitqueue  rx_waiters;      /* hilos esperando un byte        */
+
+/* --- La disciplina de linea -------------------------------------------
+ *
+ * Entre la tecla y el programa hay algo mas que un cable, y ese algo es lo
+ * que convierte un terminal en un terminal:
+ *
+ *   - Lo que escribes NO llega al programa hasta que pulsas Enter. Hasta
+ *     entonces se puede corregir, y el programa no ve las correcciones:
+ *     recibe la linea ya limpia. Por eso un backspace no es un caracter
+ *     que haya que entender, es una tecla que deshace.
+ *
+ *   - El ECO lo hace esto, no el programa. Es la parte que parece un
+ *     detalle y no lo es: si cada programa pintara lo que lee, apagar el
+ *     eco para pedir una contrasenya exigiria que TODOS se acordaran de
+ *     saber hacerlo. Estando aqui, se apaga en un sitio y vale para
+ *     cualquiera, incluso para uno escrito antes de que existieran las
+ *     contrasenyas.
+ *
+ *   - Y Ctrl-D no es una tecla que valga un caracter: es "entrega ya lo
+ *     que tengas". Si no tienes nada, lo que se entrega es el final de la
+ *     entrada. De ahi que Ctrl-D a mitad de linea no cierre nada y dos
+ *     seguidos si.
+ *
+ * En Unix esto se llama "line discipline" y vive en el kernel, no en el
+ * driver del hardware ni en el programa. Aqui, igual, y por el mismo
+ * motivo: es lo unico que esta a la vez entre todos los teclados posibles
+ * y todos los programas posibles. */
+#define LINEA_MAX    128
+
+static void putc_raw(char c);        /* mas abajo: escribir sin cerrojo */
+
+static char     linea[LINEA_MAX];    /* lo que se esta escribiendo TODAVIA */
+static uint32_t linea_n;
+static int      term_modo = T_ECO | T_CANONICO;
+static int      eof_pendiente;       /* un Ctrl-D sobre una linea vacia */
+
+/* Meter un byte en la cola de lo legible. Devuelve 0 si no cabia. */
+static int rx_meter(char c)
+{
+    uint32_t next = (rx_head + 1) % RXBUF_SIZE;
+    if (next == rx_tail) return 0;
+    rxbuf[rx_head] = c;
+    rx_head = next;
+    return 1;
+}
+
+/* El eco. Va por el mismo camino que cualquier escritura del kernel, con
+ * el cerrojo de la UART cogido: el que llama puede estar dentro de una
+ * interrupcion, y uart_acquire desactiva las IRQ de este nucleo, asi que
+ * no puede pelearse consigo mismo. */
+static void eco(const char *s, uint64_t n)
+{
+    if (!(term_modo & T_ECO)) return;
+
+    uint64_t f = uart_begin();
+    for (uint64_t i = 0; i < n; i++) {
+        if (s[i] == '\n') putc_raw('\r');
+        putc_raw(s[i]);
+    }
+    uart_end(f);
+}
+
+/* Volcar la linea a lo legible. Se hace entera o no se hace: media linea
+ * en la cola seria una linea que el programa leeria como completa. */
+static void entregar_linea(void)
+{
+    for (uint32_t i = 0; i < linea_n; i++)
+        if (!rx_meter(linea[i])) break;
+    linea_n = 0;
+}
+
+/* Un caracter que acaba de llegar, venga del hardware o de un driver de
+ * EL0. Este es el unico sitio donde se decide que significa cada tecla. */
+static void disciplina(char c)
+{
+    /* Modo crudo: cada tecla es un byte y nadie interpreta nada. Lo que
+     * necesita un editor de pantalla, y lo que NO necesita un shell. */
+    if (!(term_modo & T_CANONICO)) {
+        rx_meter(c);
+        eco(&c, 1);
+        return;
+    }
+
+    switch (c) {
+    case '\r':
+    case '\n':
+        /* El salto SI va dentro de la linea: es lo que le dice a quien lee
+         * donde acaba, y es lo que hace que fgets funcione. */
+        if (linea_n < LINEA_MAX) linea[linea_n++] = '\n';
+        eco("\n", 1);
+        entregar_linea();
+        return;
+
+    case 8:
+    case 127:
+        /* Borrar es tres cosas en la pantalla -ir atras, tapar, ir atras-
+         * y una sola en el buffer. El programa no se entera de ninguna. */
+        if (linea_n) { linea_n--; eco("\b \b", 3); }
+        return;
+
+    case 21:                            /* Ctrl-U: tirar la linea entera */
+        while (linea_n) { linea_n--; eco("\b \b", 3); }
+        return;
+
+    case 4:                             /* Ctrl-D */
+        if (linea_n) entregar_linea();  /* entrega lo que haya, sin salto */
+        else         eof_pendiente = 1; /* nada que entregar: se acabo */
+        return;
+
+    default:
+        /* Los demas caracteres de control se tiran en vez de guardarse:
+         * meterlos en la linea hace que el programa reciba basura que no
+         * pidio y que el eco descoloque la pantalla. */
+        if ((unsigned char)c < ' ' && c != '\t') return;
+        if (linea_n >= LINEA_MAX - 1) return;     /* sitio para el salto */
+
+        linea[linea_n++] = c;
+        eco(&c, 1);
+        return;
+    }
+}
+
+/* Tirar lo que hubiera a medias: la linea sin terminar Y lo ya entregado.
+ *
+ * Lo llaman Ctrl-C y Ctrl-Z, porque una senyal del terminal cancela
+ * tambien lo que estabas escribiendo. Sin esto, la media orden se queda
+ * esperando y se pega a la siguiente: tras un "hol" interrumpido, teclear
+ * "pwd" ejecutaba "holpwd". El sintoma no apunta a la causa, porque la
+ * linea a medias ya no vive en el shell -vive aqui- y el shell no tiene
+ * forma de saber que habia algo que tirar.
+ *
+ * Que el eco haya cambiado de sitio se lleva consigo esta
+ * responsabilidad, y olvidarla es facil precisamente porque antes no
+ * existia: cuando la linea era del shell, el shell la perdia al volver a
+ * empezar sin que nadie tuviera que hacer nada. */
+void uart_descartar_entrada(void)
+{
+    uint64_t f = sched_lock_irqsave();
+    linea_n       = 0;
+    rx_tail       = rx_head;
+    eof_pendiente = 0;
+    sched_unlock_irqrestore(f);
+}
+
+/* Cambiar el modo del terminal, y devolver el que habia. Con -1 solo se
+ * consulta, que es lo que necesita quien quiere restaurarlo despues. */
+int uart_modo(int nuevo)
+{
+    int antes = term_modo;
+
+    if (nuevo >= 0) {
+        /* Al salir del modo crudo, lo que estuviera a medias se tira: son
+         * teclas que se escribieron bajo otras reglas. */
+        if ((nuevo & T_CANONICO) && !(antes & T_CANONICO)) linea_n = 0;
+        term_modo = nuevo;
+    }
+    return antes;
+}
 
 void uart_init(void)
 {
@@ -224,11 +386,7 @@ void uart_irq(void)
         if (c == 3)  { interrumpir = 1; continue; }
         if (c == 26) { parar = 1; continue; }
 
-        uint32_t next = (rx_head + 1) % RXBUF_SIZE;
-        if (next != rx_tail) {            /* si esta lleno, tiramos el byte */
-            rxbuf[rx_head] = c;
-            rx_head = next;
-        }
+        disciplina(c);
     }
     mmio_write(UART0_ICR, INT_RX | INT_RT);   /* reconocer la interrupcion */
 
@@ -257,13 +415,17 @@ uint64_t uart_perdidos;               /* teclas tiradas por falta de sitio */
 void uart_push(const char *buf, uint64_t n)
 {
     uint64_t tirados = 0;
+    uint32_t antes = linea_n;
 
     for (uint64_t i = 0; i < n; i++) {
-        uint32_t next = (rx_head + 1) % RXBUF_SIZE;
-        if (next == rx_tail) { tirados = n - i; break; }
-        rxbuf[rx_head] = buf[i];
-        rx_head = next;
+        /* Sin sitio en la linea Y sin sitio en la cola: eso si es perder
+         * teclas. Que la linea crezca no es perderlas, es esperarlas. */
+        uint32_t libre = (rx_tail + RXBUF_SIZE - rx_head - 1) % RXBUF_SIZE;
+        if (!libre && linea_n >= LINEA_MAX - 1) { tirados = n - i; break; }
+
+        disciplina(buf[i]);
     }
+    (void)antes;
 
     uint64_t f = sched_lock_irqsave();
     wq_wake_all(&rx_waiters);
@@ -293,20 +455,64 @@ void uart_push(const char *buf, uint64_t n)
 /* Version bloqueante: en vez de preguntar cada 10 ms si ha llegado algo,
  * el hilo se duerme y la interrupcion de la UART lo despierta. Mientras
  * tanto no consume ni un ciclo. */
-int uart_getc_blocking(void)
+/* Sacar hasta 'n' bytes de lo que ya es legible, esperando si no hay nada.
+ *
+ * Antes esto entregaba UN byte por llamada, y cada byte era una excepcion,
+ * un cambio de privilegio y una vuelta entera por la tabla de vectores.
+ * Una orden de treinta letras costaba treinta viajes. Ahora, como la
+ * disciplina no suelta nada hasta el Enter, un read trae la linea entera y
+ * el viaje es uno. No se ha optimizado nada: sale de haber puesto la
+ * decision de "cuando hay algo que leer" en el sitio correcto.
+ *
+ * Devuelve 0 si se acabo la entrada -un Ctrl-D sobre una linea vacia- y
+ * -EINTR si lo interrumpio una senyal. El errno y no un -1 a secas: quien
+ * lee tiene que poder distinguir "te han interrumpido" de "se acabo", y
+ * son dos cosas que llevan a sitios opuestos -volver a intentarlo, o
+ * marcharse-. Escribir aqui un -1 costo que el shell se despidiera
+ * educadamente con cada Ctrl-C. Otra vez. */
+int64_t uart_leer(char *dst, uint64_t n)
 {
     uint64_t f = sched_lock_irqsave();
-    char c;
 
-    while (!uart_read(&c)) {
+    while (rx_tail == rx_head) {
+        /* El final de la entrada solo cuenta con la cola vacia: un Ctrl-D
+         * detras de texto entrega el texto, y el final llega despues. */
+        if (eof_pendiente) {
+            eof_pendiente = 0;
+            sched_unlock_irqrestore(f);
+            return 0;
+        }
+
         if (wq_wait(&rx_waiters) < 0) {   /* una senyal, no una tecla */
             sched_unlock_irqrestore(f);
-            return -1;
+            return -EINTR;
         }
     }
 
+    /* Una linea COMO MUCHO, aunque quepan mas y aunque las pidan.
+     *
+     * Esto parece tacanyeria y es lo que hace seguro leer del terminal con
+     * un cubo. Si un read pudiera llevarse dos lineas, el shell se
+     * quedaria dentro con la segunda -que el usuario escribio para el
+     * programa que viene despues- y ese programa esperaria algo que ya no
+     * va a llegar. Era el motivo por el que stdio leia el terminal de uno
+     * en uno desde el paso 49.
+     *
+     * Con la linea como frontera, el cubo deja de poder robar: lo que se
+     * lleva es exactamente lo que se escribio para ti. Y de paso una orden
+     * de treinta letras pasa de treinta viajes al kernel a uno. La mejora
+     * de velocidad es un efecto secundario de una decision sobre de quien
+     * son los caracteres. */
+    uint64_t i = 0;
+    while (i < n && rx_tail != rx_head) {
+        char c = rxbuf[rx_tail];
+        rx_tail = (rx_tail + 1) % RXBUF_SIZE;
+        dst[i++] = c;
+        if ((term_modo & T_CANONICO) && c == '\n') break;
+    }
+
     sched_unlock_irqrestore(f);
-    return c;
+    return (int64_t)i;
 }
 
 int uart_read(char *out)

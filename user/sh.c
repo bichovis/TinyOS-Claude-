@@ -26,63 +26,43 @@ static char           nombre[FS_PATH_MAX];
 
 
 
-/* --- Leer una linea, con eco y borrado ------------------------------- */
-/* El eco lo hace el shell, no el kernel: quien lee es quien decide como
- * se ve lo que se escribe. */
-/* Devuelve los caracteres leidos, LINEA_FIN si se ha acabado la entrada, o
- * LINEA_CORTE si una senyal corto la lectura.
+/* --- Leer una linea ---------------------------------------------------
  *
- * Los dos ultimos eran el mismo -1 hasta este paso, y costo un fallo: con
- * el Ctrl-C yendo ya al grupo de primer plano, el shell es quien lo
- * recibe mientras estas escribiendo. El manejador hacia su trabajo -no
- * morirse- pero la lectura volvia con -1, el shell leia "se acabo la
- * entrada" y se despedia educadamente. La senyal no lo mataba: lo
- * convencia de irse.
+ * Aqui habia cuarenta lineas: un bucle de getchar(), el eco de cada tecla,
+ * y el borrado con "\b \b" cuando llegaba un 8 o un 127. Ya no hacen
+ * falta, y no porque se hayan movido de sitio: es que nunca fueron del
+ * shell.
  *
- * Que dos cosas distintas devuelvan el mismo numero no da guerra hasta
- * que una de las dos empieza a pasar de verdad. */
+ * Un fgets. La linea llega entera y ya corregida, porque la disciplina de
+ * linea del kernel no suelta nada hasta el Enter y los backspace se
+ * comieron su caracter por el camino. El shell no llega a ver que hubo
+ * correcciones, igual que no ve que el usuario se lo penso dos veces.
+ *
+ * Lo que se gana no es codigo: es que ahora CUALQUIER programa que lea del
+ * terminal tiene edicion de linea sin pedirla, y que apagar el eco -para
+ * una contrasenya- se hace en un sitio y vale para todos. Mientras el eco
+ * lo hiciera el shell, solo el shell sabia apagarlo.
+ *
+ * Devuelve los caracteres leidos, LINEA_FIN si se acabo la entrada -un
+ * Ctrl-D sobre una linea vacia, que hasta este paso no habia forma de
+ * teclear- o LINEA_CORTE si una senyal corto la lectura. */
 #define LINEA_FIN    (-1)
 #define LINEA_CORTE  (-2)
 
 static int64_t leer_linea(void)
 {
-    uint64_t n = 0;
+    errno = 0;
 
-    for (;;) {
-        errno = 0;
-        int k = getchar();
-        if (k < 0) {
-            if (errno == EINTR) {
-                /* El cubo se quedo marcado con el error de la lectura que
-                 * no llego a serlo. Sin limpiarlo, el siguiente getchar
-                 * devuelve EOF sin ni siquiera mirar el teclado. */
-                clearerr(stdin);
-                return LINEA_CORTE;
-            }
-            return LINEA_FIN;                    /* se acabo la entrada */
-        }
-        char c = (char)k;
-
-        if (c == '\r' || c == '\n') {
-            printf("\n");
-            linea[n] = 0;
-            return (int64_t)n;
-        }
-
-        if (c == 8 || c == 127) {            /* retroceso */
-            if (n) {
-                n--;
-                printf("\b \b");             /* borrar en pantalla */
-            }
-            continue;
-        }
-
-        if (c >= ' ' && n < MAX_LINEA - 1) {
-            linea[n++] = c;
-            char eco[2] = { c, 0 };
-            printf("%s", eco);
-        }
+    if (!fgets(linea, MAX_LINEA, stdin)) {
+        if (errno == EINTR) { clearerr(stdin); return LINEA_CORTE; }
+        return LINEA_FIN;
     }
+
+    /* fgets se trae el salto; la orden no lo lleva. */
+    uint64_t n = strlen(linea);
+    if (n && linea[n - 1] == '\n') linea[--n] = 0;
+
+    return (int64_t)n;
 }
 
 /* --- El nombre del fichero -------------------------------------------

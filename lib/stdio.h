@@ -70,6 +70,7 @@ int   isatty(int fd);             /* hay alguien mirando? */
 /* Llamadas a write() que han salido de aqui, desde que arranco el
  * programa. Comparala con los caracteres que has escrito. */
 extern unsigned long stdio_escrituras;
+extern unsigned long stdio_lecturas;
 int   feof(FILE *f);
 int   ferror(FILE *f);
 void  clearerr(FILE *f);
