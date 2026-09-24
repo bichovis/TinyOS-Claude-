@@ -204,6 +204,24 @@ static int dma_bus = 0;
 
 static volatile uint32_t *reg;
 
+/* --- La barrera, o el orden en que las cosas llegan a la memoria ---------
+ *
+ * El paquete de SETUP lo escribe la CPU en el tramo de DMA, que es memoria
+ * Normal sin cachear. El arranque del canal es una escritura en un registro,
+ * que es memoria Device. Y ARMv8 no promete que un almacenamiento Normal se
+ * haga visible antes que uno Device posterior: la CPU puede tener el paquete
+ * todavia en su buffer de escritura cuando el DWC2 ya ha recibido la orden de
+ * arrancar y va a leerlo por DMA.
+ *
+ * Lo que leia entonces era el SETUP de la transferencia ANTERIOR, con su
+ * wLength de 8, y el hub -obediente- mandaba 8 bytes cuando se le pedian 18.
+ * Los otros diez se quedaban con el patron: a5a5:a5a5, 165 configuraciones.
+ *
+ * En QEMU no se ve nunca, porque su memoria es secuencialmente consistente.
+ * El kernel lo tiene bien en mbox.c, con su dsb antes de escribir al buzon.
+ * DSB se puede ejecutar desde EL0, asi que aqui tambien. */
+static inline void barrera(void) { __asm__ volatile("dsb sy" ::: "memory"); }
+
 static uint32_t leer(uint64_t off) { return reg[off / 4]; }
 static void escribir(uint64_t off, uint32_t v) { reg[off / 4] = v; }
 
@@ -360,6 +378,15 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
 {
     int paquetes = bytes ? (bytes + mps - 1) / mps : 1;
 
+    /* Para una lectura, el tamanyo se programa como un numero ENTERO de
+     * paquetes maximos, no como los bytes que se quieren. Es lo que hace Linux
+     * en dwc2_hc_start_transfer -"always program an integral # of max packets
+     * for IN transfers"- porque el nucleo escribe en memoria paquetes enteros y
+     * decide que la transferencia acabo cuando recibe uno corto. Se piden 18
+     * bytes de un dispositivo con paquetes de 64: se programa 64, el dispositivo
+     * manda 18, y ese paquete corto es el final. */
+    if (entrada) bytes = paquetes * mps;
+
     /* Los avisos viejos del canal, fuera. Un canal se reutiliza, y arrancar
      * con el ACK de la transferencia anterior puesto es creerse que esta ya
      * termino. */
@@ -398,6 +425,11 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
     uint32_t c = leer(HCCHAR(canal));
     if (!(leer(HFNUM) & 1)) c |= HCC_ODDFRM;
 
+    /* Que todo lo escrito -el paquete de SETUP, el patron, los registros del
+     * canal- este de verdad en su sitio ANTES de que el nucleo reciba la orden
+     * de arrancar. Sin esto, el DMA lee lo de la vez anterior. */
+    barrera();
+
     /* Y ahora arranca. */
     escribir(HCCHAR(canal), c | HCC_ENABLE);
 
@@ -419,7 +451,12 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
      * lo que la mascara del canal lleva ese bit y nada mas. */
     for (int v = 0; v < 2000000; v++) {
         uint32_t i = leer(HCINT(canal));
-        if (i & HCI_CHHLTD) return i;
+        if (i & HCI_CHHLTD) {
+            /* Y la simetrica: que lo que el DMA dejo en memoria se lea DESPUES
+             * de haber visto el bit de detenido, no especulado antes. */
+            barrera();
+            return i;
+        }
     }
 
     /* Nada en un par de millones de vueltas. Antes de rendirse, contar lo que
@@ -966,6 +1003,10 @@ int main(int argc, char **argv)
 
     unsigned vendedor  = (unsigned)(d[8]  | (d[9]  << 8));
     unsigned producto  = (unsigned)(d[10] | (d[11] << 8));
+
+    printf("  [usb] descriptor:");
+    for (int i = 0; i < 18; i++) printf(" %02x", (unsigned)d[i]);
+    printf("\n");
 
     printf("  [usb] es %04x:%04x, clase %u, %u configuracion%s\n",
            vendedor, producto, (unsigned)d[4], (unsigned)d[17],

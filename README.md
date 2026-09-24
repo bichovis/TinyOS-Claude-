@@ -6190,6 +6190,53 @@ error", que el booleano de antes fundia en un cero.
 
 Tres cosas, las tres leidas en el codigo de alguien que lo tiene funcionando.
 
+### Alta velocidad, la primera transferencia real, y una barrera que faltaba
+
+```
+  [usb] tras el reset: HPRT0 = 0x0000100f, alta (480 Mbit/s), puerto habilitado
+  [usb] micro-trama 236: el bus esta vivo
+  [usb] contesta: descriptor de 18 bytes, USB 2.00, paquete maximo 64
+```
+
+**Alta velocidad.** Nueve arranques persiguiendo la velocidad completa, y la
+causa era la que descarte con un argumento malo en el paso 61: el dominio de
+alimentacion. Con la GPU contestando de verdad al encendido -era el timeout del
+buzon- el PHY quedo entero y el *chirp* salio. La micro-trama avanza a 125 us.
+
+Y la primera transferencia de control con datos reales: 18 bytes, USB 2.00,
+paquete maximo 64. Esos tres valores son exactamente los de un hub LAN9514.
+SETUP, datos y estado, por el cable.
+
+**Pero la segunda transferencia devolvio el patron.** `a5a5:a5a5`, 165
+configuraciones -165 es 0xA5-, con datos reales solo en los 8 primeros bytes.
+Llegaron exactamente 8 cuando se pidieron 18, y solo hay una forma de que un hub
+con paquetes de 64 mande 8: que el `wLength` del SETUP que recibio dijera 8. **El
+SETUP de la transferencia anterior.**
+
+El paquete de SETUP lo escribe la CPU en el tramo de DMA, que es memoria Normal
+sin cachear. El arranque del canal es una escritura en un registro, que es
+memoria Device. Y ARMv8 no promete que un almacenamiento Normal se haga visible
+antes que uno Device posterior: la CPU puede tener el paquete nuevo todavia en su
+buffer de escritura cuando el DWC2 ya ha recibido la orden de arrancar y lee por
+DMA... lo de antes.
+
+Es el fallo mas clasico de programar DMA, y el kernel de este proyecto lo tiene
+resuelto desde hace treinta pasos en `mbox.c`, con su `dsb sy` antes de escribir
+al buzon. Mi driver no tenia ni una barrera. En QEMU no se ve nunca, porque su
+memoria es secuencialmente consistente: es la enesima cosa de este paso que el
+emulador da por buena y el cobre no.
+
+`DSB` se puede ejecutar desde EL0, asi que la barrera va donde tiene que ir: antes
+de arrancar el canal, para que todo lo escrito este en su sitio, y despues de ver
+el bit de detenido, para que lo que el DMA dejo se lea despues y no especulado
+antes.
+
+Y de paso, leyendo `dwc2_hc_start_transfer`: para una lectura, el tamanyo se
+programa como un numero **entero** de paquetes maximos, no como los bytes que se
+quieren. El nucleo escribe paquetes enteros y decide que la transferencia acabo
+cuando recibe uno corto. Se piden 18 de un dispositivo de 64: se programa 64, el
+dispositivo manda 18, y ese paquete corto es el final.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es
