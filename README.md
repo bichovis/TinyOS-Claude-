@@ -6338,6 +6338,43 @@ fallos vivos a la vez -MC a cero, el reloj del PHY, el dominio de alimentacion-
 y no media la direccion, media el ruido. **Un experimento con tres variables
 sueltas no mide ninguna.** Segunda vez que lo escribo en este paso.
 
+### Y contesto quien tenia que contestar
+
+```
+  [usb]   lectura de 18 (programados 64): HCINT 0x023, HCTSIZ 0x8000002e
+          -> recibidos 18, HCDMA avanzo 20
+  [usb] descriptor: 12 01 00 02 09 00 02 40 24 04 14 95 00 02 00 00 00 01
+  [usb] es 0424:9514, clase 9, 1 configuracion
+  [usb] 0x0424 es SMSC: esto es el hub con la Ethernet dentro
+```
+
+`0424:9514`. El LAN9514, con su descriptor entero: USB 2.00, clase hub, protocolo
+2 -alta velocidad con varios TT-, paquete maximo 64, `bcdDevice` 2.00, una
+configuracion. Y el testigo cuadra: 18 recibidos, y `HCDMA` avanzo 20 porque el
+DMA escribe palabras enteras y 18 bytes son cinco.
+
+Doce sub-arranques. Lo que hacia falta para que un chip contestara "quien soy",
+en orden de aparicion y con quien tuvo la culpa:
+
+| lo que faltaba | de donde salio |
+|---|---|
+| antirrebote de la conexion | leer la norma |
+| `MC = 1`: cero transacciones no es "por defecto" | leer el registro que yo mismo imprimia |
+| encender el dominio por el buzon | el candidato que descarte con un argumento malo |
+| el timeout del buzon | leer mi propio `mbox_call` |
+| esperar a `CHHLTD` y no a cualquier bit | CherryUSB y Linux |
+| el reloj del PHY a 30/60, no al del enlace | Linux, deshaciendo un arreglo mio |
+| la rafaga `0x10` de la bcm2835 | Linux, `dwc2_set_bcm_params` |
+| la barrera antes de arrancar el canal | `mbox.c` de este mismo proyecto |
+| el alias `0xC0000000` por la L2 de la VideoCore | el testigo, deshaciendo otro arreglo mio |
+
+Cuatro de nueve son correcciones a conclusiones mias anteriores. Y las que
+desatascaron de verdad vinieron de leer codigo que funciona y de medir, no de
+proponer. Eso es lo que me llevo del paso, mas que el USB.
+
+Los instrumentos -la lectura decodificada, el SETUP releido de memoria- se
+quedan puestos: el paso siguiente los va a necesitar.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es
@@ -6525,12 +6562,10 @@ del propio hub.
   separada del planificador, y el driver de la Fundacion usa una FIQ para eso.
 - El driver de USB no pide ninguna interrupcion todavia: `GINTMSK` esta a cero
   y se pregunta mirando los registros. La IRQ 9 esta reclamada y sin usar.
-- El puerto raiz de la Pi enumera a velocidad COMPLETA y deberia ser alta: el
-  LAN9514 es un hub de alta velocidad, asi que el *chirp* del reset no esta
-  saliendo. No bloquea nada -control y bulk funcionan igual, y con todo el bus
-  a velocidad completa tampoco hacen falta transferencias partidas- pero la red
-  ira a 12 Mbit/s en vez de 480. Los sospechosos son la anchura del UTMI+ y el
-  tiempo de turnaround.
+- La direccion que se le da al DWC2 lleva el alias `0xC0000000` y ese alias
+  es de este SoC: en otra placa con el mismo controlador seria otro, o ninguno.
+  Deberia salir del arbol de dispositivos (`dma-ranges`), igual que la lista de
+  IRQ; aqui esta escrito a mano en el driver.
 - Solo se usa el canal 0, y de uno en uno. Hay ocho, y usarlos a la vez es lo
   que hara falta el dia que haya varias transferencias en vuelo.
 - Un solo dispositivo, en la direccion 0, y sin `SET_ADDRESS`: se le habla a la
