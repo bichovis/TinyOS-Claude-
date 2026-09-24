@@ -6277,6 +6277,32 @@ De paso, esa misma funcion dice dos cosas mas de este ejemplar: el campo de
 tamanyo de transferencia son 16 bits y no 19, y el de numero de paquetes 9 y no
 10. No importan hoy y importaran cuando haya que mover mas de 64 KB de una vez.
 
+### Dos hipotesis que no movieron nada, y un testigo
+
+La rafaga de la bcm2835 tampoco cambio el resultado. Dos hipotesis mias
+seguidas -la barrera, la rafaga- sin efecto, y las dos eran plausibles y las dos
+son cosas que habia que hacer igualmente. Pero ninguna era la causa, y a la
+tercera no se propone: se mide.
+
+Hay dos preguntas distintas escondidas en "llegaron 8 bytes de 18", y son
+problemas opuestos:
+
+- ¿El hub mando 8? Entonces el SETUP que recibio decia `wLength = 8`, y el fallo
+  esta en como llega el SETUP al chip.
+- ¿El hub mando 18 y en memoria hay 8? Entonces el fallo esta en como el chip
+  escribe la memoria.
+
+El chip lo sabe y lo cuenta en dos registros: `HCTSIZ` baja en lo recibido, y
+`HCDMA` sube en lo escrito. Ahora se leen los dos al detenerse el canal y se
+imprimen junto a lo que se pidio. Y se vuelve a leer el paquete de SETUP tal
+como esta en memoria, por si la CPU y el chip no estan viendo el mismo.
+
+Y un experimento que discrimina la hipotesis del SETUP viejo sin gastar un
+arranque en ella: la segunda peticion usa **otro buffer de SETUP**, uno que
+nunca ha contenido un `wLength` de 8. Si con eso llegan los 18, era eso. Si
+siguen llegando 8 desde un buffer virgen, no lo era, y el testigo dira donde
+mirar.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es

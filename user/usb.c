@@ -202,6 +202,9 @@
  * correcto. Prueba que alguien conto. */
 static int dma_bus = 0;
 
+/* Lo que quedo en el canal al detenerse la ultima transferencia. */
+static uint32_t ultimo_hctsiz, ultimo_hcdma;
+
 static volatile uint32_t *reg;
 
 /* --- La barrera, o el orden en que las cosas llegan a la memoria ---------
@@ -455,6 +458,13 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
             /* Y la simetrica: que lo que el DMA dejo en memoria se lea DESPUES
              * de haber visto el bit de detenido, no especulado antes. */
             barrera();
+
+            /* Lo que el chip dice que hizo, para poder compararlo con lo que
+             * hay en memoria. HCTSIZ baja en lo recibido y HCDMA sube en lo
+             * escrito; si los dos dicen 18 y en memoria hay 8, el problema es
+             * de memoria, y si dicen 8, el problema es del hub. */
+            ultimo_hctsiz = leer(HCTSIZ(canal));
+            ultimo_hcdma  = leer(HCDMA(canal));
             return i;
         }
     }
@@ -521,14 +531,22 @@ static void quejarse_canal(const char *que, uint32_t i)
 static uint64_t dma_va, dma_pa;
 
 #define OFF_SETUP   0
+#define OFF_SETUP_B 16       /* el segundo, que nunca ha tenido un wLength de 8 */
 #define OFF_DATOS  64
+
+/* Alternar el buffer del SETUP entre peticiones es un experimento, no un
+ * disenyo: si la hipotesis es que el DMA lee el paquete de la vez anterior,
+ * darle un sitio que nunca tuvo paquete anterior la confirma o la mata sin
+ * gastar un arranque en una suposicion. */
+static int setup_turno;
 
 #define PATRON  0xA5      /* con que se rellena para saber si el DMA llego */
 
 static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
                         uint16_t valor, uint16_t indice, int bytes)
 {
-    volatile uint8_t *setup = (volatile uint8_t *)(dma_va + OFF_SETUP);
+    uint64_t off_setup = (setup_turno++ & 1) ? OFF_SETUP_B : OFF_SETUP;
+    volatile uint8_t *setup = (volatile uint8_t *)(dma_va + off_setup);
     volatile uint8_t *datos = (volatile uint8_t *)(dma_va + OFF_DATOS);
 
     /* Los ocho bytes de siempre, en el orden de siempre y en little-endian,
@@ -549,12 +567,29 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
     uint32_t r;
 
     r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_SETUP,
-                    dma_pa + OFF_SETUP, 8);
+                    dma_pa + off_setup, 8);
     if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el SETUP no paso", r); return -1; }
 
     r = canal_hacer(0, 1, EP_CONTROL, mps, addr, 0, PID_DATA1,
                     dma_pa + OFF_DATOS, bytes);
     if (!(r & HCI_XFERCOMPL)) { quejarse_canal("los datos no llegaron", r); return -1; }
+
+    /* El testigo: lo que el chip dice que recibio, contra lo que se pidio. En
+     * este ejemplar el campo de tamanyo son 16 bits (max_transfer_size 65535
+     * en Linux), asi que se enmascara a eso. */
+    {
+        int paquetes  = (bytes + mps - 1) / mps;
+        int programado = paquetes * mps;
+        int restante  = (int)(ultimo_hctsiz & 0xFFFF);
+        printf("  [usb]   lectura de %d (programados %d, SETUP en +%lu): "
+               "HCINT 0x%03x, HCTSIZ 0x%08x -> recibidos %d, HCDMA avanzo %ld\n",
+               bytes, programado, (unsigned long)off_setup, (unsigned int)r,
+               (unsigned int)ultimo_hctsiz, programado - restante,
+               (long)(ultimo_hcdma - (uint32_t)(dma_pa + OFF_DATOS)));
+        printf("  [usb]   SETUP tal como esta en memoria:");
+        for (int i = 0; i < 8; i++) printf(" %02x", (unsigned)setup[i]);
+        printf("\n");
+    }
 
     r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_DATA1,
                     dma_pa + OFF_DATOS, 0);
