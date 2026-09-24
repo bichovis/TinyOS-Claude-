@@ -6237,6 +6237,46 @@ quieren. El nucleo escribe paquetes enteros y decide que la transferencia acabo
 cuando recibe uno corto. Se piden 18 de un dispositivo de 64: se programa 64, el
 dispositivo manda 18, y ese paquete corto es el final.
 
+### Ocho bytes son dos palabras
+
+La barrera hacia falta, pero no era la causa: el mismo resultado, y esta vez con
+el volcado delante.
+
+```
+  [usb] descriptor: 12 01 00 02 09 00 02 40 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5
+```
+
+Los ocho primeros bytes son reales -y `bDeviceProtocol = 2`, "hub de alta
+velocidad con varios TT", es un LAN9514 hablando-. Los otros diez, patron.
+
+Y la regularidad es la pista: **todo lo que mide 8 bytes o menos funciona**. El
+SETUP son 8 y llega. La primera lectura son 8 y llega. La de 18 devuelve
+exactamente 8. Ocho bytes son **dos palabras de bus**. Eso no parece un problema
+de USB: parece una rafaga de DMA que se queda en dos beats.
+
+Yo habia puesto las rafagas a INCR16 -`HBSTLEN = 7`-, que es una eleccion
+razonable leyendo el databook del DWC2. Linux, para la bcm2835 **y solo para
+ella**, escribe otra cosa:
+
+```c
+static void dwc2_set_bcm_params(struct dwc2_hsotg *hsotg)
+{
+	p->host_rx_fifo_size = 774;
+	p->max_transfer_size = 65535;
+	p->max_packet_count = 511;
+	p->ahbcfg = 0x10;
+}
+```
+
+`0x10` en crudo, sin las macros del campo. Un bit que en la codificacion
+generica no tiene nombre, y que en este SoC es lo que hace que las rafagas
+salgan enteras. No se por que; se que es lo que tiene la gente que lo tiene
+funcionando, y a estas alturas eso vale mas que mi razonamiento.
+
+De paso, esa misma funcion dice dos cosas mas de este ejemplar: el campo de
+tamanyo de transferencia son 16 bits y no 19, y el de numero de paquetes 9 y no
+10. No importan hoy y importaran cuando haya que mover mas de 64 KB de una vez.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es

@@ -606,10 +606,24 @@ static void modo_anfitrion(void)
     /* 2. El reparto de las FIFO y su vaciado, antes del DMA. */
     fifos_repartir();
 
-    /* 3. Las rafagas y el DMA, sin pisar el resto del registro. */
+    /* 3. Las rafagas y el DMA, sin pisar el resto del registro.
+     *
+     * Y el valor de las rafagas NO es el que uno elegiria leyendo el databook.
+     * Yo puse INCR16 -HBSTLEN = 7-, que es una eleccion razonable y en esta
+     * placa se traduce en que cada rafaga de DMA se queda en DOS palabras. Se
+     * veia sin saber que se veia: todo lo que media 8 bytes o menos funcionaba
+     * -el SETUP, la primera lectura- y una lectura de 18 devolvia exactamente
+     * 8, con los otros diez intactos.
+     *
+     * Linux, para la bcm2835 y solo para ella, escribe 0x10 en crudo en
+     * GAHBCFG (dwc2_set_bcm_params: "p->ahbcfg = 0x10"), sin usar las macros
+     * del campo. Es un bit que en la codificacion generica del DWC2 no tiene
+     * nombre, y en este SoC es lo que hace que las rafagas salgan enteras. No
+     * se por que; se que es lo que tiene la gente que lo tiene funcionando, y
+     * a estas alturas del paso eso vale mas que mi razonamiento. */
     uint32_t ahb = leer(GAHBCFG);
     ahb &= ~AHB_HBSTLEN(0xF);
-    ahb |=  AHB_HBSTLEN(7) | AHB_DMAEN;
+    ahb |=  0x10 | AHB_DMAEN;
     escribir(GAHBCFG, ahb);
 
     /* Y los avisos viejos borrados. Sin pedir interrupciones: se pregunta
