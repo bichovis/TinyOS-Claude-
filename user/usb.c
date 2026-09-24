@@ -44,6 +44,7 @@
 #define HAINT      0x414    /* que canales han avisado                       */
 #define HAINTMSK   0x418
 #define HCFG       0x400    /* configuracion de anfitrion                    */
+#define HCFG_FSLSS (1u << 2) /* "solo velocidades completa y baja"            */
 #define HFIR       0x404    /* cada cuantos relojes empieza una trama        */
 #define HFNUM      0x408    /* numero de micro-trama: el reloj del USB        */
 #define HPRT0      0x440    /* EL puerto raiz                                */
@@ -129,6 +130,7 @@
  * cuenta transacciones. */
 #define HCC_MC(n)      ((uint32_t)((n) & 3) << 20)
 #define HCC_ADDR(n)    ((uint32_t)((n) & 0x7F) << 22)
+#define HCC_ODDFRM     (1u << 29)
 #define HCC_DISABLE    (1u << 30)
 #define HCC_ENABLE     (1u << 31)
 
@@ -361,30 +363,43 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
     /* Los avisos viejos del canal, fuera. Un canal se reutiliza, y arrancar
      * con el ACK de la transferencia anterior puesto es creerse que esta ya
      * termino. */
+    escribir(HCINTMSK(canal), 0);
     escribir(HCINT(canal), 0xFFFFFFFF);
-
-    /* La mascara del canal, PUESTA, aunque no queramos interrupciones.
-     *
-     * Yo la dejaba a cero -"no quiero que me interrumpa, voy a preguntar
-     * mirando"- y eso da por hecho que los bits de HCINT se encienden solos.
-     * En QEMU se encienden; el databook dice que la mascara gobierna si el
-     * aviso SALE, y hay silicio que ademas la usa para decidir si el bit se
-     * enciende. Ponerla no cuesta nada y no provoca ninguna interrupcion,
-     * porque para eso hace falta ademas GINTMSK.HChInt, que sigue a cero.
-     *
-     * HAINTMSK es el mismo cuento un nivel mas arriba: dice de que canales se
-     * hace caso. */
-    escribir(HCINTMSK(canal), 0x7FF);
     escribir(HAINTMSK, leer(HAINTMSK) | (1u << canal));
     escribir(HCSPLT(canal), 0);         /* sin particion: cuelga del raiz */
+
+    /* --- Las caracteristicas del canal, SIN habilitarlo todavia -----------
+     *
+     * Dos escrituras y no una, que es como lo hace la implementacion de
+     * referencia y no como lo hacia yo. Poner las caracteristicas y el bit de
+     * "arranca" en la MISMA escritura le pide al nucleo que empiece con unos
+     * valores que estan llegando en ese mismo ciclo de bus. Separarlo es
+     * gratis, y lo que se gana es que cuando el canal arranca todo lo demas
+     * llevaba ya un rato en su sitio. */
+    escribir(HCCHAR(canal), HCC_MC(1) | HCC_ADDR(addr) | HCC_TIPO(tipo) |
+                            (entrada ? HCC_IN : 0) | HCC_EP(ep) |
+                            HCC_MPS(mps));
 
     escribir(HCTSIZ(canal), HCT_PID(pid) | HCT_PAQUETES(paquetes) |
                             HCT_BYTES(bytes));
     escribir(HCDMA(canal), dma_bus ? BUS(pa) : (uint32_t)pa);
 
-    escribir(HCCHAR(canal), HCC_ENABLE | HCC_MC(1) | HCC_ADDR(addr) |
-                            HCC_TIPO(tipo) | (entrada ? HCC_IN : 0) |
-                            HCC_EP(ep) | HCC_MPS(mps));
+    /* Y la mascara del canal: SOLO "se ha detenido".
+     *
+     * Yo ponia 0x7FF, o sea todo, incluidos NAK y ACK. La referencia pone
+     * unicamente ese bit, y tiene sentido: el canal se detiene al acabar, pase
+     * lo que pase, y entonces el resto de HCINT dice POR QUE. Desenmascarar
+     * NAK y ACK le pide al nucleo que reaccione a cosas que son normales a
+     * mitad de una transferencia. */
+    escribir(HCINTMSK(canal), HCI_CHHLTD);
+
+    /* La paridad de la trama, que tampoco ponia. Con ella el nucleo sabe en
+     * que mitad del ciclo colocar la transaccion. */
+    uint32_t c = leer(HCCHAR(canal));
+    if (!(leer(HFNUM) & 1)) c |= HCC_ODDFRM;
+
+    /* Y ahora arranca. */
+    escribir(HCCHAR(canal), c | HCC_ENABLE);
 
     /* Y esperar. El canal acaba avisando por HCINT, y las dos formas de acabar
      * son "completada" y "detenida"; lo segundo puede ser bueno o malo, y lo
@@ -400,11 +415,11 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
      *
      * Lo dice ChEna: si sigue puesto, el nucleo cogio la orden y esta a lo
      * suyo; si se bajo solo, la acabo y no lo conto. */
-    uint32_t c = leer(HCCHAR(canal));
+    uint32_t fin = leer(HCCHAR(canal));
     printf("  [usb] el canal %d no contesta: HCCHAR = 0x%08x (%s), "
            "HCTSIZ = 0x%08x\n",
-           canal, (unsigned int)c,
-           (c & HCC_ENABLE) ? "sigue habilitado" : "se deshabilito solo",
+           canal, (unsigned int)fin,
+           (fin & HCC_ENABLE) ? "sigue habilitado" : "se deshabilito solo",
            (unsigned int)leer(HCTSIZ(canal)));
     printf("  [usb]   GINTSTS = 0x%08x, HAINT = 0x%08x, GAHBCFG = 0x%08x "
            "(DMA %s), HCDMA = 0x%08x\n",
@@ -413,7 +428,7 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
            (leer(GAHBCFG) & AHB_DMAEN) ? "encendido" : "APAGADO",
            (unsigned int)leer(HCDMA(canal)));
 
-    escribir(HCCHAR(canal), c | HCC_DISABLE);
+    escribir(HCCHAR(canal), fin | HCC_DISABLE);
     return 0;
 }
 
@@ -502,19 +517,50 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
 }
 
 /* --- Lo demas de la configuracion ------------------------------------- */
+/* --- La configuracion, en el orden de una implementacion que funciona ----
+ *
+ * Aqui llevaba siete arranques proponiendo un registro por vez, sacado de
+ * memoria. El orden de abajo no es mio: es el de CherryUSB, que es una pila de
+ * USB portable con un puerto de DWC2 limpio y probado en varios chips.
+ *
+ * Comparar mi version con la suya destapo cinco diferencias que no se me
+ * habian ocurrido, y el orden era una de ellas. Vale la pena anotar por que
+ * cada paso va donde va:
+ *
+ *   1. HCFG antes de todo, incluido quitar FSLSS -"solo velocidades completa y
+ *      baja"-, que yo no tocaba nunca.
+ *   2. Las FIFO y su vaciado ANTES de encender el DMA. Al reves, el DMA queda
+ *      apuntando a un reparto que se va a mover debajo.
+ *   3. El DMA con lectura-modificacion-escritura, no reescribiendo el registro
+ *      entero: hay bits ahi que el nucleo pone por su cuenta.
+ *   4. Y la interrupcion global AL FINAL, cuando ya esta todo puesto y el
+ *      puerto alimentado. Antes de eso no hay nada que interrumpir.
+ *
+ * La leccion de metodo es la que me llevo: cuando algo no funciona y se
+ * empiezan a proponer bits de memoria, lo que hay que hacer es buscar una
+ * implementacion que funcione y comparar. Siete arranques mas tarde. */
 static void modo_anfitrion(void)
 {
-    /* DMA interno y rafagas de 16 palabras: es lo que GHWCFG2 dijo que este
-     * ejemplar sabe hacer. Y la interrupcion global, otra vez abierta. */
-    escribir(GAHBCFG, AHB_DMAEN | AHB_HBSTLEN(7) | AHB_GLBLINTR);
+    /* 1. Que NO se limite a velocidades lentas. Este bit lo tenia sin mirar
+     *    desde el principio, y es literalmente "no hables alta velocidad". */
+    escribir(HCFG, leer(HCFG) & ~HCFG_FSLSS);
 
-    /* Sin pedir ninguna interrupcion todavia: de momento se pregunta mirando.
-     * Y los avisos viejos borrados -los W1C se limpian escribiendo unos-,
-     * porque arrancar con avisos de antes del reset es leer noticias de ayer. */
+    /* 2. El reparto de las FIFO y su vaciado, antes del DMA. */
+    fifos_repartir();
+
+    /* 3. Las rafagas y el DMA, sin pisar el resto del registro. */
+    uint32_t ahb = leer(GAHBCFG);
+    ahb &= ~AHB_HBSTLEN(0xF);
+    ahb |=  AHB_HBSTLEN(7) | AHB_DMAEN;
+    escribir(GAHBCFG, ahb);
+
+    /* Y los avisos viejos borrados. Sin pedir interrupciones: se pregunta
+     * mirando, y con GINTMSK a cero el chip no levanta la linea. Es la unica
+     * desviacion deliberada de la referencia -ella si las pide- y el motivo es
+     * que este driver todavia no atiende su puerto de mensajes: una
+     * interrupcion que nadie recoge acabaria en una tormenta. */
     escribir(GINTMSK, 0);
     escribir(GINTSTS, 0xFFFFFFFF);
-
-    fifos_repartir();
 }
 
 /* --- El puerto raiz ---------------------------------------------------
@@ -526,7 +572,13 @@ static void puerto_encender(void)
 {
     uint32_t p = leer(HPRT0);
     if (!(p & HPRT_PWR)) hprt_escribir(p | HPRT_PWR);
-    sleep(2);                          /* que la alimentacion suba */
+
+    /* 200 ms, no 20. Es lo que espera la implementacion de referencia, y da de
+     * sobra para la subida de VBUS y para el antirrebote del controlador. */
+    sleep(20);
+
+    /* Y AHORA la interrupcion global, con todo lo demas ya puesto. */
+    escribir(GAHBCFG, leer(GAHBCFG) | AHB_GLBLINTR);
 }
 
 /* Y esperar a que el controlador registre la conexion.

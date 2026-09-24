@@ -6099,6 +6099,43 @@ acaba de salir de un reset es normal: el canal reintenta por su cuenta las veces
 que diga MC, pero uno que todavia se esta despertando puede fallar las tres.
 Cualquier pila de USB de verdad reintenta la enumeracion.
 
+### Siete arranques, y lo que tenia que haber hecho el primero
+
+`GAHBCFG` pasando de `0x2f` a `0x1f` entre dos intentos -el DMA apagandose sin
+que nadie escriba ese registro-, `OTGInt` apareciendo en `GINTSTS`, el buzon
+contestando que no contesta. El hardware cambiando de estado por su cuenta de
+formas que no se explicar.
+
+Y siete arranques proponiendo un campo por vez, sacado de memoria sobre un IP
+block complejo, con dos de mis conclusiones retractadas por mi mismo. Eso no es
+depurar: es apostar.
+
+Lo que habia que hacer desde el principio es lo que se hace cuando algo no
+funciona y se empiezan a proponer bits de memoria: **buscar una implementacion
+que funcione y comparar**. La de referencia es el puerto de DWC2 de CherryUSB,
+que es portable y esta probado en varios chips distintos.
+
+Comparar destapo **cinco** diferencias, y ninguna se me habia ocurrido en siete
+rondas:
+
+| la referencia | lo que yo hacia |
+|---|---|
+| `HCCHAR` en **dos** escrituras: caracteristicas, y `CHENA` aparte | todo de golpe, incluido el bit de arranque |
+| `HCINTMSK` = **solo** *Channel Halted* | `0x7FF`, con NAK y ACK desenmascarados |
+| `ODDFRM` segun la paridad de `HFNUM` | sin poner |
+| `DMAEN` **despues** de repartir y vaciar las FIFO | antes |
+| `GINT` global **al final**, tras alimentar el puerto y 200 ms | en la misma escritura que `DMAEN` |
+
+Y una sexta que salio de leer su `HCFG`: **`FSLSS`**, el bit que significa "solo
+velocidades completa y baja". Yo no lo tocaba nunca. Si el firmware lo dejaba
+puesto, el nucleo tenia prohibido hablar alta velocidad, lo cual explicaria de
+una vez la anomalia que llevo arrastrando desde el paso 61.
+
+Cada una de las cinco tiene su motivo y merece leerse en el codigo, pero la que
+me llevo es de metodo y no de registro: **poner las caracteristicas de un canal y
+su bit de arranque en la misma escritura** le pide al nucleo que empiece con
+valores que estan llegando en ese mismo ciclo de bus. Separarlo es gratis.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es
