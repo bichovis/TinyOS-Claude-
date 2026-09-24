@@ -606,6 +606,26 @@ static uint32_t canal_transferir(int entrada, int tipo, int mps, int addr,
     int quedan = bytes;
     ultimo_recibido = 0;
 
+    /* --- Lo periodico tiene reloj, lo demas no ------------------------------
+     *
+     * Para control y bulk, el traductor del hub GUARDA el resultado hasta que
+     * el anfitrion vuelva a por el: se puede esperar una trama entera entre
+     * las dos mitades y sale bien, como salio toda la enumeracion.
+     *
+     * Para un endpoint de interrupcion, no. El traductor hace la transaccion
+     * lenta en la trama siguiente y se queda el resultado SOLO durante esa
+     * trama: si el complete split llega tarde, lo tira. Asi que aqui el
+     * tiempo esta contado en micro-tramas, y la regla es la de USPi, que
+     * lleva anyos leyendo teclados detras de este hub: el start split en una
+     * micro-trama que no sea la 6, el primer complete split dos despues, y si
+     * el hub dice NYET, otro una micro-trama mas tarde, hasta tres. Y luego
+     * se da esa trama por perdida y se vuelve a empezar.
+     *
+     * Yo esperaba ocho micro-tramas -una trama entera- antes del primer
+     * complete split. Llegaba cuando el resultado ya no existia, y el teclado
+     * parecia mudo. */
+    int periodico = (tipo == EP_INT || tipo == EP_ISO);
+
     /* Un paquete por ciclo, hasta que se acaben o llegue uno corto. Un OUT de
      * cero bytes -el estado- es un ciclo con cero. */
     do {
@@ -614,6 +634,15 @@ static uint32_t canal_transferir(int entrada, int tipo, int mps, int addr,
         int listo = 0;
 
         for (int vuelta = 0; vuelta < split_intentos && !listo; vuelta++) {
+            /* Lo periodico arranca al principio de una trama. ODDFRM hace que
+             * el canal salga en la micro-trama SIGUIENTE a la que se programa
+             * (canal_hacer lo pone con la paridad de la siguiente), asi que se
+             * espera a la 7 y el start split sale en la 0. Las dos mitades y
+             * sus reintentos caben entonces en la misma trama, y nunca se
+             * pisa la 6, que la norma reserva. */
+            if (periodico)
+                for (int v = 0; v < 400000 && (leer(HFNUM) & 7) != 7; v++) { }
+
             /* Start split: para un OUT lleva los datos; para un IN, el
              * tamanyo del paquete que se espera. */
             r = canal_hacer(0, entrada, tipo, mps, addr, ep, pid, pa + hecho,
@@ -622,16 +651,27 @@ static uint32_t canal_transferir(int entrada, int tipo, int mps, int addr,
             if (r & HCI_NAK) { esperar_microtramas(8); continue; }
             if (!(r & HCI_ACK)) { esperar_microtramas(8); continue; }
 
-            /* Complete split: repetir mientras el hub diga NYET. */
-            for (int c = 0; c < 40; c++) {
-                esperar_microtramas(8);
+            /* Complete split: repetir mientras el hub diga NYET.
+             *
+             * Periodico: el start salio en la micro-trama 0; esperar una y
+             * programar pone el primer complete en la 2, y cada reintento,
+             * programado nada mas volver, sale una mas tarde: 2, 3, 4. Tres y
+             * se acabo; la trama se da por perdida. NAK aqui es el teclado
+             * diciendo "no tengo nada", y no se insiste.
+             *
+             * Control y bulk: sin prisa, una trama entre intento e intento. */
+            int intentos_c = periodico ? 3 : 40;
+            for (int c = 0; c < intentos_c; c++) {
+                if (periodico) { if (c == 0) esperar_microtramas(1); }
+                else           esperar_microtramas(8);
                 r = canal_hacer(0, entrada, tipo, mps, addr, ep, pid, pa + hecho,
                                 entrada ? mps : 0, 1);
                 if (r & HCI_MALO)      return r;
-                if (r & HCI_NYET)      continue;
-                if (r & HCI_NAK)       break;          /* de nuevo desde el start */
                 if (r & HCI_XFERCOMPL) { listo = 1; break; }
+                if (r & HCI_NAK)       break;          /* de nuevo desde el start */
+                /* NYET o nada: otro intento */
             }
+            if (!listo && periodico && (r & HCI_NAK)) break;   /* no hay dato */
         }
         if (!listo) return r ? r : 0;
 
@@ -907,6 +947,10 @@ struct hid_ep {
 
 static struct hid_ep teclado, raton;
 
+/* Lo que contesta el endpoint al sondearlo. "No se ve nada" no es un
+ * diagnostico; "dos mil NAK y ningun NYET" si lo es. */
+static unsigned sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error;
+
 /* Leer la configuracion entera y apuntar donde estan el teclado y el raton. */
 static int hid_descubrir(int addr, int mps)
 {
@@ -982,10 +1026,13 @@ static int hid_sondear(struct hid_ep *e, uint8_t *out)
         volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
         int n = ultimo_recibido;
         for (int i = 0; i < n && i < 64; i++) out[i] = d[i];
+        sondeo_datos++;
         return n;
     }
-    if (r & (HCI_NAK | HCI_NYET)) return 0;
-    if (!r) return 0;
+    if (r & HCI_NAK)  { sondeo_nak++;  return 0; }
+    if (r & HCI_NYET) { sondeo_nyet++; return 0; }
+    if (!r)           { sondeo_nada++; return 0; }
+    sondeo_error++;
     return -1;
 }
 
@@ -1587,7 +1634,12 @@ int main(int argc, char **argv)
     printf("  [usb] escuchando el teclado: pulsa algo\n");
 
     uint8_t inf[64], antes[8] = { 0 };
+    unsigned vueltas = 0;
     for (;;) {
+        if (++vueltas % 200 == 0)
+            printf("  [usb] sondeos: %u con datos, %u NAK, %u NYET, %u sin respuesta, %u error\n",
+                   sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error);
+
         int n = hid_sondear(&teclado, inf);
         if (n >= 8) {
             int shift = (inf[0] & 0x22) != 0;

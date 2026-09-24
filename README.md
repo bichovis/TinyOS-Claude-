@@ -6562,6 +6562,35 @@ Que las teclas vayan a la consola en vez de imprimirse: el driver de USB
 entregandoselas a la disciplina de linea, como hace el conserver con las de la
 UART. Y luego la Ethernet, que esta en la direccion 2 esperando.
 
+### Lo periodico tiene reloj
+
+El teclado quedo configurado y sondeado, pero en la Pi no salia ni una tecla.
+Primero, visibilidad: `hid_sondear` ahora cuenta lo que contesta el endpoint
+(datos, NAK, NYET, sin respuesta, error) y el bucle lo imprime cada dos
+segundos. "No se ve nada" no es un diagnostico; "dos mil NAK y ningun NYET"
+si lo es.
+
+Segundo, la sospecha: la maquina de estados de la particion esperaba ocho
+micro-tramas -una trama entera- antes del primer *complete split*. Para
+control y bulk el traductor del hub guarda el resultado hasta que vengan a por
+el, y por eso toda la enumeracion salio bien. Para un endpoint de interrupcion
+no: el traductor hace la transaccion lenta en la trama siguiente y se queda el
+resultado solo mientras dura esa trama. Un *complete split* tardio encuentra
+el resultado tirado, y el teclado parece mudo.
+
+La regla, sacada de USPi (`dwhciframeschedper.c`), que lleva anyos leyendo
+teclados detras de este mismo hub: el *start split* en una micro-trama que no
+sea la 6, el primer *complete split* dos micro-tramas despues, y si el hub dice
+NYET, otro una micro-trama mas tarde, hasta tres. NAK en el *complete* es el
+dispositivo diciendo "no tengo nada" y no se insiste. Aqui se implementa con
+`HFNUM` y `ODDFRM`: se espera a la micro-trama 7, el canal sale en la 0 (ODDFRM
+lleva la paridad de la siguiente), se espera una y el primer *complete* sale en
+la 2; los reintentos, programados nada mas volver, salen en la 3 y la 4.
+
+En QEMU, con `-device usb-kbd` y `sendkey` desde el monitor, el driver imprime
+las teclas (ahi no hay hub ni particion: prueba solo el camino corto). Lo
+partido solo se puede probar en la placa.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
