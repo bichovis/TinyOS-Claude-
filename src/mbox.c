@@ -35,6 +35,7 @@
 
 #define TAG_GET_ARM_MEMORY  0x00010005u
 #define TAG_GET_CLOCK_RATE  0x00030002u
+#define TAG_SET_POWER_STATE 0x00028001u
 #define TAG_END             0x00000000u
 #define CODE_REQUEST        0x00000000u
 #define CODE_RESP_OK        0x80000000u
@@ -114,6 +115,45 @@ int mbox_arm_memory(uint64_t *base, uint64_t *size)
  * por supuesto es lo que hace que un driver funcione en el emulador y no en
  * el hardware: el divisor sale de un numero inventado.
  */
+/* --- Encender un dispositivo --------------------------------------------
+ *
+ * Y esto es mas que un interruptor de corriente. Lo que la VideoCore hace al
+ * "encender" un periferico incluye poner en marcha su reloj y, en el caso del
+ * USB, su PHY: el bloque analogico que hace la senyalizacion en el cable.
+ *
+ * De ahi que esto no se pueda deducir leyendo registros. Con el dominio a
+ * medias, el AHB funciona -o sea que todos los registros del controlador se
+ * leen y se escriben perfectamente, y hasta el DMA anda- pero el PHY solo da
+ * para lo mas basico: ver si hay una resistencia en D+ y hablar a velocidad
+ * completa. Los paquetes no salen y nada dice por que.
+ *
+ * Me costo cinco arranques descartar esto con un argumento malo: "los
+ * registros se leen bien, asi que esta encendido". Leer registros solo prueba
+ * que hay reloj de bus.
+ *
+ * El bit 1 del estado es "y espera a que este listo", que es justo lo que hace
+ * falta: sin el, la llamada vuelve antes de que el PHY haya arrancado. */
+#define PWR_ON        (1u << 0)
+#define PWR_ESPERAR   (1u << 1)
+
+int mbox_power_on(uint32_t device_id)
+{
+    buf[0] = 8 * 4;
+    buf[1] = CODE_REQUEST;
+    buf[2] = TAG_SET_POWER_STATE;
+    buf[3] = 8;                      /* espacio para la respuesta         */
+    buf[4] = 8;                      /* tamano de la peticion             */
+    buf[5] = device_id;
+    buf[6] = PWR_ON | PWR_ESPERAR;
+    buf[7] = TAG_END;
+
+    if (!mbox_call(MBOX_CH_PROP)) return 0;
+
+    /* La GPU contesta con el estado que ha quedado. El bit 0 es "encendido" y
+     * el 1, en la RESPUESTA, significa "no existe ese dispositivo". */
+    return (buf[6] & PWR_ON) && !(buf[6] & PWR_ESPERAR);
+}
+
 uint32_t mbox_clock_rate(uint32_t clock_id)
 {
     buf[0] = 8 * 4;

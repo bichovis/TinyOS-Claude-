@@ -753,7 +753,27 @@ int main(int argc, char **argv)
     if (irq_register(29, (int)puerto) >= 0)
         printf("  [usb] MAL: me ha dado una IRQ que no esta en la lista\n");
 
-    /* --- 4. Y ahora si: encender el controlador --- */
+    /* --- 4. Encenderlo de verdad, que no es lo mismo que tocar registros --
+     *
+     * Lo PRIMERO, antes de escribir un solo bit del controlador. En la Pi el
+     * USB lo enciende la GPU, y eso incluye arrancar su PHY: el bloque
+     * analogico que pone los unos y ceros en el cable.
+     *
+     * Y esto no se puede deducir leyendo registros, que es el error que me
+     * costo cinco arranques. Con el dominio a medias el AHB va, o sea que todo
+     * el banco de registros se lee y se escribe bien y hasta el DMA funciona
+     * -se veia: HCDMA avanzaba ocho bytes-, pero el PHY solo da para lo minimo:
+     * ver si hay una resistencia en D+ y hablar a velocidad completa. Los
+     * paquetes no salen y no hay ningun bit que lo diga.
+     *
+     * Yo lo descarte con un argumento malo: "los registros se leen bien, asi
+     * que esta encendido". Leer registros solo prueba que hay reloj de bus. */
+    if (dev_power(PWR_USB) != 1)
+        printf("  [usb] la GPU no me confirma que el USB este encendido\n");
+    else
+        printf("  [usb] la GPU dice que el USB esta encendido y listo\n");
+
+    /* --- 5. Y ahora si: configurar el controlador --- */
     if (!nucleo_despertar()) {
         printf("  [usb] el nucleo no responde al reset (GRSTCTL = 0x%08x)\n",
                (unsigned int)leer(GRSTCTL));
@@ -818,7 +838,7 @@ int main(int argc, char **argv)
     printf("  [usb] reloj del enlace puesto para %s (HCFG = 0x%08x)\n",
            velocidad(p), (unsigned int)leer(HCFG));
 
-    /* --- 5. Y ahora a hablar ------------------------------------------
+    /* --- 6. Y ahora a hablar ------------------------------------------
      *
      * El primer GET_DESCRIPTOR pide OCHO bytes, y no es timidez: todavia no se
      * sabe cual es el tamanyo maximo de paquete de este dispositivo, y ese dato

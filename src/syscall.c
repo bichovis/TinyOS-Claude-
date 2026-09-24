@@ -336,6 +336,16 @@ void syscall_dispatch(struct trap_frame *f)
      * la placa. Pero si necesita saber a que velocidad va su reloj, porque
      * de ahi sale el divisor. El kernel contesta a esa pregunta concreta y
      * a ninguna mas. */
+    /* Encender un dispositivo de la placa. Solo un driver -alguien con un
+     * periferico concedido- y solo los de la lista: el buzon es el mando de la
+     * placa entera y no se presta. */
+    case SYS_dev_power: {
+        if (!current || !current->mmio_va) { ret = -EPERM; break; }
+        if (f->x[0] != PWR_USB)            { ret = -EINVAL; break; }
+        ret = mbox_power_on((uint32_t)f->x[0]) ? 1 : 0;
+        break;
+    }
+
     case SYS_clock_rate: {
         uint64_t id = f->x[0];
         if (id != CLK_EMMC && id != CLK_UART && id != CLK_CORE) { ret = -1; break; }

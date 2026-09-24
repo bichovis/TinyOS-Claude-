@@ -463,6 +463,19 @@ struct estado {
  * mismo espacio de numeros -un grupo se llama como su primer proceso- asi
  * que hace falta algo fuera del numero para decir cual de los dos es. */
 
+/* --- Encender un dispositivo de la placa -------------------------------
+ *
+ * En la Pi, "encender" un periferico lo hace la GPU, y para el USB no es solo
+ * darle corriente: incluye arrancar su PHY. Sin eso el controlador se lee y se
+ * escribe perfectamente -hay reloj de bus- y los paquetes no salen del chip.
+ *
+ * La lista de lo que se puede encender esta EN EL KERNEL, como la del MMIO y
+ * la de los relojes: un driver pide "el USB", no un numero cualquiera. Darle el
+ * buzon entero seria darle el mando de la placa. */
+#define SYS_dev_power    54    /* (dispositivo) -> 1 si quedo encendido    */
+
+#define PWR_USB           3    /* el DWC2, segun la numeracion de la GPU   */
+
 /* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del
  * buzon de la GPU y solo contesta a esta lista corta. */
 #define CLK_EMMC        1

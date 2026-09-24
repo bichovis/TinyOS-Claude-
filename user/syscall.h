@@ -311,6 +311,11 @@ int64_t console_stop(void)  { return syscall2(SYS_console_stop, 0, 0); }
 static inline int64_t klog(char *buf, uint64_t n)
 { return syscall2(SYS_klog, (uint64_t)buf, n); }
 
+/* Pedirle a la GPU que encienda un dispositivo de la placa y espere a que este
+ * listo. Devuelve 1 si quedo encendido. Solo para drivers. */
+static inline int64_t dev_power(uint64_t dispositivo)
+{ return syscall2(SYS_dev_power, dispositivo, 0); }
+
 static inline int64_t dma_alloc(uint64_t paginas, uint64_t *pa)
 { return revisar(syscall2(SYS_dma_alloc, paginas, (uint64_t)pa)); }
 

@@ -6021,6 +6021,45 @@ rondas sin mirar el registro que decide justamente eso, y eso es de las cosas
 que hay que dejar escritas: **cuando algo no cuadra, lo primero es leer de vuelta
 lo que crees que escribiste.**
 
+### Cinco arranques, y el candidato que descarte mal
+
+`MC = 1` puesto y el mismo sintoma. `GUSBCFG = 0x20001400` en la placa,
+**identico a QEMU**: PHY UTMI+, modo anfitrion forzado, turnaround 5. O sea que
+mis escrituras se sostienen y ese punto ciego, cerrado, no era la respuesta.
+
+Llegado aqui conviene mirar el metodo y no solo el registro. Cinco arranques
+proponiendo un campo por vez, sacado de memoria sobre un IP block complejo. Eso
+no converge, y cada intento cuesta un arranque de alguien.
+
+Asi que vuelvo a lo que descarte, y lo descarte con un argumento malo. En el
+paso 61 escribi que el dominio de alimentacion del USB no podia ser el problema
+*"porque leemos GSNPSID y los GHWCFG correctamente, y el PHY ve las lineas, cosa
+imposible con el dominio apagado"*.
+
+Leer registros solo prueba que hay **reloj de bus**.
+
+En la Pi, "encender" un periferico lo hace la GPU, y para el USB incluye arrancar
+su **PHY**: el bloque analogico que pone los unos y los ceros en el cable. Con el
+dominio a medias:
+
+| lo que se observo | lo que explica |
+|---|---|
+| los registros se leen y escriben bien | hay reloj AHB |
+| el PHY ve la resistencia de D+ | eso es un comparador, no necesita casi nada |
+| enumera a velocidad **completa**, nunca alta | la senyalizacion de alta velocidad es lo primero que falta |
+| el DMA funciona, `HCDMA` avanza | el DMA es AHB, no PHY |
+| los paquetes **no salen** y nada dice por que | no hay nada que los ponga en el cable |
+
+Es la primera explicacion que cubre los cinco sintomas a la vez, incluido el que
+llevaba cinco arranques apartando como "raro pero inofensivo". Y es la segunda
+vez en este paso que esa anomalia resulta no ser inofensiva.
+
+El arreglo es una llamada al buzon de la GPU -`SET_POWER_STATE` del dispositivo
+3- con el bit de "y espera a que este listo", porque sin el la llamada vuelve
+antes de que el PHY haya arrancado. La lista de lo que se puede encender vive en
+el kernel, como la del MMIO y la de los relojes: un driver pide "el USB", no un
+numero cualquiera. Darle el buzon entero seria darle el mando de la placa.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es
