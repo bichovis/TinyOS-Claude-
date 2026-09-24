@@ -5017,6 +5017,169 @@ lo acertaba por casualidad: el bucle viejo preguntaba por todos sus pids en
 cada vuelta y veia que ese seguia vivo. Un bucle que reacciona a sucesos solo
 sabe de los sucesos que hay.
 
+## Un editor, y por que vi es modal
+
+Hasta aqui no se podia editar un fichero dentro de TinyOS. Habia `write`, que
+crea uno con lo que quepa en una linea de orden, o sea un centenar de bytes.
+Para cualquier otra cosa habia que sacar la tarjeta y enchufarla al Mac.
+
+Un editor es ademas la primera pieza del camino largo -compilar TinyOS dentro
+de TinyOS- y es la unica de ese camino que se paga sola aunque el resto no se
+haga nunca.
+
+### La restriccion que explica el diseno entero
+
+Un editor necesita muchas mas ordenes que teclas. Mover el cursor en cuatro
+direcciones, insertar, borrar, buscar, guardar, salir, deshacer... y por la
+linea serie solo llegan bytes. No hay Alt, no hay teclas de funcion en las que
+confiar, no hay raton. Con Ctrl hay 31 combinaciones y ya tienen duenyo.
+
+Asi que las teclas tienen que significar cosas distintas en momentos
+distintos. Eso es un MODO, y de ahi sale vi: no es una rareza historica ni
+cabezoneria de los viejos, es lo unico que se puede hacer con 26 letras y
+cincuenta ordenes.
+
+Y hay una segunda razon, que en esta maquina se puede medir. La linea va a
+115200 baudios: 11.520 bytes por segundo. Una pantalla de 80x24 son 1.920
+caracteres que con los escapes se van a unos 2.000 bytes, o sea **174
+milisegundos**. Si el editor redibujara todo en cada tecla, escribir seria
+como escribir debajo del agua.
+
+Bill Joy escribio el vi original en una linea de 300 baudios: 30 bytes por
+segundo, o sea **64 segundos por pantalla**. Todo lo que le parece raro a la
+gente de vi -que no haya menus, que las ordenes sean una letra, que no se
+refresque la pantalla a lo tonto- sale de ese numero. Tenemos 384 veces mas
+ancho de banda y la leccion sigue valiendo.
+
+Por eso este editor lleva su propio instrumento: **Ctrl-G dice cuantos bytes
+ha mandado al terminal** desde que arranco. Es la unica forma honesta de saber
+si lo que acabo de escribir es verdad.
+
+### Y el instrumento me llamo mentiroso a la primera
+
+Habia escrito en un comentario que mover el cursor "no cuesta ni un byte de
+redibujado". Once movimientos, y Ctrl-G:
+
+```
+  antes:  2.638 bytes
+  once h/j/k/l despues:  3.886 bytes      -> 113 bytes por tecla
+```
+
+Ciento trece. Lo que pasaba es que cada movimiento repintaba la **linea de
+estado entera**: ochenta caracteres de relleno y dos escapes de video inverso,
+para que cambiara un numero de dos cifras.
+
+Repintar solo el numero, en su esquina, son 36 bytes contando el
+reposicionamiento del cursor. Tres veces menos. Y aun asi es cuatro veces mas
+que no tener contador: el vi original no ensenyaba la posicion salvo que se la
+pidieras con Ctrl-G, y ahora se por que. En vim la "regla" es una opcion, y
+tambien viene apagada.
+
+La medida completa, con el editor ya arreglado:
+
+| lo que se hace | bytes |
+|---|---|
+| abrir un fichero (pantalla entera) | ~1.900 |
+| escribir una letra (su linea + la posicion) | ~60 |
+| mover el cursor (la posicion + el cursor) | ~36 |
+| mover el cursor sin contador de posicion | ~8 |
+
+### write() no escribe todo lo que le pides
+
+Esto me costo una hora y es la mejor leccion del paso.
+
+La primera version pintaba dos lineas y media y se paraba. Sin error, sin
+aviso: la pantalla salia cortada y el resto desaparecia. Los bytes de verdad,
+capturados del puerto serie, se cortaban en **exactamente 128**.
+
+`consola_write` en `src/file.c` copia a un buffer de rebote de 128 bytes
+-`BOUNCE`, pequenyo porque la pila del kernel es UNA pagina-, se queda con los
+primeros 128 y **devuelve cuantos ha cogido**. Es una escritura parcial, y es
+perfectamente legal: lo dice POSIX y lo hace cualquier Unix en cuanto hay una
+tuberia o un socket por medio. Quien llama tiene que dar la vuelta.
+
+Lo bonito es por que no habia salido antes: **el editor es el primer programa
+de este proyecto que escribe mas de 128 bytes de una vez.** Todo lo anterior
+imprimia lineas sueltas de texto. Y la libc ya lo hacia bien desde el paso 49
+-`lib/file.c` tiene su bucle `while (o < n)`- asi que el fallo no estaba en lo
+viejo, estaba en lo nuevo. Un contrato que llevaba 57 pasos cumpliendose sin
+que nadie lo mirara.
+
+De paso, una consecuencia que conviene tener presente: con `BOUNCE` en 128, un
+redibujado completo son **16 llamadas al sistema** por mucho cubo que se le
+ponga delante. El cubo sigue valiendo -sin el serian cien- pero el suelo lo
+pone el kernel.
+
+### El modo, siempre visible
+
+El vi original no ensenyaba en que modo estabas. No le sobraban ni filas ni
+baudios, y es la queja mas repetida que ha tenido un programa en la historia.
+Aqui el modo se ensenya siempre.
+
+Y de eso salio el segundo fallo, que es peor que el primero: al pulsar Escape,
+el editor volvia a modo ordenes y la linea de estado **seguia diciendo `--
+INSERTAR --`**, porque la salida del modo insercion usaba el redibujado barato
+-el que solo toca la posicion- y no llegaba a borrar el texto de la izquierda.
+
+Un estado invisible se adivina mal. Uno visible y falso se cree. Es el peor
+fallo posible en un programa modal, y lo tenia yo en el unico sitio del codigo
+donde se puede salir del modo.
+
+### El terminal es prestado, y ahora hay trabajo que perder
+
+El editor apaga `T_ECO` y `T_CANONICO` -el modo crudo del paso 53- y se queda
+con cada tecla. Pero hay dos que no le llegan nunca, y eso lo decide el driver
+mucho antes:
+
+```c
+        if (c == 3)  { interrumpir = 1; continue; }   /* uart_irq() */
+        if (c == 26) { parar = 1;       continue; }
+```
+
+Ctrl-C y Ctrl-Z se los queda `uart_irq` **antes de la disciplina de linea**,
+asi que llegan como senyales incluso en modo crudo. Y aqui eso importa como no
+importaba antes: **este es el primer programa del proyecto donde perder contra
+una senyal cuesta TRABAJO y no solo un proceso.** Si el editor no atrapa
+SIGINT, un Ctrl-C se lleva todo lo que no hayas guardado.
+
+Con SIGTSTP hay que hacer trampa, y se nota que es trampa: se traga. Si el
+editor se detuviera, dejaria el terminal en modo crudo y sin eco, y el shell
+se quedaria escribiendo a ciegas -que es exactamente la limitacion que el
+paso 53 dejo apuntada, ahora con dientes-. Suspender un editor de verdad exige
+devolver el terminal al pararse y volver a cogerlo al seguir, con SIGCONT y un
+redibujado. Eso es un paso aparte, y es el que hace falta para que la tercera
+pieza del control de trabajos quede completa.
+
+### Lo que hace, y con que teclas
+
+```
+  h j k l  0  $  G  gg  w  b        moverse
+  i a A  o O                        insertar (Escape para salir)
+  x  D  dd                          borrar
+  /texto   n                        buscar, y el siguiente
+  :w  :w fichero  :wq  :q  :q!      guardar y salir
+  Ctrl-G                            que fichero, cuantas lineas, cuantos bytes
+  Ctrl-L                            repintar
+```
+
+`:q` con cambios sin guardar se niega y te dice que uses `:q!`. Es lo que hace
+vi, y aqui ademas es el sustituto barato de lo que no hay.
+
+### Lo que no tiene, y lo que falta de verdad
+
+Lo que falta de verdad es **deshacer**. No hay `u`, y sin `u` un `dd` en la
+linea equivocada es definitivo. El vi original tenia UN nivel de deshacer -uno
+solo- y eso no era tacanyeria: guardar el estado anterior de una linea es
+barato, guardar una historia entera necesita decidir que es "un cambio", que es
+la parte dificil y la que vim tardo veinte anyos en hacer bien. Es el paso
+siguiente.
+
+Lo demas son casos del mismo `switch`, que es lo que suele quedar cuando el
+mecanismo ya esta: no hay contadores (`3dd`, `5G`), ni copiar y pegar (`yy`,
+`p`), ni `J` para juntar lineas, ni `r` ni `cw`. Y la busqueda es texto tal
+cual: las expresiones regulares son el otro programa que habria que escribir, y
+no es este.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -5042,6 +5205,25 @@ sabe de los sucesos que hay.
   correcto. (Lo que si se saco de el es la carga de un proceso, que son
   milisegundos: `task_create_user()` reserva la ranura con el cerrojo, carga
   sin el y publica con el otra vez.)
+- `vi` no sabe DESHACER. Sin `u`, un `dd` en la linea equivocada es
+  definitivo, y lo unico que hay entre tu y el desastre es que `:q` se niegue
+  a salir con cambios. El vi original tenia un nivel, uno solo.
+- `vi` no se puede suspender: se traga el Ctrl-Z, porque pararse dejaria el
+  terminal en modo crudo y sin eco y el shell escribiendo a ciegas. Hacerlo
+  bien es devolver el terminal al pararse y recuperarlo con SIGCONT.
+- `vi` no sabe el tamanyo del terminal. No hay `ioctl` ni `TIOCGWINSZ`, asi
+  que da por hecho 80x24 y se deja corregir con las variables `LINES` y
+  `COLUMNS`. Un terminal de verdad se lo diria, y ademas avisaria por
+  `SIGWINCH` cuando cambiara.
+- `vi` guarda el fichero como un array de lineas, no como un "gap buffer".
+  Insertar un caracter mueve media linea en vez de mover un hueco, y son 8192
+  lineas de 1024 caracteres como mucho. Para ficheros de megabytes habria que
+  cambiar la estructura, no el codigo.
+- `vi` no tiene contadores (`3dd`), ni copiar y pegar, ni `J`, ni `r`, ni
+  `cw`, y la busqueda es texto tal cual: sin expresiones regulares.
+- Un mensaje de la linea de estado se queda puesto hasta que algo lo tape. El
+  modo no -eso se corrige siempre-, pero un "escrito /nota.txt" sigue ahi
+  mientras te mueves. Es lo que hace vi.
 - El shell no tiene historial, ni tuberias de mas de dos, ni `2>`.
   Redirigir stderr pide poder nombrar el descriptor de destino (`2>&1`), y
   eso es una sintaxis nueva, no una llamada nueva.
