@@ -3762,6 +3762,31 @@ hay que decirlo: **no fabrica el fallo, ensancha su ventana.** Sin el, el
 fallo sigue estando y aparece cuando le apetece, que en una prueba es peor
 que no aparecer, porque convierte un error en un misterio.
 
+### Lo mismo en la Pi, que no da lo mismo
+
+|                        | QEMU        | Pi 3B       |
+|------------------------|-------------|-------------|
+| `O_ANYADIR`            | 960 bytes, 20 20 20 | **960 bytes, 20 20 20** |
+| `lseek` + `write`      | 656 bytes, 13 14 14 | **848 bytes, 18 17 18** |
+
+La primera fila es identica, y tiene que serlo: colocar la escritura al
+final lo resuelve el servidor dentro de la peticion, y eso no depende de
+lo que tarde nadie.
+
+La segunda no. En la Pi se pierden **7 lineas de 60** donde en QEMU se
+perdian 19, con la misma ventana de 10 ms. El motivo es que ahi las
+escrituras cuestan de verdad -traerse el sector de una tarjeta lenta,
+tocarlo, devolverlo, y la FAT ademas- asi que cada proceso pasa mucho mas
+tiempo DENTRO de la escritura y quedan menos ocasiones de colarse entre el
+`lseek` y el `write`.
+
+Sigue fallando, que es lo que tiene que hacer, pero con menos margen del
+que parecia. Y eso es justo la forma en que una prueba deja de medir sin
+avisar: si la ventana se estrechara un poco mas -un tick mas corto, una
+tarjeta distinta- esta contraprueba empezaria a pasar, y parecerian buenas
+noticias. No lo serian: el `lseek` seguiria estando igual de mal, y solo
+habriamos dejado de verlo.
+
 Y fijate en lo que *no* es el problema en esa segunda mitad: los hijos
 comparten un descriptor heredado, y si escribieran sin el `lseek` saldria
 bien, porque compartirian el desplazamiento. Es la pregunta -el `lseek`,
@@ -4281,6 +4306,46 @@ ficheros no encuentra la SD, init se queda sin `/etc/rc` y el shell
 arranca sobre un sistema sin disco. Un `make clean` no es inofensivo
 cuando parte del estado de pruebas vive dentro de `build/`.
 
+## La ronda en la Pi, y lo que ensenya el retardo
+
+Los pasos 50, 51 y 52 se escribieron y se comprobaron en QEMU. Esto es lo
+que dijo el silicio, con la tarjeta de verdad y los cuatro nucleos de
+verdad:
+
+- **`anyadir`**: las dos mitades, con los numeros de la tabla de arriba.
+- **Ctrl-Z, `jobs`, `fg`**: para en la 5 y **reanuda en la 6**. El estado
+  del proceso sobrevive a la parada sin que nadie lo guarde, que es
+  exactamente lo que se afirmaba: si no se ejecuta, tampoco se mueve.
+- **Ctrl-C sobre `lento | lento`**: mueren los dos.
+- **`wc &`**: se para solo, por `SIGTTIN`.
+- **`libc`**: las veinte comprobaciones, y 4 llamadas a `write()` para
+  2000 caracteres.
+
+Nada se comporto distinto. Lo unico que cambio fue **cuando** pasan las
+cosas, y una de esas diferencias merece contarse porque se leyo como un
+fallo antes de entenderse:
+
+    / $ wc &
+      [4] en el fondo  wc
+    / $ jobs
+      [4] corriendo 22  wc
+      [4] parado   wc
+
+Dos lineas que se contradicen, y las dos son ciertas. La primera la
+imprime `jobs` en el momento en que se teclea; la segunda la imprime
+`recoger()` en el prompt siguiente. Entre una y otra, `wc` intento leer
+del teclado por primera vez y se detuvo.
+
+En QEMU no se veia asi: el programa llegaba a leer antes de que el shell
+sacara el primer prompt, y la lista ya lo daba por parado. En la Pi,
+cargar un ELF de 13 KB desde la tarjeta son unas setenta idas y venidas
+por el IPC, y eso se nota.
+
+Lo interesante es que la diferencia no es un retardo cualquiera: **un
+programa no se para al nacer, se para la primera vez que pregunta por el
+teclado.** Eso no se deduce mirando la lista de trabajos, y en QEMU los
+tiempos lo tapaban.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -4326,7 +4391,13 @@ cuando parte del estado de pruebas vive dentro de `build/`.
   pregunta, no solo la primera. El shell lo tapa anunciandolo solo al
   cambiar de estado; un Unix lo lleva en el propio proceso.
 - No hay `SIGCHLD`, asi que los cambios de estado se descubren preguntando
-  antes de cada prompt y no en el momento en que ocurren.
+  antes de cada prompt y no en el momento en que ocurren. En la Pi eso se
+  ve: un `wc &` aparece como "corriendo" en el `jobs` inmediato y como
+  "parado" en el prompt siguiente.
+- La contraprueba de `anyadir` depende del tiempo: pierde 19 lineas de 60
+  en QEMU y 7 en la Pi, con la misma ventana. Si algun dia dejara de
+  perder ninguna, no seria que el `lseek` se ha arreglado, seria que la
+  prueba ha dejado de medir.
 - No hay sesiones, ni proceso lider, ni `SIGHUP`. Con un solo terminal y
   un solo shell, una sesion seria una etiqueta que no distingue nada.
 - Dos procesos que escriban a la vez en la consola se entrelazan letra a
