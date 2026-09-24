@@ -16,6 +16,7 @@
  */
 #include <stdint.h>
 #include "ipc.h"
+#include "timer.h"
 #include "mm.h"
 #include "irq.h"
 #include "sched.h"
@@ -182,6 +183,59 @@ int port_notify(int id, uint64_t tipo)
 
     sched_unlock_irqrestore(f);
     return ok;
+}
+
+/* --- Alarmas: el tiempo, como mensaje -------------------------------------
+ *
+ * Una tabla chica: quien la pidio, a que puerto, cada cuanto y cuando toca
+ * la siguiente. Se comprueba en cada tick del reloj -es un recorrido de
+ * cuatro entradas- y se entrega con port_notify, que no espera: si el buzon
+ * del driver esta lleno, ese tick se pierde y no pasa nada, porque el
+ * siguiente llega en 10 ms. Es la misma regla que con las interrupciones.
+ *
+ * La entrada se borra sola cuando el puerto cambia de duenyo: un driver que
+ * muere no deja un reloj sonando en un puerto que ya es de otro. */
+#define MAX_ALARMAS 4
+
+static struct alarma {
+    uint64_t pid;                    /* 0 = ranura libre */
+    int      puerto;
+    uint64_t cada, proxima;
+} alarmas[MAX_ALARMAS];
+
+int alarma_poner(uint64_t pid, int puerto, uint64_t cada)
+{
+    if (port_owner(puerto) != pid) return -1;
+
+    uint64_t f = sched_lock_irqsave();
+    int libre = -1;
+    for (int i = 0; i < MAX_ALARMAS; i++) {
+        if (alarmas[i].pid == pid && alarmas[i].puerto == puerto) { libre = i; break; }
+        if (!alarmas[i].pid && libre < 0) libre = i;
+    }
+    if (libre < 0) { sched_unlock_irqrestore(f); return -1; }
+
+    if (!cada) alarmas[libre].pid = 0;                /* cancelar */
+    else {
+        alarmas[libre].pid     = pid;
+        alarmas[libre].puerto  = puerto;
+        alarmas[libre].cada    = cada;
+        alarmas[libre].proxima = timer_ticks() + cada;
+    }
+    sched_unlock_irqrestore(f);
+    return 0;
+}
+
+void alarmas_tick(uint64_t ahora)
+{
+    for (int i = 0; i < MAX_ALARMAS; i++) {
+        struct alarma *a = &alarmas[i];
+        if (!a->pid || ahora < a->proxima) continue;
+
+        if (port_owner(a->puerto) != a->pid) { a->pid = 0; continue; }
+        port_notify(a->puerto, CMSG_ALARMA);
+        a->proxima = ahora + a->cada;
+    }
 }
 
 void ipc_release_ports(uint64_t pid)

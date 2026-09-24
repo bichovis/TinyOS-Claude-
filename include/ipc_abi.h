@@ -26,7 +26,11 @@
  * es el sintoma de un protocolo que mete todo en un mensaje de tamanyo
  * fijo. Lo limpio seria separar la ruta de los datos; mientras tanto,
  * esto es un numero que se sube cuando hace falta. */
-#define MSG_DATA_MAX         512
+/* 512 eran los bytes justos de una peticion al servidor de ficheros. Desde
+ * el paso 68 un mensaje tiene que poder llevar un SECTOR entero (512 bytes)
+ * mas la cabecera que dice que sector es y a donde contestar: 544. Los
+ * programas viejos que suponian 512 siguen bien, porque data[] va al final. */
+#define MSG_DATA_MAX         544
 
 struct message {
     unsigned long from;             /* pid del remitente: lo pone el kernel */
@@ -43,6 +47,7 @@ struct message {
 #define CMSG_PRINT     1
 #define CMSG_IRQ       2    /* lo manda el KERNEL: ha llegado una interrupcion */
 #define CMSG_KLOG      3    /* lo manda el KERNEL: tiene texto que sacar      */
+#define CMSG_ALARMA    4    /* lo manda el KERNEL: ha pasado el tiempo pedido  */
 
 /* Las interrupciones que un proceso puede reclamar.
  *
@@ -473,6 +478,19 @@ struct estado {
  * la de los relojes: un driver pide "el USB", no un numero cualquiera. Darle el
  * buzon entero seria darle el mando de la placa. */
 #define SYS_dev_power    54    /* (dispositivo) -> 1 si quedo encendido    */
+
+/* --- Un reloj que llega por mensaje --------------------------------------
+ *
+ * Un driver que tiene que hacer algo cada cierto tiempo -sondear un teclado
+ * cada 10 ms- y ADEMAS atender a quien le pida cosas por su puerto no puede
+ * dormir con sleep(): mientras duerme no atiende. La salida es la misma que
+ * con las interrupciones: el tiempo tambien es un mensaje. El kernel manda
+ * CMSG_ALARMA al puerto cada 'cada' ticks, y el driver espera en msg_recv
+ * como para todo lo demas. Con cada = 0 se cancela.
+ *
+ * Solo para drivers (los que tienen MMIO concedido), y solo sobre un puerto
+ * propio: un mensaje cada 10 ms es un recurso, no un derecho. */
+#define SYS_alarma       55    /* (puerto, cada_ticks) -> 0 | -EPERM       */
 
 #define PWR_USB           3    /* el DWC2, segun la numeracion de la GPU   */
 

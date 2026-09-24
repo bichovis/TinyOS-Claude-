@@ -22,6 +22,7 @@
 #include "syscall.h"
 #include "sd.h"
 #include "fs_abi.h"
+#include "blk_abi.h"
 
 /* --- Geometria de UN volumen -----------------------------------------
  *
@@ -39,6 +40,7 @@
  */
 struct volumen {
     int      montado;
+    int      disco;              /* DISCO_SD o DISCO_USB: de donde se lee */
     int      fat32;              /* 0 = FAT16, 1 = FAT32                  */
 
     uint32_t part_lba;           /* donde empieza la particion            */
@@ -58,7 +60,7 @@ struct volumen {
 
 /* Donde cuelga cada volumen. El orden importa al buscar: se prueba el
  * punto mas largo primero, para que "/boot/x" no se lo quede "/". */
-#define MAX_MONTAJES 2
+#define MAX_MONTAJES 3           /* "/", "/boot" y "/mnt" */
 
 struct montaje {
     char           punto[16];    /* "/" o "/boot"; vacio = ranura libre   */
@@ -67,21 +69,77 @@ struct montaje {
 
 static struct montaje montajes[MAX_MONTAJES];
 
-/* Un sector cacheado: leer de la SD es caro y casi todo son relecturas
- * del mismo sitio (el directorio, o la FAT). */
-static uint8_t  cache[512];
-static uint32_t cache_lba = 0xFFFFFFFF;
+/* --- De donde salen los sectores ----------------------------------------
+ *
+ * Hasta el paso 68 aqui habia una linea: sd_read_block. La SD era el unico
+ * disco, y "leer el sector N" no necesitaba decir de donde. Con un pendrive
+ * enchufado, si: cada volumen dice de que disco es, y la capa de bloques
+ * mira ese campo y nada mas. Todo lo de arriba -FAT, directorios, nombres
+ * largos- sigue sin saber que hay dos discos, y uno de ellos al otro lado
+ * de un cable.
+ *
+ * El pendrive no lo lleva este proceso: lo lleva el driver de USB, que es
+ * quien tiene el controlador. Se le pide cada sector por mensaje (ver
+ * blk_abi.h) y se espera la respuesta en un puerto propio, distinto del de
+ * las peticiones: si llegara por PORT_FILES se mezclaria con lo que mandan
+ * los clientes. */
+#define DISCO_SD   0
+#define DISCO_USB  1
 
-static int leer(uint32_t lba, uint8_t *dst)
+static struct {
+    int      hay;
+    uint64_t puerto;             /* el del driver, donde se piden sectores */
+    uint32_t sectores;
+    char     nombre[32];
+} usb;
+static int64_t puerto_bloques = -1;   /* el nuestro, para las respuestas   */
+static void desmontar_usb(void);
+
+static int bloque_usb(uint64_t tipo, uint32_t lba, uint8_t *buf)
 {
+    static struct message m;
+    struct blk_request *b = (struct blk_request *)m.data;
+
+    if (!usb.hay) return -1;
+
+    m.type = tipo;
+    m.len  = sizeof(*b);
+    b->port = (unsigned long)puerto_bloques;
+    b->lba  = lba;
+    if (tipo == BMSG_ESCRIBIR) for (int i = 0; i < 512; i++) b->datos[i] = buf[i];
+
+    if (msg_send(usb.puerto, &m) < 0) {
+        /* El driver ya no esta: su puerto ha desaparecido. El disco, con el. */
+        printf("  [fs] el driver de USB se ha ido; /mnt deja de existir\n");
+        usb.hay = 0;
+        desmontar_usb();
+        return -1;
+    }
+    if (msg_recv((uint64_t)puerto_bloques, &m) < 0) return -1;
+    if (m.type != BMSG_OK) return -1;
+    if (tipo == BMSG_LEER) for (int i = 0; i < 512; i++) buf[i] = (uint8_t)m.data[i];
+    return 0;
+}
+
+static int leer(const struct volumen *v, uint32_t lba, uint8_t *dst)
+{
+    if (v->disco == DISCO_USB) return bloque_usb(BMSG_LEER, lba, dst);
     return sd_read_block(lba, dst);
 }
 
-static uint8_t *cached(uint32_t lba)
+/* Un sector cacheado: leer de un disco es caro y casi todo son relecturas
+ * del mismo sitio (el directorio, o la FAT). La llave es (disco, sector):
+ * el sector 100 de la SD y el 100 del pendrive no son el mismo sector. */
+static uint8_t  cache[512];
+static uint32_t cache_lba = 0xFFFFFFFF;
+static int      cache_disco = -1;
+
+static uint8_t *cached(const struct volumen *v, uint32_t lba)
 {
-    if (cache_lba != lba) {
-        if (leer(lba, cache) < 0) return 0;
-        cache_lba = lba;
+    if (cache_lba != lba || cache_disco != v->disco) {
+        if (leer(v, lba, cache) < 0) return 0;
+        cache_lba   = lba;
+        cache_disco = v->disco;
     }
     return cache;
 }
@@ -121,7 +179,7 @@ static int montar_particion(struct volumen *v, uint32_t lba)
     uint8_t bpb[512];
 
     v->montado = 0;
-    if (leer(lba, bpb) < 0) return -1;
+    if (leer(v, lba, bpb) < 0) return -1;
     if (le16(bpb + 510) != 0xAA55) return -1;
     if (le16(bpb + 11) != 512) return -1;          /* solo 512 b/sector */
 
@@ -207,7 +265,8 @@ static int montar(void)
 
     for (int i = 0; i < MAX_MONTAJES; i++) montajes[i].punto[0] = 0;
 
-    if (leer(0, mbr) < 0) return -1;
+    struct volumen sd = { 0 };          /* solo para decir de que disco */
+    if (leer(&sd, 0, mbr) < 0) return -1;
     if (le16(mbr + 510) != 0xAA55) return -1;
 
     struct volumen datos = { 0 }, arranque = { 0 };
@@ -221,7 +280,7 @@ static int montar(void)
         uint32_t lba = le32(e + 8);
         if (!lba) continue;
 
-        struct volumen v;
+        struct volumen v = { 0 };                  /* disco: la SD */
         if (montar_particion(&v, lba) < 0) continue;
 
         if (v.fat32 && !hay_datos)        { datos    = v; hay_datos    = 1; }
@@ -290,6 +349,80 @@ static struct volumen *volumen_de(const char *ruta, const char **resto)
         if (!(*resto)[0]) *resto = "/";          /* "/boot" a secas */
     }
     return &mejor->vol;
+}
+
+/* --- Montar lo que se enchufa ------------------------------------------
+ *
+ * El driver de USB avisa: "hay un disco de tantos sectores, pidemelos por
+ * este puerto". Se lee su sector 0 con la misma capa de bloques que todo lo
+ * demas -solo que con disco = USB- y se decide que es: una tabla de
+ * particiones, y entonces se monta la primera que se entienda, o un volumen
+ * FAT directamente en el sector 0, que es como vienen muchos pendrives de
+ * fabrica. El resultado cuelga de /mnt y a partir de ahi no se distingue de
+ * la SD: mismos directorios, misma FAT, mismos nombres largos. */
+static struct montaje *montaje_llamado(const char *punto)
+{
+    for (int i = 0; i < MAX_MONTAJES; i++) {
+        const char *a = montajes[i].punto; const char *b = punto; int k = 0;
+        while (a[k] && a[k] == b[k]) k++;
+        if (!a[k] && !b[k]) return &montajes[i];
+    }
+    return 0;
+}
+
+static void desmontar_usb(void)
+{
+    struct montaje *m = montaje_llamado("/mnt");
+    if (m) { m->punto[0] = 0; m->vol.montado = 0; }
+    cache_lba = 0xFFFFFFFF;
+}
+
+static int montar_usb(const struct fs_disco *d)
+{
+    usb.hay      = 1;
+    usb.puerto   = d->bloques;
+    usb.sectores = (uint32_t)d->sectores;
+    for (int i = 0; i < 31; i++) usb.nombre[i] = d->nombre[i];
+    usb.nombre[31] = 0;
+
+    struct montaje *m = montaje_llamado("/mnt");
+    if (!m) m = montaje_llamado("");
+    if (!m) { usb.hay = 0; return -1; }
+
+    struct volumen v = { 0 };
+    v.disco = DISCO_USB;
+
+    uint8_t s0[512];
+    if (leer(&v, 0, s0) < 0) { usb.hay = 0; return -1; }
+
+    int ok = 0;
+    int bpb = (s0[0] == 0xEB || s0[0] == 0xE9) && le16(s0 + 11) == 512;
+
+    if (le16(s0 + 510) == 0xAA55 && !bpb) {
+        for (int i = 0; i < 4 && !ok; i++) {
+            const uint8_t *e = s0 + 446 + i * 16;
+            uint32_t lba = le32(e + 8);
+            if (!e[4] || !lba) continue;
+            v.disco = DISCO_USB;
+            if (montar_particion(&v, lba) == 0) ok = 1;
+        }
+    } else {
+        if (montar_particion(&v, 0) == 0) ok = 1;      /* sin tabla */
+    }
+
+    if (!ok) {
+        printf("  [fs] el disco USB no tiene ningun volumen FAT que entienda\n");
+        usb.hay = 0;
+        return -1;
+    }
+
+    poner_punto(m, "/mnt");
+    m->vol = v;
+    cache_lba = 0xFFFFFFFF;
+    printf("  [fs] /mnt   FAT%d  %lu sectores/cluster  %lu clusters  (%s, %lu MB)\n",
+           v.fat32 ? 32 : 16, (uint64_t)v.sec_per_clus, (uint64_t)v.max_cluster,
+           usb.nombre, (uint64_t)usb.sectores >> 11);
+    return 0;
 }
 
 /* ====================== ESCRITURA ==================================
@@ -394,9 +527,11 @@ static int  igual_sin_caja(const char *a, const char *b);
 
 
 
-static int escribir(uint32_t lba, const uint8_t *src)
+static int escribir(const struct volumen *v, uint32_t lba, const uint8_t *src)
 {
-    if (sd_write_block(lba, src) < 0) return -1;
+    int r = (v->disco == DISCO_USB) ? bloque_usb(BMSG_ESCRIBIR, lba, (uint8_t *)src)
+                                    : sd_write_block(lba, src);
+    if (r < 0) return -1;
     cache_lba = 0xFFFFFFFF;          /* lo cacheado ya no vale */
     return 0;
 }
@@ -424,12 +559,12 @@ static void fsinfo_olvidar(struct volumen *v)
 {
     if (!v->fat32 || !v->fsinfo_lba || v->fsinfo_olvidado) return;
 
-    uint8_t *b = cached(v->fsinfo_lba);
+    uint8_t *b = cached(v, v->fsinfo_lba);
     if (!b) return;
     if (le32(b) != 0x41615252) return;          /* no es un FSInfo */
 
     for (int i = 488; i < 496; i++) b[i] = 0xFF;   /* libres y "siguiente" */
-    if (escribir(v->fsinfo_lba, b) == 0) v->fsinfo_olvidado = 1;
+    if (escribir(v, v->fsinfo_lba, b) == 0) v->fsinfo_olvidado = 1;
 }
 
 static int fat_set(struct volumen *v, uint32_t c, uint32_t valor)
@@ -444,7 +579,7 @@ static int fat_set(struct volumen *v, uint32_t c, uint32_t valor)
     for (uint32_t copia = 0; copia < v->num_fats; copia++) {
         uint32_t lba = v->fat_lba + copia * v->sec_por_fat + off / 512;
 
-        uint8_t *b = cached(lba);
+        uint8_t *b = cached(v, lba);
         if (!b) return -1;
 
         uint32_t o = off % 512;
@@ -458,7 +593,7 @@ static int fat_set(struct volumen *v, uint32_t c, uint32_t valor)
             b[o + 3] = (uint8_t)((b[o + 3] & 0xF0) | ((valor >> 24) & 0x0F));
         }
 
-        if (escribir(lba, b) < 0) return -1;
+        if (escribir(v, lba, b) < 0) return -1;
     }
     return 0;
 }
@@ -552,7 +687,7 @@ static int dir_lookup_en(struct volumen *v, uint32_t dir, const char *nombre, in
         uint32_t sl;
         if (dir_sector(v, dir, s, &sl) < 0) return -1;
 
-        uint8_t *b = cached(sl);
+        uint8_t *b = cached(v, sl);
         if (!b) return -1;
 
         for (int e = 0; e < 512; e += 32) {
@@ -592,9 +727,9 @@ static int dir_lookup_en(struct volumen *v, uint32_t dir, const char *nombre, in
  * Ojo con el "..": en FAT, el ".." del primer nivel apunta al cluster 0, y
  * el 0 quiere decir el raiz. No es un caso especial inventado por
  * nosotros, viene asi en el disco. */
-static uint32_t entrada_cluster(uint32_t lba, uint32_t off)
+static uint32_t entrada_cluster(const struct volumen *v, uint32_t lba, uint32_t off)
 {
-    uint8_t *b = cached(lba);
+    uint8_t *b = cached(v, lba);
     return b ? le16(b + off + 26) : 0;
 }
 
@@ -719,7 +854,7 @@ static int hueco_seguido(struct volumen *v, uint32_t dir, int cuantas,
         uint32_t lba;
         if (dir_sector(v, dir, s, &lba) < 0) return -1;   /* directorio lleno */
 
-        uint8_t *b = cached(lba);
+        uint8_t *b = cached(v, lba);
         if (!b) return -1;
 
         for (int e = 0; e < 512; e += 32) {
@@ -742,7 +877,7 @@ static uint8_t *entrada_en(struct volumen *v, uint32_t dir, uint32_t indice,
 {
     if (dir_sector(v, dir, indice / 16, lba) < 0) return 0;
     *off = (indice % 16) * 32;
-    return cached(*lba);
+    return cached(v, *lba);
 }
 
 /* Crear una entrada con nombre largo: la cadena VFAT y detras la corta.
@@ -797,7 +932,7 @@ static int dir_create_largo(struct volumen *v, uint32_t dir, const char *largo,
             d[hueco[i] + 1] = (uint8_t)(c >> 8);
         }
 
-        if (escribir(l, b) < 0) return -1;
+        if (escribir(v, l, b) < 0) return -1;
     }
 
     /* Y la corta, detras del todo. */
@@ -814,7 +949,7 @@ static int dir_create_largo(struct volumen *v, uint32_t dir, const char *largo,
 
     if (ultima && o + 32 < 512) d[32] = 0x00;
 
-    if (escribir(l, b) < 0) return -1;
+    if (escribir(v, l, b) < 0) return -1;
 
     *lba = l;
     *off = o;
@@ -836,7 +971,7 @@ static int dir_create_en(struct volumen *v, uint32_t dir, const char *nombre, ui
         uint32_t sl;
         if (dir_sector(v, dir, s, &sl) < 0) return -1;   /* directorio lleno */
 
-        uint8_t *b = cached(sl);
+        uint8_t *b = cached(v, sl);
         if (!b) return -1;
 
         for (int e = 0; e < 512; e += 32) {
@@ -854,7 +989,7 @@ static int dir_create_en(struct volumen *v, uint32_t dir, const char *nombre, ui
              * pararia nunca. */
             if (ultima && e + 32 < 512) d[32] = 0x00;
 
-            if (escribir(sl, b) < 0) return -1;
+            if (escribir(v, sl, b) < 0) return -1;
 
             *lba = sl;
             *off = (uint32_t)e;
@@ -905,7 +1040,7 @@ static int resolver(struct volumen *v, const char *ruta, uint32_t *dir, char *ul
         /* Componente de en medio: TIENE que ser un directorio. */
         uint32_t lba, off;
         if (dir_lookup_en(v, actual, comp, 1, &lba, &off) < 0) return -1;
-        actual = entrada_cluster(lba, off);
+        actual = entrada_cluster(v, lba, off);
     }
 }
 
@@ -1019,9 +1154,9 @@ static void tocar(uint8_t *d)
 }
 
 /* Leer y modificar un campo de la entrada de directorio. */
-static int dir_update(uint32_t lba, uint32_t off, uint32_t cluster, uint32_t tam)
+static int dir_update(const struct volumen *v, uint32_t lba, uint32_t off, uint32_t cluster, uint32_t tam)
 {
-    uint8_t *b = cached(lba);
+    uint8_t *b = cached(v, lba);
     if (!b) return -1;
 
     uint8_t *d = b + off;
@@ -1033,12 +1168,12 @@ static int dir_update(uint32_t lba, uint32_t off, uint32_t cluster, uint32_t tam
     d[30] = (uint8_t)(tam >> 16);
     d[31] = (uint8_t)(tam >> 24);
 
-    return escribir(lba, b);
+    return escribir(v, lba, b);
 }
 
-static void dir_read(uint32_t lba, uint32_t off, uint32_t *cluster, uint32_t *tam)
+static void dir_read(const struct volumen *v, uint32_t lba, uint32_t off, uint32_t *cluster, uint32_t *tam)
 {
-    uint8_t *b = cached(lba);
+    uint8_t *b = cached(v, lba);
     *cluster = b ? le16(b + off + 26) : 0;
     *tam     = b ? le32(b + off + 28) : 0;
 }
@@ -1067,7 +1202,7 @@ static int fichero_escribir(struct volumen *v, const char *nombre, uint32_t offs
     }
 
     uint32_t primero, tam;
-    dir_read(dlba, doff, &primero, &tam);
+    dir_read(v, dlba, doff, &primero, &tam);
 
     if (offset == (uint32_t)FS_AL_FINAL) offset = tam;
     if (offset > tam) return -1;
@@ -1079,7 +1214,7 @@ static int fichero_escribir(struct volumen *v, const char *nombre, uint32_t offs
     if (!primero) {
         primero = alloc_cluster(v);
         if (!primero) return -1;
-        if (dir_update(dlba, doff, primero, tam) < 0) return -1;
+        if (dir_update(v, dlba, doff, primero, tam) < 0) return -1;
     }
 
     /* Llegar hasta el cluster donde cae 'offset', creando los que falten. */
@@ -1106,11 +1241,11 @@ static int fichero_escribir(struct volumen *v, const char *nombre, uint32_t offs
         /* Leer-modificar-escribir: el sector es la unidad minima que sabe
          * mover la tarjeta, asi que cambiar tres bytes obliga a traerse
          * los 512, tocarlos y devolverlos. */
-        uint8_t *b = cached(lba);
+        uint8_t *b = cached(v, lba);
         if (!b) return -1;
         for (uint32_t i = 0; i < trozo; i++)
             b[(dentro % 512) + i] = datos[hechos + i];
-        if (escribir(lba, b) < 0) return -1;
+        if (escribir(v, lba, b) < 0) return -1;
 
         hechos += trozo;
         dentro += trozo;
@@ -1130,7 +1265,7 @@ static int fichero_escribir(struct volumen *v, const char *nombre, uint32_t offs
     /* Y lo ultimo, el tamanyo: hasta que no se apunta ahi, los bytes
      * escritos no existen para nadie. */
     if (offset + n > tam)
-        return dir_update(dlba, doff, primero, offset + n);
+        return dir_update(v, dlba, doff, primero, offset + n);
     return 0;
 }
 
@@ -1141,9 +1276,9 @@ static int fichero_crear(struct volumen *v, const char *nombre)
 
     if (dir_lookup(v, nombre, &dlba, &doff) == 0) {
         uint32_t primero, tam;
-        dir_read(dlba, doff, &primero, &tam);
+        dir_read(v, dlba, doff, &primero, &tam);
         if (primero) free_chain(v, primero);
-        return dir_update(dlba, doff, 0, 0);
+        return dir_update(v, dlba, doff, 0, 0);
     }
     return dir_create(v, nombre, &dlba, &doff);
 }
@@ -1163,7 +1298,7 @@ static int dir_vacio(struct volumen *v, uint32_t cluster)
         uint32_t lba;
         if (dir_sector(v, cluster, s, &lba) < 0) return 1;   /* se acabo */
 
-        uint8_t *b = cached(lba);
+        uint8_t *b = cached(v, lba);
         if (!b) return 0;
 
         for (int e = 0; e < 512; e += 32) {
@@ -1180,12 +1315,12 @@ static int dir_vacio(struct volumen *v, uint32_t cluster)
 /* Marcar una entrada como borrada. Es poner un 0xE5 en la primera letra
  * del nombre: el resto se queda ahi, y por eso se pueden recuperar
  * ficheros borrados. Nadie ha tocado ni los datos ni la cadena. */
-static int entrada_borrar(uint32_t lba, uint32_t off)
+static int entrada_borrar(const struct volumen *v, uint32_t lba, uint32_t off)
 {
-    uint8_t *b = cached(lba);
+    uint8_t *b = cached(v, lba);
     if (!b) return -1;
     b[off] = 0xE5;
-    return escribir(lba, b);
+    return escribir(v, lba, b);
 }
 
 /* En que numero de entrada cae un (sector, desplazamiento).
@@ -1216,12 +1351,12 @@ static int entrada_borrar_todo(struct volumen *v, uint32_t dir,
                                uint32_t lba, uint32_t off)
 {
     int idx = indice_de(v, dir, lba, off);
-    if (idx < 0) return entrada_borrar(lba, off);
+    if (idx < 0) return entrada_borrar(v, lba, off);
 
-    uint8_t *b = cached(lba);
+    uint8_t *b = cached(v, lba);
     if (!b) return -1;
 
-    /* La suma ANTES de tocar nada: cached() solo guarda un sector, y la
+    /* La suma ANTES de tocar nada: cached(v, ) solo guarda un sector, y la
      * primera vuelta del bucle se lo lleva por delante. */
     uint8_t suma = suma_83(b + off);
 
@@ -1232,10 +1367,10 @@ static int entrada_borrar_todo(struct volumen *v, uint32_t dir,
         if (p[o + 11] != 0x0F || p[o + 13] != suma) break;   /* no es suya */
 
         p[o] = 0xE5;
-        if (escribir(l, p) < 0) return -1;
+        if (escribir(v, l, p) < 0) return -1;
     }
 
-    return entrada_borrar(lba, off);
+    return entrada_borrar(v, lba, off);
 }
 
 /* Borrar un directorio vacio. */
@@ -1249,7 +1384,7 @@ static int dir_borrar(struct volumen *v, const char *ruta, int *motivo)
     if (dir_lookup_en(v, dir, ultimo, 1, &lba, &off) < 0) { *motivo = FS_ERROR; return -1; }
 
     uint32_t cluster, tam;
-    dir_read(lba, off, &cluster, &tam);
+    dir_read(v, lba, off, &cluster, &tam);
 
     if (!dir_vacio(v, cluster)) { *motivo = FS_NO_VACIO; return -1; }
 
@@ -1286,7 +1421,7 @@ static int mover(struct volumen *v, const char *origen, const char *destino,
 
     /* Lo que hay que llevarse: donde empiezan los datos, cuanto miden, y
      * si es un directorio. */
-    uint8_t *b = cached(lba_o);
+    uint8_t *b = cached(v, lba_o);
     if (!b) return -1;
 
     uint32_t cluster = le16(b + off_o + 26);
@@ -1311,7 +1446,7 @@ static int mover(struct volumen *v, const char *origen, const char *destino,
             if (subir == cluster) return -1;      /* se mete en si mismo */
             uint32_t l, o;
             if (dir_lookup_en(v, subir, "..", -1, &l, &o) < 0) break;
-            subir = entrada_cluster(l, o);
+            subir = entrada_cluster(v, l, o);
         }
     }
 
@@ -1320,7 +1455,7 @@ static int mover(struct volumen *v, const char *origen, const char *destino,
      * arregla; al reves, se habria perdido. Entre dos formas de romperse
      * se elige la que deja los datos alcanzables. */
     if (dir_create_en(v, dir_d, nom_d, attr, &lba_d, &off_d) < 0) return -1;
-    if (dir_update(lba_d, off_d, cluster, tam) < 0) return -1;
+    if (dir_update(v, lba_d, off_d, cluster, tam) < 0) return -1;
 
     /* Si es un directorio y ha cambiado de padre, su ".." apuntaba al
      * antiguo. En FAT no hay indice de padres en ningun sitio: cada hijo
@@ -1328,11 +1463,11 @@ static int mover(struct volumen *v, const char *origen, const char *destino,
     if (es_dir && dir_o != dir_d && cluster) {
         uint32_t l, o;
         if (dir_lookup_en(v, cluster, "..", -1, &l, &o) == 0) {
-            uint8_t *p = cached(l);
+            uint8_t *p = cached(v, l);
             if (!p) return -1;
             p[o + 26] = (uint8_t)(dir_d & 0xFF);
             p[o + 27] = (uint8_t)(dir_d >> 8);
-            if (escribir(l, p) < 0) return -1;
+            if (escribir(v, l, p) < 0) return -1;
         }
     }
 
@@ -1345,7 +1480,7 @@ static int fichero_borrar(struct volumen *v, const char *nombre)
     if (dir_lookup(v, nombre, &dlba, &doff) < 0) return -1;
 
     uint32_t primero, tam;
-    dir_read(dlba, doff, &primero, &tam);
+    dir_read(v, dlba, doff, &primero, &tam);
     if (primero) free_chain(v, primero);
 
     /* Borrar en FAT es poner un 0xE5 en la primera letra del nombre. El
@@ -1449,7 +1584,7 @@ static int buscar(struct volumen *v, const char *ruta, uint32_t *cluster, uint32
     uint32_t lba, off;
     if (dir_lookup_en(v, dir, ultimo, -1, &lba, &off) < 0) return -1;
 
-    uint8_t *b = cached(lba);
+    uint8_t *b = cached(v, lba);
     if (!b) return -1;
 
     *cluster = le16(b + off + 26);
@@ -1499,7 +1634,7 @@ static int listar(struct volumen *v, uint32_t dir, uint32_t indice, struct fs_in
         uint32_t lba;
         if (dir_sector(v, dir, s, &lba) < 0) return -1;
 
-        uint8_t *b = cached(lba);
+        uint8_t *b = cached(v, lba);
         if (!b) return -1;
 
         for (int e = 0; e < 512; e += 32) {
@@ -1616,10 +1751,10 @@ static int dir_nuevo(struct volumen *v, const char *ruta)
     uint8_t vacio[512];
     for (int i = 0; i < 512; i++) vacio[i] = 0;
     for (uint32_t s = 0; s < v->sec_per_clus; s++)
-        if (escribir(v->data_lba + (c - 2) * v->sec_per_clus + s, vacio) < 0) return -1;
+        if (escribir(v, v->data_lba + (c - 2) * v->sec_per_clus + s, vacio) < 0) return -1;
 
     /* "." y "..", a mano, en el primer sector. */
-    uint8_t *b = cached(v->data_lba + (c - 2) * v->sec_per_clus);
+    uint8_t *b = cached(v, v->data_lba + (c - 2) * v->sec_per_clus);
     if (!b) return -1;
 
     for (int i = 0; i < 11; i++) b[i] = ' ';
@@ -1634,12 +1769,12 @@ static int dir_nuevo(struct volumen *v, const char *ruta)
     b[58] = (uint8_t)(padre & 0xFF);
     b[59] = (uint8_t)(padre >> 8);
 
-    if (escribir(v->data_lba + (c - 2) * v->sec_per_clus, b) < 0) return -1;
+    if (escribir(v, v->data_lba + (c - 2) * v->sec_per_clus, b) < 0) return -1;
 
     /* Y ahora si, la entrada en el padre. La ultima, para que un fallo a
      * mitad no deje un directorio que se ve pero esta sin estrenar. */
     if (dir_create_en(v, padre, nombre, 0x10, &lba, &off) < 0) return -1;
-    return dir_update(lba, off, c, 0);           /* los directorios miden 0 */
+    return dir_update(v, lba, off, c, 0);           /* los directorios miden 0 */
 }
 
 /* --- Seguir la cadena de clusters ------------------------------------- */
@@ -1649,7 +1784,7 @@ static int dir_nuevo(struct volumen *v, const char *ruta)
 static uint32_t siguiente_cluster(struct volumen *v, uint32_t c)
 {
     uint32_t off = c * (v->fat32 ? 4 : 2);
-    uint8_t *b = cached(v->fat_lba + off / 512);
+    uint8_t *b = cached(v, v->fat_lba + off / 512);
     if (!b) return v->eoc;
 
     if (!v->fat32) return le16(b + (off % 512));
@@ -1685,7 +1820,7 @@ static int leer_fichero(struct volumen *v, uint32_t primero, uint32_t tam,
         if (c < 2 || c >= v->eoc) break;
 
         uint32_t lba = v->data_lba + (c - 2) * v->sec_per_clus + dentro / 512;
-        uint8_t *b = cached(lba);
+        uint8_t *b = cached(v, lba);
         if (!b) break;
 
         uint32_t en_sector = 512 - (dentro % 512);
@@ -1737,6 +1872,13 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    /* Un segundo puerto, para las respuestas de los drivers de disco. */
+    puerto_bloques = port_create(-1);
+    if (puerto_bloques < 0) {
+        printf("  [fs] no tengo puerto para hablar con los discos\n");
+        exit(1);
+    }
+
     volatile uint32_t *emmc = (volatile uint32_t *)mmio_base();
     if (!emmc) {
         printf("  [fs] no tengo el MMIO del EMMC, no puedo trabajar\n");
@@ -1777,6 +1919,14 @@ int main(int argc, char **argv)
         uint64_t quien = r->port;
         uint32_t cluster = 0, tam = 0, flags = 0;
         uint64_t mtime = 0;
+
+        /* Un driver ofrece un disco. No lleva ruta: se atiende antes de
+         * buscar en que volumen cae nada. */
+        if (pet.type == FS_DISCO) {
+            const struct fs_disco *d = (const struct fs_disco *)pet.data;
+            responder(d->port, montar_usb(d) < 0 ? FS_ERROR : FS_OK, "", 0);
+            continue;
+        }
 
         r->name[FS_PATH_MAX - 1] = 0;         /* venga de donde venga */
 

@@ -4,7 +4,7 @@
 #include "ipc_abi.h"
 #include "sync.h"
 
-#define MAX_PORTS      8
+#define MAX_PORTS     16
 #define PORT_QUEUE     8
 
 /* El puerto por el que el KERNEL recibe respuestas del servidor de
@@ -49,3 +49,8 @@ uint64_t port_owner(int id);            /* pid del duenyo, 0 si no hay      */
 int  port_recv(int id, struct message *out, uint64_t pid);  /* 0 o -1       */
 void ipc_release_ports(uint64_t pid);   /* al morir un proceso              */
 void ipc_dump(void);
+
+/* Alarmas: CMSG_ALARMA a un puerto cada tantos ticks. Las pone un driver y
+ * las dispara el tick, sin cerrojo del planificador cogido. */
+int  alarma_poner(uint64_t pid, int puerto, uint64_t cada);   /* 0 o -1 */
+void alarmas_tick(uint64_t ahora);

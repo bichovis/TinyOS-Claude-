@@ -356,6 +356,13 @@ void syscall_dispatch(struct trap_frame *f)
         break;
     }
 
+    /* El reloj como mensaje: solo drivers, y solo sobre un puerto propio. */
+    case SYS_alarma: {
+        if (!current || !current->mmio_va) { ret = -EPERM; break; }
+        ret = alarma_poner(current->pid, (int)f->x[0], f->x[1]) < 0 ? -EPERM : 0;
+        break;
+    }
+
     case SYS_clock_rate: {
         uint64_t id = f->x[0];
         if (id != CLK_EMMC && id != CLK_UART && id != CLK_CORE) { ret = -1; break; }

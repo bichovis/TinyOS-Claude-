@@ -6748,6 +6748,94 @@ En QEMU (`-device usb-storage` con una imagen de 32 MB particionada con
 Los numeros coinciden con lo que puso `diskutil`. Falta la segunda mitad:
 que el servidor de ficheros lea esos sectores y los monte en `/mnt`.
 
+## Montar lo que se enchufa
+
+La segunda mitad: que el servidor de ficheros use el pendrive y lo cuelgue
+de `/mnt`. Ha tocado tres sitios, y en cada uno la misma idea: lo que ya
+existia no se entera de que hay un disco nuevo.
+
+### El tiempo tambien es un mensaje
+
+El driver de USB tenia un bucle de "sondear el teclado, dormir un tick,
+repetir". Valia con un cliente. Con dos -el teclado y el servidor de
+ficheros pidiendo sectores- no: mientras duerme no atiende, y una lectura
+de `/mnt` esperaria hasta 10 ms por sector solo por la siesta.
+
+La salida es la del paso 58 con las interrupciones: el kernel convierte el
+reloj en un mensaje. `alarma(puerto, cada)` pide que llegue `CMSG_ALARMA`
+cada tantos ticks, y el tick lo entrega con `port_notify` desde el
+manejador, sin ningun cerrojo cogido, al lado de `klog_avisar`. Si el buzon
+del driver esta lleno, ese tick se pierde y no pasa nada: el siguiente
+llega en 10 ms. El driver ya solo hace una cosa, `msg_recv`: alarma,
+sondea el teclado; peticion de sector, la sirve; respuesta del `fs`, la
+cuenta. Una peticion lo despierta en el acto, y el canal 0 del DWC2, que es
+uno solo, nunca lo usan dos cosas a la vez, porque el bucle atiende un
+mensaje entero antes de mirar el siguiente.
+
+Solo para drivers (los que tienen MMIO concedido) y solo sobre un puerto
+propio: un mensaje cada 10 ms es un recurso, no un derecho. Y la entrada se
+borra sola cuando el puerto cambia de duenyo, para que un driver que muere
+no deje un reloj sonando en un puerto que ya es de otro.
+
+### Un sector por mensaje
+
+`blk_abi.h` es el contrato mas simple del sistema: `BMSG_LEER` y
+`BMSG_ESCRIBIR` con el numero de sector y a donde contestar, y de vuelta
+`BMSG_OK` con los 512 bytes. Para que quepan, `MSG_DATA_MAX` pasa de 512 a
+544 -sector mas cabecera-; los programas viejos siguen bien porque `data[]`
+va al final. Es un sector por viaje: no es lo mas rapido, pero es lo que
+cabe en un mensaje y lo que el servidor de ficheros ya hace por su cache de
+un sector. `MAX_PORTS` sube a 16, que con dos servidores, el kernel, init,
+el shell y el driver de USB los ocho se quedaban justos.
+
+### El `fs` con dos discos
+
+Hasta ahora `leer(lba)` era `sd_read_block`, y todo el servidor daba por
+hecho que solo habia un disco. El cambio es que cada `struct volumen` dice
+de que disco es -`DISCO_SD` o `DISCO_USB`- y la capa de bloques mira ese
+campo y nada mas: `leer(v, lba)`, `escribir(v, lba)`, `cached(v, lba)`. Ha
+habido que pasar el volumen a cuatro ayudantes que no lo llevaban
+(`entrada_cluster`, `dir_update`, `dir_read`, `entrada_borrar`); el resto
+ya lo tenia por el refactor del paso de las dos particiones. La cache de un
+sector lleva ahora la llave (disco, sector): el sector 100 de la SD y el 100
+del pendrive no son el mismo sector.
+
+Para el pendrive, el `fs` manda la peticion al puerto del driver y espera
+la respuesta en un puerto PROPIO, distinto de `PORT_FILES`: si llegara por
+el de las peticiones se mezclaria con lo que mandan los clientes. Todo lo de
+arriba -FAT, directorios, nombres largos, `write`- no sabe que uno de los
+discos esta al otro lado de un cable.
+
+### `FS_DISCO`: "hay un disco, pidemelo por aqui"
+
+El driver, al terminar de enumerar, le manda al `fs` un `FS_DISCO` con el
+puerto, los sectores y el nombre. No espera la respuesta: para montar hay
+que leer sectores, y los sectores los sirve su propio bucle; el `FS_OK`
+llega despues como un mensaje mas. El `fs` lee el sector 0 -con la misma
+capa de bloques, disco USB- y decide: tabla de particiones, y monta la
+primera que entienda; o un BPB directamente en el 0, y monta eso. El
+resultado cuelga de `/mnt`, aparece en `ls /` por la tabla de montajes, y
+si el driver muere su puerto desaparece, el `msg_send` falla y `/mnt` deja
+de existir.
+
+### La prueba
+
+En QEMU, con `-device usb-kbd` y `-device usb-storage` sobre la imagen de
+32 MB:
+
+    [fs] /mnt   FAT16  4 sectores/cluster  16325 clusters  (QEMU QEMU HARDDISK, 32 MB)
+    [usb] el disco esta montado en /mnt
+    / $ ls /mnt
+        2026-09-24 23:36        88  PEN.TXT
+        2026-09-24 23:36     <dir>  FOTOS
+    / $ write /mnt/NUEVO.TXT hola desde TinyOS por USB
+    / $ cat /mnt/NUEVO.TXT
+    hola desde TinyOS por USB
+
+Y la contraprueba que no se puede fingir: montar la imagen en el Mac
+despues y encontrar `NUEVO.TXT` con ese texto. La SD sigue igual (`t7`), y
+el teclado USB sigue escribiendo con el bucle de mensajes.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -6931,6 +7019,19 @@ que el servidor de ficheros lea esos sectores y los monte en `/mnt`.
 - La distribucion del teclado USB es la americana. Las flechas y el teclado
   numerico no estan en la tabla. El raton esta descubierto y configurado, pero
   nadie lo sondea todavia.
+- El pendrive va a un sector por mensaje y sin cache de mas de un sector:
+  un fichero de 100 KB son 200 viajes de ida y vuelta entre tres procesos.
+  Funciona; no es rapido. Y solo se enumera al arrancar: enchufarlo despues
+  no lo monta, y sacarlo mientras esta montado da errores en cada acceso
+  pero no desmonta. Falta sondear el endpoint de interrupcion del hub.
+- Cualquier proceso puede mandar un `FS_DISCO` con su propio puerto y
+  servirle al `fs` los sectores que quiera: el `fs` no tiene forma de saber
+  si quien le habla es un driver. Un proceso podria "montar" lo que
+  quisiera en /mnt.
+- Si el driver de USB muere ENTRE una peticion de sector y su respuesta, el
+  `fs` se queda esperando para siempre, y con el todo el que use ficheros.
+  Si muere en cualquier otro momento, el siguiente `msg_send` falla y /mnt
+  se desmonta limpiamente.
 - El driver de USB no pide ninguna interrupcion todavia: `GINTMSK` esta a cero
   y se pregunta mirando los registros. La IRQ 9 esta reclamada y sin usar.
 - La direccion que se le da al DWC2 lleva el alias `0xC0000000` y ese alias

@@ -175,6 +175,8 @@ static inline uint64_t uptime(void)       { return (uint64_t)syscall2(SYS_uptime
 /* 'want' es el puerto que se quiere, o -1 para el primero libre. */
 static inline int64_t port_create(int64_t want)
 { return syscall2(SYS_port_create, (uint64_t)want, 0); }
+static inline int64_t alarma(uint64_t port, uint64_t cada)
+                                          { return syscall2(SYS_alarma, port, cada); }
 static inline int64_t msg_send(uint64_t port, struct message *m)
                                           { return syscall2(SYS_send, port, (uint64_t)m); }
 static inline int64_t msg_recv(uint64_t port, struct message *m)

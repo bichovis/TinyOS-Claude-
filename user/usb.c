@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <errno.h>
 #include "syscall.h"
+#include "fs_abi.h"
+#include "blk_abi.h"
 
 /* --- Registros del DWC2 ----------------------------------------------- */
 #define PCGCCTL    0xE00    /* puertas de reloj y pinza de alimentacion      */
@@ -1099,7 +1101,7 @@ static int disco_leer(uint32_t lba, int n)
     return disco_orden(cb, 10, 1, dma_pa + OFF_SECTOR, n * 512) == n * 512 ? 0 : -1;
 }
 
-static int __attribute__((unused)) disco_escribir(uint32_t lba, int n)   /* lo usa el paso 68 */
+static int disco_escribir(uint32_t lba, int n)
 {
     uint8_t cb[10] = { 0x2A, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
                        (uint8_t)(lba >> 8), (uint8_t)lba, 0, (uint8_t)(n >> 8), (uint8_t)n, 0 };
@@ -1137,6 +1139,30 @@ static void disco_presentar_sector0(void)
         printf("  [usb]   particion %d: tipo 0x%02x, empieza en %u, %u sectores (%u MB)\n",
                i + 1, e[4], lba, tam, tam >> 11);
     }
+}
+
+/* Servir un sector al servidor de ficheros. Un mensaje, un sector: se lee o
+ * se escribe por el DMA y se contesta al puerto que diga la peticion. */
+static void disco_atender(const struct message *pet)
+{
+    const struct blk_request *b = (const struct blk_request *)pet->data;
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_SECTOR);
+    static struct message resp;
+    int ok = 0;
+
+    if (disco.hay && b->lba < disco.sectores) {
+        if (pet->type == BMSG_LEER) {
+            ok = (disco_leer((uint32_t)b->lba, 1) == 0);
+            if (ok) for (int i = 0; i < 512; i++) resp.data[i] = (char)d[i];
+        } else {
+            for (int i = 0; i < 512; i++) d[i] = b->datos[i];
+            ok = (disco_escribir((uint32_t)b->lba, 1) == 0);
+        }
+    }
+
+    resp.type = ok ? BMSG_OK : BMSG_ERROR;
+    resp.len  = (ok && pet->type == BMSG_LEER) ? 512 : 0;
+    msg_send(b->port, &resp);
 }
 
 /* --- HID: el idioma de los teclados -------------------------------------------
@@ -1947,27 +1973,74 @@ int main(int argc, char **argv)
         split_activo = 0;
     }
 
-    if (!teclado.hay) {
-        printf("  [usb] no hay teclado; me quedo aqui\n");
-        for (;;) sleep(1000);
+    /* --- 12. Un bucle de mensajes, no un bucle de sondeo --------------------
+     *
+     * Hasta el paso 67 esto era "sondear el teclado, dormir un tick, repetir".
+     * Valia mientras el driver solo tuviera un cliente: el teclado. Ahora
+     * tiene dos, y el segundo -el servidor de ficheros pidiendo sectores- no
+     * puede esperar a que el driver se despierte de un sleep.
+     *
+     * La salida es la misma que con las interrupciones en el paso 58: que el
+     * tiempo tambien sea un mensaje. El kernel manda CMSG_ALARMA a este
+     * puerto cada tick, y el driver hace UNA cosa: esperar en msg_recv. Si lo
+     * que llega es la alarma, sondea el teclado; si es una peticion de
+     * sector, la sirve y contesta; si es la respuesta del servidor de
+     * ficheros, la cuenta. Una peticion del fs despierta al driver en el
+     * acto, y el teclado sigue mirandose cada 10 ms. Y el canal 0 del DWC2,
+     * que es uno solo, nunca lo usan dos cosas a la vez, porque el bucle
+     * atiende un mensaje entero antes de mirar el siguiente. */
+    if (teclado.hay) {
+        if (alarma((uint64_t)puerto, 1) < 0)
+            printf("  [usb] el kernel no me da el reloj: sin teclado\n");
+        else
+            printf("  [usb] teclado USB listo: lo que teclees va a la consola\n");
     }
 
-    /* --- 12. Sondear el teclado --------------------------------------------
-     *
-     * Un teclado USB no avisa: se le pregunta. Cada bInterval milisegundos el
-     * anfitrion le manda un IN a su endpoint de interrupcion, y el teclado
-     * contesta NAK -"nada"- o un informe de 8 bytes. Aqui se pregunta cada
-     * 10 ms, que es un tick, y se traduce lo que llega.
-     *
-     * Y esto es lo que en un sistema con planificador de micro-tramas haria
-     * el hardware; aqui lo hace un proceso, que es la razon de que solo sirva
-     * para teclados y ratones y no para nada que pida mas de cien preguntas
-     * por segundo. */
-    printf("  [usb] teclado USB listo: lo que teclees va a la consola\n");
+    /* Y si hay un disco, decirselo al servidor de ficheros: que lo monte en
+     * /mnt y que pida los sectores por este puerto. No se espera la
+     * respuesta aqui -para montar tiene que leer sectores, y los sectores
+     * los sirve este bucle-: llegara como un mensaje mas. */
+    if (disco.hay) {
+        struct message m;
+        struct fs_disco *fd = (struct fs_disco *)m.data;
+        m.type = FS_DISCO; m.len = sizeof(*fd);
+        fd->port = (unsigned long)puerto;
+        fd->bloques = (unsigned long)puerto;
+        fd->sectores = disco.sectores;
+        int i = 0;
+        for (const char *c = disco.vendedor; *c && i < 30; c++) fd->nombre[i++] = *c;
+        fd->nombre[i++] = ' ';
+        for (const char *c = disco.producto; *c && i < 31; c++) fd->nombre[i++] = *c;
+        fd->nombre[i] = 0;
+        if (msg_send(PORT_FILES, &m) < 0)
+            printf("  [usb] no hay servidor de ficheros a quien ofrecerle el disco\n");
+    }
+
+    if (!teclado.hay && !disco.hay)
+        printf("  [usb] ni teclado ni disco; me quedo esperando\n");
 
     uint8_t inf[64];
     unsigned vueltas = 0;
     for (;;) {
+        struct message m;
+        if (msg_recv((uint64_t)puerto, &m) < 0) break;
+
+        if (m.type == CMSG_IRQ) { irq_ack(IRQ_USB); continue; }
+
+        if (m.type == FS_OK)    { printf("  [usb] el disco esta montado en /mnt\n"); continue; }
+        if (m.type == FS_ERROR) { printf("  [usb] el servidor de ficheros no ha podido montar el disco\n"); continue; }
+
+        if (m.type == BMSG_LEER || m.type == BMSG_ESCRIBIR) {
+            disco_atender(&m);
+            continue;
+        }
+
+        if (m.type != CMSG_ALARMA || !teclado.hay) continue;
+
+        /* Un teclado USB no avisa: se le pregunta. Cada bInterval milisegundos
+         * el anfitrion le manda un IN a su endpoint de interrupcion, y el
+         * teclado contesta NAK -"nada"- o un informe de 8 bytes. Aqui se
+         * pregunta a cada alarma, que es un tick, y se traduce lo que llega. */
         if (detallado && ++vueltas % 200 == 0)
             printf("  [usb] sondeos: %u con datos, %u NAK, %u NYET, %u sin respuesta, %u error; %u teclas entregadas\n",
                    sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error, teclas_dadas);
@@ -1988,6 +2061,6 @@ int main(int argc, char **argv)
             printf("  [usb] el teclado ha fallado al sondearlo\n");
             sleep(50);
         }
-        sleep(1);
     }
+    return 0;
 }

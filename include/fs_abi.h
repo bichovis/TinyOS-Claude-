@@ -31,6 +31,18 @@
 #define FS_RMDIR       8     /* name -> lo borra, si esta vacio            */
 #define FS_RENAME      9     /* name + data=destino -> lo mueve            */
 
+/* Un driver avisa de que hay un disco nuevo -un pendrive- y de por que
+ * puerto se le piden sectores (ver blk_abi.h). El servidor lo monta en
+ * /mnt y contesta FS_OK o FS_ERROR al puerto que venga en la peticion. */
+#define FS_DISCO      10     /* data = struct fs_disco -> FS_OK | FS_ERROR */
+
+struct fs_disco {
+    unsigned long port;              /* a donde contestar                  */
+    unsigned long bloques;           /* el puerto que sirve los sectores   */
+    unsigned long sectores;
+    char          nombre[32];        /* "TOSHIBA TransMemory"              */
+};
+
 /* --- Respuestas (message.type) ---------------------------------------- */
 #define FS_OK        100
 #define FS_ERROR     101     /* no existe, o la tarjeta fallo              */

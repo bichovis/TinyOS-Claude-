@@ -318,6 +318,10 @@ void irq_handle(void)
          * no pasa por aqui: de eso se encarga el propio conserver, que vacia
          * el anillo justo despues de entregar lo que ha leido. */
         klog_avisar();
+
+        /* Y los relojes que los drivers hayan pedido: tambien mensajes, y
+         * tambien desde aqui, sin ningun cerrojo cogido. */
+        alarmas_tick(timer_ticks());
     }
 
     /* Un toque de otro nucleo. Reconocerlo es escribir de vuelta lo que se
