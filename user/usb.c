@@ -617,6 +617,105 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
     return 0;
 }
 
+/* --- Una transferencia de control sin datos ----------------------------
+ *
+ * SET_ADDRESS, SET_CONFIGURATION, SET_PORT_FEATURE: el SETUP lo dice todo y no
+ * hay fase de datos. Lo que si hay es la de estado, y aqui va AL REVES que en
+ * una lectura: es un IN de cero bytes. Es el dispositivo confirmando "hecho"
+ * con un paquete vacio, y va en DATA1 como todo estado. */
+static int control_escribir(int addr, int mps, uint8_t tipo, uint8_t peticion,
+                            uint16_t valor, uint16_t indice)
+{
+    volatile uint8_t *setup = (volatile uint8_t *)(dma_va + OFF_SETUP);
+
+    setup[0] = tipo;
+    setup[1] = peticion;
+    setup[2] = (uint8_t)(valor & 0xFF);
+    setup[3] = (uint8_t)(valor >> 8);
+    setup[4] = (uint8_t)(indice & 0xFF);
+    setup[5] = (uint8_t)(indice >> 8);
+    setup[6] = 0;
+    setup[7] = 0;
+
+    uint32_t r;
+
+    r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_SETUP,
+                    dma_pa + OFF_SETUP, 8);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el SETUP no paso", r); return -1; }
+
+    r = canal_hacer(0, 1, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                    dma_pa + OFF_DATOS, 0);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el estado no paso", r); return -1; }
+
+    return 0;
+}
+
+/* --- "Quien eres": el descriptor de dispositivo, en dos veces -------------
+ *
+ * Ocho bytes con paquetes de ocho, porque es lo unico que se sabe seguro de un
+ * desconocido; en el byte 7 viene su tamanyo de paquete, y con ese se pide el
+ * resto. Devuelve el tamanyo de paquete, o -1. */
+static int presentarse(int addr, unsigned *vendedor, unsigned *producto,
+                       unsigned *clase)
+{
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+
+    if (control_leer(addr, 8, 0x80, 6, 0x0100, 0, 8) < 0) return -1;
+
+    int mps0 = d[7];
+    if (mps0 != 8 && mps0 != 16 && mps0 != 32 && mps0 != 64) {
+        printf("  [usb] tamanyo de paquete %d: no es legal\n", mps0);
+        return -1;
+    }
+
+    if (control_leer(addr, mps0, 0x80, 6, 0x0100, 0, 18) < 0) return -1;
+
+    *vendedor = (unsigned)(d[8]  | (d[9]  << 8));
+    *producto = (unsigned)(d[10] | (d[11] << 8));
+    *clase    = d[4];
+
+    printf("  [usb] descriptor:");
+    for (int i = 0; i < 18; i++) printf(" %02x", (unsigned)d[i]);
+    printf("\n");
+    printf("  [usb] direccion %d: es %04x:%04x, clase %u, USB %x.%02x, "
+           "paquete maximo %d\n", addr, *vendedor, *producto, *clase,
+           (unsigned)d[3], (unsigned)d[2], mps0);
+    return mps0;
+}
+
+/* --- Lo que se le pide a un hub -------------------------------------------
+ * Son peticiones de CLASE (bit 5 del tipo) y las de puerto van "al otro"
+ * (recipient 3), con el numero de puerto en wIndex. Los numeros son los de la
+ * norma y no tienen mas misterio que estar escritos en una tabla. */
+#define HUB_GET_DESCRIPTOR   0xA0   /* clase, dispositivo, IN  */
+#define HUB_GET_PORT_STATUS  0xA3   /* clase, puerto,      IN  */
+#define HUB_SET_PORT_FEATURE 0x23   /* clase, puerto,      OUT */
+#define HUB_CLR_PORT_FEATURE 0x23
+
+#define PORT_RESET            4
+#define PORT_POWER            8
+#define C_PORT_CONNECTION    16
+#define C_PORT_RESET         20
+
+/* wPortStatus */
+#define PS_CONNECTION   (1u << 0)
+#define PS_ENABLE       (1u << 1)
+#define PS_RESET        (1u << 4)
+#define PS_POWER        (1u << 8)
+#define PS_LOW_SPEED    (1u << 9)
+#define PS_HIGH_SPEED   (1u << 10)
+
+static int hub_estado_puerto(int addr, int mps, int puerto,
+                             unsigned *estado, unsigned *cambio)
+{
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+    if (control_leer(addr, mps, HUB_GET_PORT_STATUS, 0, 0, (uint16_t)puerto, 4) < 0)
+        return -1;
+    *estado = (unsigned)(d[0] | (d[1] << 8));
+    *cambio = (unsigned)(d[2] | (d[3] << 8));
+    return 0;
+}
+
 /* --- Lo demas de la configuracion ------------------------------------- */
 /* --- La configuracion, en el orden de una implementacion que funciona ----
  *
@@ -1008,74 +1107,158 @@ int main(int argc, char **argv)
     printf("  [usb] reloj del enlace puesto para %s (HCFG = 0x%08x)\n",
            velocidad(p), (unsigned int)leer(HCFG));
 
-    /* --- 6. Y ahora a hablar ------------------------------------------
-     *
-     * El primer GET_DESCRIPTOR pide OCHO bytes, y no es timidez: todavia no se
-     * sabe cual es el tamanyo maximo de paquete de este dispositivo, y ese dato
-     * esta DENTRO del descriptor, en el byte 7. Ocho es el minimo que la norma
-     * obliga a soportar a todo el mundo, asi que con ocho se puede leer cuanto
-     * se puede leer. El descriptor te dice como leer el descriptor. */
-    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+    /* --- 6. Y ahora a hablar: quien eres ----------------------------------- */
+    unsigned vendedor = 0, producto = 0, clase = 0;
+    int mps0 = -1;
 
-    /* Y si no contesta, se prueba con la otra forma de direccion ANTES de
-     * rendirse. Las dos posibilidades son "el chip quiere la direccion de bus"
-     * y "el chip quiere la fisica", y averiguarlo probando cuesta un segundo;
-     * averiguarlo a base de arrancar la placa cuesta un arranque por intento. */
-    /* Y con reintentos, que no es pereza: un XACTERR en la primera peticion a
-     * un dispositivo que acaba de salir de un reset es normal. El canal ya
-     * reintenta por su cuenta las veces que diga MC, pero un dispositivo que
-     * todavia se esta despertando puede fallar las tres. Cualquier pila de USB
-     * de verdad reintenta la enumeracion. */
-    int ok = 0;
-    for (int intento = 1; intento <= 4 && !ok; intento++) {
-        if (control_leer(0, 8, 0x80, 6, 0x0100, 0, 8) == 0) { ok = 1; break; }
-        printf("  [usb] intento %d fallido; espero y repito\n", intento);
-        sleep(5);
+    for (int intento = 1; intento <= 4 && mps0 < 0; intento++) {
+        mps0 = presentarse(0, &vendedor, &producto, &clase);
+        if (mps0 < 0) { printf("  [usb] intento %d fallido; espero y repito\n", intento); sleep(5); }
     }
-
-    if (!ok) {
+    if (mps0 < 0) {
         printf("  [usb] el dispositivo no contesta a un GET_DESCRIPTOR\n");
-        printf("  [usb] estado del puerto: HPRT0 = 0x%08x, trama %u\n",
-               (unsigned int)leer(HPRT0),
-               (unsigned int)(leer(HFNUM) & 0x3FFF));
         for (;;) sleep(1000);
     }
 
-    int mps0 = d[7];
-    printf("  [usb] contesta: descriptor de %u bytes, USB %x.%02x, "
-           "paquete maximo %d\n",
-           (unsigned int)d[0], (unsigned int)d[3], (unsigned int)d[2], mps0);
-
-    if (mps0 != 8 && mps0 != 16 && mps0 != 32 && mps0 != 64) {
-        printf("  [usb] ese tamanyo de paquete no es legal; me paro aqui\n");
+    if (vendedor == 0x0424) printf("  [usb] 0x0424 es SMSC: esto es el hub con la Ethernet dentro\n");
+    if (clase != 9) {
+        printf("  [usb] no es un hub (clase %u): no se que hacer con el todavia\n", clase);
         for (;;) sleep(1000);
     }
 
-    /* Y ahora el descriptor entero, con el tamanyo de paquete que acaba de
-     * decir. Son 18 bytes y los interesantes estan del 8 al 11. */
-    if (control_leer(0, mps0, 0x80, 6, 0x0100, 0, 18) < 0) {
-        printf("  [usb] el segundo GET_DESCRIPTOR fallo\n");
+    /* --- 7. Darle una direccion --------------------------------------------
+     *
+     * Hasta aqui se le ha hablado a la direccion 0, que es la que tiene todo
+     * dispositivo recien reseteado. Sirve mientras solo hay uno; en cuanto el
+     * hub encienda sus puertos, lo que cuelgue de ellos tambien saldra del
+     * reset en la 0, y dos en la misma direccion es que ninguno oye.
+     *
+     * SET_ADDRESS es la unica peticion que se contesta desde la direccion
+     * VIEJA: el dispositivo cambia de nombre despues de decir "hecho". Y la
+     * norma le da 2 ms para acostumbrarse antes de que nadie le hable por el
+     * nuevo. */
+    #define DIR_HUB 1
+    if (control_escribir(0, mps0, 0x00, 5, DIR_HUB, 0) < 0) {
+        printf("  [usb] no acepta SET_ADDRESS\n");
+        for (;;) sleep(1000);
+    }
+    sleep(1);
+    printf("  [usb] el hub ya es la direccion %d\n", DIR_HUB);
+
+    /* --- 8. Configurarlo ---------------------------------------------------
+     *
+     * Un dispositivo sin configurar es un descriptor y nada mas: no tiene
+     * endpoints activos ni hace su trabajo. La configuracion se elige por su
+     * numero, que esta en el byte 5 de su descriptor de configuracion, y casi
+     * siempre es 1. Se lee en vez de suponerlo. */
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+    if (control_leer(DIR_HUB, mps0, 0x80, 6, 0x0200, 0, 9) < 0) {
+        printf("  [usb] no me da su descriptor de configuracion\n");
+        for (;;) sleep(1000);
+    }
+    int config = d[5];
+    if (control_escribir(DIR_HUB, mps0, 0x00, 9, (uint16_t)config, 0) < 0) {
+        printf("  [usb] no acepta SET_CONFIGURATION(%d)\n", config);
+        for (;;) sleep(1000);
+    }
+    printf("  [usb] configuracion %d puesta: %u bytes de descriptores, %u interfaz%s\n",
+           config, (unsigned)(d[2] | (d[3] << 8)), (unsigned)d[4],
+           d[4] == 1 ? "" : "es");
+
+    /* --- 9. El descriptor de hub, que es de clase --------------------------
+     * Cuantos puertos, y cuanto tardan en tener corriente buena despues de
+     * encenderlos: bPwrOn2PwrGood, en unidades de 2 ms. */
+    if (control_leer(DIR_HUB, mps0, HUB_GET_DESCRIPTOR, 6, 0x2900, 0, 9) < 0) {
+        printf("  [usb] no me da su descriptor de hub\n");
+        for (;;) sleep(1000);
+    }
+    int puertos   = d[2];
+    int pwr_good  = d[5] * 2;             /* ms */
+    printf("  [usb] hub de %d puertos, caracteristicas 0x%04x, "
+           "corriente buena a los %d ms\n",
+           puertos, (unsigned)(d[3] | (d[4] << 8)), pwr_good);
+    if (puertos > 8) puertos = 8;
+
+    /* --- 10. Encender los puertos y ver que hay ----------------------------
+     * Y esperar lo que el hub dijo, mas el antirrebote de siempre: lo que se
+     * enchufa hace contacto varias veces mientras entra. */
+    for (int pt = 1; pt <= puertos; pt++)
+        control_escribir(DIR_HUB, mps0, HUB_SET_PORT_FEATURE, 3, PORT_POWER, (uint16_t)pt);
+    sleep((pwr_good + 100) / 10 + 1);
+
+    int con_algo = 0;
+    for (int pt = 1; pt <= puertos; pt++) {
+        unsigned est = 0, cam = 0;
+        if (hub_estado_puerto(DIR_HUB, mps0, pt, &est, &cam) < 0) {
+            printf("  [usb] puerto %d: no contesta al estado\n", pt);
+            continue;
+        }
+        printf("  [usb] puerto %d: 0x%04x/0x%04x %s%s%s\n", pt, est, cam,
+               (est & PS_POWER)      ? "alimentado" : "SIN alimentar",
+               (est & PS_CONNECTION) ? ", HAY ALGO"  : ", vacio",
+               (est & PS_CONNECTION)
+                 ? ((est & PS_HIGH_SPEED) ? " (alta)" :
+                    (est & PS_LOW_SPEED)  ? " (baja)" : " (completa)") : "");
+        if ((est & PS_CONNECTION) && !con_algo) con_algo = pt;
+    }
+
+    if (!con_algo) {
+        printf("  [usb] ningun puerto tiene nada; en la Pi 3B eso no puede ser\n");
         for (;;) sleep(1000);
     }
 
-    unsigned vendedor  = (unsigned)(d[8]  | (d[9]  << 8));
-    unsigned producto  = (unsigned)(d[10] | (d[11] << 8));
+    /* --- 11. Resetear ese puerto y preguntarle a lo que hay detras ---------
+     *
+     * Un reset de puerto de hub es lo mismo que el del puerto raiz, pero se
+     * pide por mensaje: SET_PORT_FEATURE(RESET), y el hub lo mantiene el
+     * tiempo que toca y avisa con C_PORT_RESET cuando ha acabado. Lo que sale
+     * del reset esta otra vez en la direccion 0, que ahora esta libre porque
+     * el hub ya vive en la 1. */
+    control_escribir(DIR_HUB, mps0, HUB_CLR_PORT_FEATURE, 1, C_PORT_CONNECTION, (uint16_t)con_algo);
+    control_escribir(DIR_HUB, mps0, HUB_SET_PORT_FEATURE, 3, PORT_RESET, (uint16_t)con_algo);
 
-    printf("  [usb] descriptor:");
-    for (int i = 0; i < 18; i++) printf(" %02x", (unsigned)d[i]);
-    printf("\n");
+    unsigned est = 0, cam = 0;
+    int listo = 0;
+    for (int v = 0; v < 50 && !listo; v++) {
+        sleep(1);
+        if (hub_estado_puerto(DIR_HUB, mps0, con_algo, &est, &cam) < 0) break;
+        if (!(est & PS_RESET) && (est & PS_ENABLE)) listo = 1;
+    }
+    control_escribir(DIR_HUB, mps0, HUB_CLR_PORT_FEATURE, 1, C_PORT_RESET, (uint16_t)con_algo);
 
-    printf("  [usb] es %04x:%04x, clase %u, %u configuracion%s\n",
-           vendedor, producto, (unsigned)d[4], (unsigned)d[17],
-           d[17] == 1 ? "" : "es");
+    if (!listo) {
+        printf("  [usb] el puerto %d no sale del reset (0x%04x)\n", con_algo, est);
+        for (;;) sleep(1000);
+    }
 
-    if (vendedor == 0x0424)
-        printf("  [usb] 0x0424 es SMSC: esto es el hub con la Ethernet dentro\n");
-    if (d[4] == 9)
-        printf("  [usb] clase 9 es HUB, que es lo que tiene que ser\n");
+    if (!(est & PS_HIGH_SPEED)) {
+        /* Detras de un hub de alta velocidad, un dispositivo de baja o completa
+         * necesita transferencias partidas -HCSPLT-, y eso es el planificador
+         * de micro-tramas que este driver no tiene. La Ethernet es de alta. */
+        printf("  [usb] el puerto %d es de %s velocidad: necesita transferencias "
+               "partidas, y eso es otro paso\n", con_algo,
+               (est & PS_LOW_SPEED) ? "baja" : "completa");
+        for (;;) sleep(1000);
+    }
 
-    /* Y aqui se para. Lo siguiente es ponerle una direccion con SET_ADDRESS,
-     * leerle el descriptor de hub y encender sus puertos, que es donde
-     * aparecera la Ethernet. */
+    sleep(2);
+    printf("  [usb] puerto %d reseteado, alta velocidad; le pregunto quien es\n", con_algo);
+
+    unsigned v2 = 0, p2 = 0, c2 = 0;
+    int mps2 = -1;
+    for (int intento = 1; intento <= 4 && mps2 < 0; intento++) {
+        mps2 = presentarse(0, &v2, &p2, &c2);
+        if (mps2 < 0) sleep(5);
+    }
+    if (mps2 < 0) {
+        printf("  [usb] lo que hay en el puerto %d no contesta\n", con_algo);
+        for (;;) sleep(1000);
+    }
+    if (v2 == 0x0424 && p2 == 0xec00)
+        printf("  [usb] 0424:ec00 es la Ethernet del LAN9514. Ahi esta la red.\n");
+
+    /* Y aqui se para. Lo que hay ahora es la Ethernet en la direccion 0 con
+     * su descriptor leido; lo siguiente es darle direccion y configuracion,
+     * leer sus endpoints bulk, y hablarle en su idioma: el del LAN9514. */
     for (;;) sleep(1000);
 }

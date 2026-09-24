@@ -6375,12 +6375,48 @@ proponer. Eso es lo que me llevo del paso, mas que el USB.
 Los instrumentos -la lectura decodificada, el SETUP releido de memoria- se
 quedan puestos: el paso siguiente los va a necesitar.
 
+## El hub, y lo que cuelga de el
+
+Con la conversacion abierta, lo que le falta a un hub para ser un hub son cuatro
+peticiones, y cada una ensenya algo del USB que no se ve en el descriptor.
+
+**`SET_ADDRESS`.** Hasta aqui se le ha hablado a la direccion 0, la de todo
+dispositivo recien reseteado. Sirve mientras solo hay uno; en cuanto el hub
+encienda sus puertos, lo que cuelgue de ellos tambien saldra del reset en la 0, y
+dos en la misma direccion es que ninguno oye. Es la unica peticion que se
+contesta desde la direccion vieja: el dispositivo cambia de nombre *despues* de
+decir "hecho", y la norma le da 2 ms para acostumbrarse.
+
+**`SET_CONFIGURATION`.** Un dispositivo sin configurar es un descriptor y nada
+mas: no tiene endpoints activos ni hace su trabajo. El numero de configuracion se
+lee del descriptor -byte 5- en vez de suponer que es 1, que casi siempre lo es.
+
+**El descriptor de hub**, que es de *clase*: bit 5 del tipo de peticion, y
+`wValue` 0x2900. Dice cuantos puertos hay y cuanto tardan en tener corriente
+buena despues de encenderlos, `bPwrOn2PwrGood`, en unidades de 2 ms.
+
+**Y los puertos.** `SET_PORT_FEATURE(POWER)` en cada uno, esperar lo que el hub
+dijo mas el antirrebote de siempre, y `GET_PORT_STATUS`, que es una peticion "al
+otro" -recipient 3- con el numero de puerto en `wIndex`. Devuelve dos palabras:
+el estado y lo que ha cambiado, y ahi estan la conexion y la velocidad.
+
+Un reset de puerto de hub es lo mismo que el del puerto raiz pero se pide por
+mensaje, y el hub lo mantiene el tiempo que toca y avisa con `C_PORT_RESET`. Lo
+que sale del reset esta otra vez en la direccion 0, que ahora esta libre porque
+el hub ya vive en la 1.
+
+Y una frontera que hay que declarar: detras de un hub de alta velocidad, un
+dispositivo de baja o completa velocidad necesita **transferencias partidas**,
+que es el planificador de micro-tramas que este driver no tiene. En QEMU se ve
+enseguida -el pendrive emulado es de velocidad completa y el driver se para ahi
+diciendolo-. La Ethernet del LAN9514 es de alta, y por eso hasta aqui no ha hecho
+falta.
+
 ### Lo que falta
 
-Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es
-la que usa todo dispositivo recien reseteado-, leerle el descriptor de hub, y
-encender sus puertos. Ahi es donde aparecera la Ethernet, en un puerto interno
-del propio hub.
+La Ethernet en la direccion 0 con su descriptor leido: darle direccion y
+configuracion, leer sus endpoints bulk, y hablarle en su idioma, que ya no es el
+del USB sino el del LAN9514.
 
 ## Limitaciones conocidas
 
