@@ -4217,6 +4217,70 @@ la lista seguia diciendo "parado" de algo que ya no existia. Lo que no hay
 que repetir no es la pregunta, es el **anuncio**: se dice al cambiar de
 estado, no cada vez que se mira.
 
+## La otra mitad del mismo fallo de despliegue
+
+Dos pasos mas tarde, `make sd` volvio a morder, y por lo contrario de la
+vez anterior.
+
+El sintoma en la Pi era este:
+
+    / $ ls
+      LS.ELF: no lo encuentro. PATH=/usr/bin:.
+    / $ cd usr
+    /usr $ cd bin
+      no puedo entrar en bin
+
+`/usr` estaba y `/usr/bin` no. El codigo no tenia nada que ver: con una
+tarjeta recien generada, los mismos binarios listaban y entraban
+perfectamente. Lo que habia pasado estaba en la receta:
+
+    rm -rf "$(DATA)/USR/BIN";
+    cp -R $(BUILD)/sddata/. "$(DATA)/";
+    echo "Copiado a $(DATA) (el raiz).";
+
+**Borra primero y copia despues, sin comprobar ninguna de las dos cosas.**
+Los `;` no son `&&`, asi que si el `cp` falla la receta sigue; y el ultimo
+comando es un `echo`, que devuelve cero, asi que **make dice que todo fue
+bien**. El resultado es un destino peor que antes de empezar y un mensaje
+diciendo que esta al dia.
+
+La vez anterior la leccion fue que una herramienta que nunca borra deja el
+destino contando la historia entera. Esta es el reverso exacto: **una que
+borra sin comprobar deja el destino sin nada, y encima te felicita.** Las
+dos mitades son la misma regla vista de los dos lados — un despliegue
+tiene que dejar el destino en un estado conocido, y *saber* que lo ha
+dejado ahi.
+
+Ahora la receta hace tres cosas que antes no hacia:
+
+- **Mira el origen antes de tocar el destino.** Si `build/sddata/USR/BIN`
+  esta vacio, se niega y no borra nada. Lo primero que hay que proteger no
+  es la copia, es lo que ya estaba.
+- **Encadena con `&&`** y aborta si el `cp` falla, en vez de seguir.
+- **Cuenta lo que ha llegado** y lo compara con lo que salio, y comprueba
+  que el `kernel8.img` de la tarjeta es byte a byte el recien compilado.
+  Verificar despues de copiar cuesta una linea y es la unica forma de que
+  "Copiado" quiera decir algo.
+
+Y dice en que dispositivo escribe (`/Volumes/DATA -> disk4s2`), porque
+cuando hay una tarjeta de verdad y una imagen de pruebas montadas a la
+vez, macOS llama a la segunda `DATA 1` y el nombre que uno teclea de
+memoria puede apuntar a cualquiera de las dos. Es el mismo peligro del
+que ya se protege `sdtest`, un escalon mas abajo.
+
+### Y un descuido mio, mas tonto y mas facil de repetir
+
+El paso anterior terminaba con un `make clean` para comprobar que todo
+compilaba desde cero. Compilaba. Lo que no hice fue volver a generar
+`build/sd.img`, que es lo que `make run` usa:
+
+    SDOPT = $(if $(wildcard $(SDIMG)),-drive file=$(SDIMG)...,)
+
+Sin imagen, QEMU arranca **sin tarjeta** y en silencio: el servidor de
+ficheros no encuentra la SD, init se queda sin `/etc/rc` y el shell
+arranca sobre un sistema sin disco. Un `make clean` no es inofensivo
+cuando parte del estado de pruebas vive dentro de `build/`.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que

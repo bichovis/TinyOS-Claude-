@@ -300,15 +300,33 @@ sd: sdcard
 	@cp -R $(BUILD)/sdcard/. "$(SD)/"
 	@if [ -n "$(DATA)" ]; then                                            \
 	   test -d "$(DATA)" || { echo "No existe $(DATA)"; exit 1; };        \
-	   rm -rf "$(DATA)/USR/BIN";                                          \
-	   cp -R $(BUILD)/sddata/. "$(DATA)/";                                \
-	   echo "Copiado a $(DATA) (el raiz).";                               \
+	   n=$$(ls $(BUILD)/sddata/USR/BIN/*.ELF 2>/dev/null | wc -l | tr -d ' '); \
+	   test "$$n" -gt 0 || {                                              \
+	     echo "  $(BUILD)/sddata/USR/BIN esta vacio: no borro nada.";      \
+	     echo "  Haz 'make sdcard' primero.";                              \
+	     exit 1; };                                                        \
+	   echo "  $(DATA) -> $$(diskutil info -plist "$(DATA)" 2>/dev/null |  \
+	         plutil -extract DeviceIdentifier raw - 2>/dev/null)";          \
+	   rm -rf "$(DATA)/USR/BIN" &&                                        \
+	   cp -R $(BUILD)/sddata/. "$(DATA)/" || {                            \
+	     echo "  LA COPIA HA FALLADO y USR/BIN se ha quedado a medias.";   \
+	     exit 1; };                                                        \
+	   sync;                                                               \
+	   m=$$(ls "$(DATA)"/[Uu][Ss][Rr]/[Bb][Ii][Nn]/*.ELF 2>/dev/null | wc -l | tr -d ' '); \
+	   test "$$m" -eq "$$n" || {                                          \
+	     echo "  MAL: iban $$n programas y han llegado $$m.";              \
+	     exit 1; };                                                        \
+	   echo "  Copiado a $(DATA) (el raiz): $$m programas.";               \
 	 else                                                                 \
 	   echo "AVISO: sin DATA=... no se han copiado los programas.";        \
 	   echo "       Usa: make sd SD=$(SD) DATA=/Volumes/DATA";             \
 	 fi
 	@sync
-	@echo "Copiado a $(SD) (el /boot)."
+	@test -s "$(SD)/kernel8.img" || { echo "  MAL: no hay kernel8.img en $(SD)"; exit 1; }
+	@cmp -s $(BUILD)/kernel8.img "$(SD)/kernel8.img" || {                  \
+	   echo "  MAL: el kernel de $(SD) no es el que acabas de compilar.";  \
+	   exit 1; }
+	@echo "Copiado a $(SD) (el /boot): kernel8.img al dia."
 	@echo "Expulsalas y arranca la Pi."
 
 clean:
