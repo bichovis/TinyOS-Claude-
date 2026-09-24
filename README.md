@@ -6440,13 +6440,76 @@ el codigo pero deja de imprimirse: fue lo que destapo la L2 de la VideoCore y se
 guarda para el siguiente dispositivo que no conteste. Con la conversacion
 funcionando son dos lineas por peticion, y lo normal no se anuncia.
 
+## Hablar con lo lento a traves de lo rapido
+
+El receptor Logitech del puerto 3 es de velocidad completa y cuelga de un hub
+de alta. El cable entre el anfitrion y el hub va a 480 Mbit/s, y el receptor no
+lo entiende. Lo que hace el USB 2.0 es que el hub **traduzca**: el anfitrion le
+manda la transaccion en alta velocidad -*start split*-, el hub la hace por su
+cuenta en velocidad completa con el dispositivo, y el anfitrion vuelve mas tarde
+a por el resultado -*complete split*-. Si vuelve pronto, el hub dice NYET,
+"todavia no", y hay que volver.
+
+### Lo que dije y no era verdad
+
+En el paso 58 escribi que esto necesitaba una fuente de tiempo de 125
+microsegundos, y que sin ella no habia teclado. Es cierto para lo periodico de
+verdad -isocrono, video- donde cada trozo tiene su micro-trama asignada. Un
+teclado son unos pocos bytes cada 8 o 10 ms, y las pilas de bare metal de la Pi
+llevan anyos leyendo teclados detras de este mismo hub sin FIQ: la particion se
+hace **sincrona**, start, esperar, complete, repetir si NYET.
+
+Lo lei en tres sitios -Linux, USPi y CherryUSB- antes de escribirlo, y la
+maquina de estados es la misma en los tres:
+
+```
+  start split    -> ACK:  el hub la acepto; a por el complete split
+                 -> NAK:  el hub no tiene sitio; volver a empezar
+  complete split -> NYET: el hub no ha terminado; esperar y repetir
+                 -> NAK:  el DISPOSITIVO dijo que no; volver a empezar
+                 -> XferCompl: hecho
+```
+
+El DWC2 hace la mecanica de cada mitad por hardware. Lo que pone el software es
+a quien -`HCSPLT`: direccion del hub y numero de puerto- y en que mitad esta.
+
+### La regla que solo estaba en Linux
+
+Y sin la que nada de esto funciona: en modo partido el nucleo mueve **un paquete
+por ciclo**. `dwc2_hc_start_transfer` lo dice sin comentario: `num_packets = 1`,
+`xfer_len = max_packet`. Una lectura de 18 bytes con paquetes de 8 son tres
+ciclos start/complete, con el PID alternando entre ellos y un paquete corto
+marcando el final. Y el complete split de un OUT se programa con **cero** bytes,
+para que el nucleo no vuelva a pedirle datos a la FIFO.
+
+USPi y CherryUSB dan por hecho eso y no lo dicen. Es la clase de detalle que no
+sale de leer una implementacion sino de leer tres.
+
+### Y esperar lo justo
+
+Entre el start y el complete, el hub necesita el tiempo de hacer la transaccion
+lenta: una trama de velocidad completa, 1 ms. Un `sleep()` aqui son 10 ms, diez
+veces mas. Asi que se espera mirando el contador de micro-tramas del propio
+nucleo -`HFNUM`, que a alta velocidad avanza cada 125 us- hasta que hayan pasado
+ocho. Es la primera vez que el driver usa el reloj del USB como reloj.
+
+### El recorrido
+
+Cada puerto con algo se resetea, se le mira la velocidad, y esa velocidad decide
+**como** se le habla: de alta, directamente, como al hub; de completa o baja,
+partido a traves del hub, y si es de baja, ademas se le dice al canal. Y cada
+uno recibe una direccion segun aparece: la 1 es del hub y a partir de la 2 por
+orden de puerto.
+
+En QEMU el raiz emulado es de velocidad completa, asi que la particion no se
+activa nunca -no hay nada rapido por medio- y el pendrive del hub se enumera
+directo y recibe la direccion 2. La particion de verdad solo la prueba la placa.
+
 ### Lo que falta
 
-La Ethernet en la direccion 0 con su descriptor leido: darle direccion y
-configuracion, leer su descriptor de configuracion para encontrar los endpoints
-bulk, y hablarle en su idioma, que ya no es el del USB sino el del LAN9514: sus
-registros se leen y escriben con peticiones *vendor* por el endpoint 0, y las
-tramas van por bulk con una cabecera propia delante.
+El HID: configurar el receptor, leer su descriptor de configuracion para
+encontrar los endpoints de interrupcion, y leer una tecla. Y luego la Ethernet,
+que ya esta en su direccion esperando.
 
 ## Limitaciones conocidas
 

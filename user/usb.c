@@ -165,6 +165,33 @@
 #define HCI_MALO  (HCI_AHBERR | HCI_STALL | HCI_XACTERR | HCI_BBLERR | \
                    HCI_FRMOVRUN | HCI_DATATGLERR)
 
+/* --- HCSPLT: hablar con lo lento a traves de lo rapido ---------------------
+ *
+ * Un dispositivo de velocidad completa o baja detras de un hub de alta no
+ * puede hablar directamente con el anfitrion: el cable entre los dos va a 480
+ * Mbit/s y el dispositivo no lo entiende. Lo que hace el USB 2.0 es que el
+ * hub TRADUZCA: el anfitrion le manda al hub la transaccion en alta velocidad
+ * ("start split"), el hub la hace por su cuenta en velocidad completa con el
+ * dispositivo, y el anfitrion vuelve mas tarde a por el resultado ("complete
+ * split"). Si vuelve demasiado pronto el hub contesta NYET -"todavia no"- y
+ * hay que volver a preguntar.
+ *
+ * El DWC2 hace la mecanica de cada mitad por hardware; lo que pone el
+ * software es a quien -direccion del hub y numero de puerto- y en que mitad
+ * esta. Bits de Linux, drivers/usb/dwc2/hw.h. */
+#define SPLT_ENA        (1u << 31)
+#define SPLT_COMPLETE   (1u << 16)
+#define SPLT_XACT_ALL   (3u << 14)    /* la transaccion entera, no un trozo */
+#define SPLT_HUB(a)     ((uint32_t)((a) & 0x7F) << 7)
+#define SPLT_PUERTO(p)  ((uint32_t)((p) & 0x7F))
+
+/* El contexto de particion del dispositivo con el que se esta hablando. Cero
+ * mientras se habla con algo de alta velocidad, o directamente con el raiz. */
+static int split_activo;      /* 1 = las transferencias van partidas */
+static int split_hub;         /* direccion del hub que traduce */
+static int split_puerto;      /* y su puerto */
+static int dispositivo_baja;  /* 1 = el dispositivo es de BAJA velocidad */
+
 /* --- Y la direccion que hay que darle al chip, que NO es la fisica -----
  *
  * Esto es de las cosas que fallan en silencio y cuestan un dia.
@@ -392,7 +419,8 @@ static void fifos_repartir(void)
  * interrupciones antes de que una transferencia funcione es depurar dos cosas
  * a la vez. */
 static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
-                            int addr, int ep, int pid, uint64_t pa, int bytes)
+                            int addr, int ep, int pid, uint64_t pa, int bytes,
+                            int csplit)
 {
     int paquetes = bytes ? (bytes + mps - 1) / mps : 1;
 
@@ -411,7 +439,16 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
     escribir(HCINTMSK(canal), 0);
     escribir(HCINT(canal), 0xFFFFFFFF);
     escribir(HAINTMSK, leer(HAINTMSK) | (1u << canal));
-    escribir(HCSPLT(canal), 0);         /* sin particion: cuelga del raiz */
+
+    /* Partida o no, y si lo es, en que mitad. Lo decide el contexto del
+     * dispositivo, no quien llama: quien llama solo sabe que quiere leer un
+     * descriptor. */
+    if (split_activo)
+        escribir(HCSPLT(canal), SPLT_ENA | SPLT_XACT_ALL | SPLT_HUB(split_hub) |
+                                SPLT_PUERTO(split_puerto) |
+                                (csplit ? SPLT_COMPLETE : 0));
+    else
+        escribir(HCSPLT(canal), 0);         /* cuelga del raiz, o es de alta */
 
     /* --- Las caracteristicas del canal, SIN habilitarlo todavia -----------
      *
@@ -423,7 +460,8 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
      * llevaba ya un rato en su sitio. */
     escribir(HCCHAR(canal), HCC_MC(1) | HCC_ADDR(addr) | HCC_TIPO(tipo) |
                             (entrada ? HCC_IN : 0) | HCC_EP(ep) |
-                            HCC_MPS(mps));
+                            HCC_MPS(mps) |
+                            (dispositivo_baja ? HCC_LOWSPEED : 0));
 
     escribir(HCTSIZ(canal), HCT_PID(pid) | HCT_PAQUETES(paquetes) |
                             HCT_BYTES(bytes));
@@ -515,6 +553,100 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
     return 0;
 }
 
+/* Esperar n micro-tramas mirando el contador del propio nucleo. A alta
+ * velocidad avanza cada 125 us, asi que 8 son una trama de velocidad completa:
+ * el tiempo que el hub necesita para hacer por su cuenta la transaccion lenta.
+ * Un sleep() aqui seria diez veces mas de lo que hace falta. */
+static void esperar_microtramas(int n)
+{
+    uint32_t desde = leer(HFNUM) & 0x3FFF;
+    for (int v = 0; v < 2000000; v++)
+        if (((leer(HFNUM) - desde) & 0x3FFF) >= (uint32_t)n) return;
+}
+
+/* --- Una transferencia, partida o no ----------------------------------------
+ *
+ * Si el dispositivo es de alta velocidad -o cuelga del raiz- esto es una
+ * llamada a canal_hacer y nada mas. Si no, es la maquina de estados de la
+ * particion, que sale de leer a Linux, USPi y CherryUSB y es la misma en los
+ * tres:
+ *
+ *   start split   -> ACK:  el hub la ha aceptado; a por el complete split
+ *                 -> NAK:  el hub no tiene sitio; volver a empezar
+ *   complete split-> NYET: el hub no ha terminado; esperar y repetir
+ *                 -> NAK:  el DISPOSITIVO dijo que no; volver a empezar
+ *                 -> XferCompl: hecho
+ *
+ * Y una regla que solo esta en Linux y sin la que nada de esto funciona: en
+ * modo partido el nucleo mueve UN paquete por ciclo (dwc2_hc_start_transfer:
+ * num_packets = 1, xfer_len = max_packet). Una lectura de 18 bytes con
+ * paquetes de 8 son tres ciclos, con el PID alternando entre ellos y un
+ * paquete corto marcando el final. Y el complete split de un OUT se programa
+ * con CERO bytes, para que el nucleo no vuelva a pedirle datos a la FIFO. */
+static int ultimo_recibido;   /* bytes que llegaron en la ultima lectura */
+
+static uint32_t canal_transferir(int entrada, int tipo, int mps, int addr,
+                                 int ep, int pid, uint64_t pa, int bytes)
+{
+    if (!split_activo) {
+        uint32_t r = canal_hacer(0, entrada, tipo, mps, addr, ep, pid, pa, bytes, 0);
+        int programado = entrada ? ((bytes + mps - 1) / mps) * mps : bytes;
+        if (!bytes) programado = 0;
+        ultimo_recibido = programado - (int)(ultimo_hctsiz & 0xFFFF);
+        return r;
+    }
+
+    int hecho = 0;
+    int quedan = bytes;
+    ultimo_recibido = 0;
+
+    /* Un paquete por ciclo, hasta que se acaben o llegue uno corto. Un OUT de
+     * cero bytes -el estado- es un ciclo con cero. */
+    do {
+        int trozo = quedan < mps ? quedan : mps;
+        uint32_t r = 0;
+        int listo = 0;
+
+        for (int vuelta = 0; vuelta < 40 && !listo; vuelta++) {
+            /* Start split: para un OUT lleva los datos; para un IN, el
+             * tamanyo del paquete que se espera. */
+            r = canal_hacer(0, entrada, tipo, mps, addr, ep, pid, pa + hecho,
+                            entrada ? mps : trozo, 0);
+            if (r & HCI_MALO) return r;
+            if (r & HCI_NAK) { esperar_microtramas(8); continue; }
+            if (!(r & HCI_ACK)) { esperar_microtramas(8); continue; }
+
+            /* Complete split: repetir mientras el hub diga NYET. */
+            for (int c = 0; c < 40; c++) {
+                esperar_microtramas(8);
+                r = canal_hacer(0, entrada, tipo, mps, addr, ep, pid, pa + hecho,
+                                entrada ? mps : 0, 1);
+                if (r & HCI_MALO)      return r;
+                if (r & HCI_NYET)      continue;
+                if (r & HCI_NAK)       break;          /* de nuevo desde el start */
+                if (r & HCI_XFERCOMPL) { listo = 1; break; }
+            }
+        }
+        if (!listo) return r ? r : 0;
+
+        if (entrada) {
+            int llego = mps - (int)(ultimo_hctsiz & 0xFFFF);
+            ultimo_recibido += llego;
+            hecho  += llego;
+            quedan -= llego;
+            if (llego < mps) break;                    /* paquete corto: fin */
+        } else {
+            hecho  += trozo;
+            quedan -= trozo;
+        }
+
+        /* El siguiente paquete va con el otro PID. */
+        pid = (pid == PID_DATA1) ? PID_DATA0 : PID_DATA1;
+    } while (quedan > 0);
+
+    return HCI_XFERCOMPL | HCI_CHHLTD;
+}
+
 /* Por que fallo, en palabras. Con estos nombres delante, un HCINT deja de ser
  * un numero: STALL es "el dispositivo dice que no entiende eso", XACTERR es
  * "no ha contestado o ha contestado mal", BBLERR es "ha hablado mas de lo que
@@ -574,12 +706,12 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
 
     uint32_t r;
 
-    r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_SETUP,
-                    dma_pa + off_setup, 8);
+    r = canal_transferir(0, EP_CONTROL, mps, addr, 0, PID_SETUP,
+                         dma_pa + off_setup, 8);
     if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el SETUP no paso", r); return -1; }
 
-    r = canal_hacer(0, 1, EP_CONTROL, mps, addr, 0, PID_DATA1,
-                    dma_pa + OFF_DATOS, bytes);
+    r = canal_transferir(1, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                         dma_pa + OFF_DATOS, bytes);
     if (!(r & HCI_XFERCOMPL)) { quejarse_canal("los datos no llegaron", r); return -1; }
 
     /* El testigo: lo que el chip dice que recibio, contra lo que se pidio. En
@@ -591,13 +723,10 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
      * conteste; pero con la conversacion funcionando, son dos lineas por cada
      * peticion y la regla de esta casa es que lo normal no se anuncia. */
     if (detallado) {
-        int paquetes  = (bytes + mps - 1) / mps;
-        int programado = paquetes * mps;
-        int restante  = (int)(ultimo_hctsiz & 0xFFFF);
-        printf("  [usb]   lectura de %d (programados %d, SETUP en +%lu): "
+        printf("  [usb]   lectura de %d (SETUP en +%lu): "
                "HCINT 0x%03x, HCTSIZ 0x%08x -> recibidos %d, HCDMA avanzo %ld\n",
-               bytes, programado, (unsigned long)off_setup, (unsigned int)r,
-               (unsigned int)ultimo_hctsiz, programado - restante,
+               bytes, (unsigned long)off_setup, (unsigned int)r,
+               (unsigned int)ultimo_hctsiz, ultimo_recibido,
                (long)(ultimo_hcdma - (dma_bus ? BUS(dma_pa + OFF_DATOS)
                                               : (uint32_t)(dma_pa + OFF_DATOS))));
         printf("  [usb]   SETUP tal como esta en memoria:");
@@ -605,8 +734,8 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
         printf("\n");
     }
 
-    r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_DATA1,
-                    dma_pa + OFF_DATOS, 0);
+    r = canal_transferir(0, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                         dma_pa + OFF_DATOS, 0);
     if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el estado no paso", r); return -1; }
 
     /* ¿Ha escrito alguien aqui? Si sigue todo con el patron, el DMA fue a otra
@@ -645,12 +774,12 @@ static int control_escribir(int addr, int mps, uint8_t tipo, uint8_t peticion,
 
     uint32_t r;
 
-    r = canal_hacer(0, 0, EP_CONTROL, mps, addr, 0, PID_SETUP,
-                    dma_pa + OFF_SETUP, 8);
+    r = canal_transferir(0, EP_CONTROL, mps, addr, 0, PID_SETUP,
+                         dma_pa + OFF_SETUP, 8);
     if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el SETUP no paso", r); return -1; }
 
-    r = canal_hacer(0, 1, EP_CONTROL, mps, addr, 0, PID_DATA1,
-                    dma_pa + OFF_DATOS, 0);
+    r = canal_transferir(1, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                         dma_pa + OFF_DATOS, 0);
     if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el estado no paso", r); return -1; }
 
     return 0;
@@ -710,6 +839,29 @@ static int presentarse(int addr, unsigned *vendedor, unsigned *producto,
 #define PS_POWER        (1u << 8)
 #define PS_LOW_SPEED    (1u << 9)
 #define PS_HIGH_SPEED   (1u << 10)
+
+static int hub_estado_puerto(int addr, int mps, int puerto,
+                             unsigned *estado, unsigned *cambio);
+
+/* Resetear un puerto del hub y esperar a que salga habilitado. Deja en
+ * *estado lo que dijo el hub, que es donde esta la velocidad. */
+static int hub_resetear_puerto(int addr, int mps, int puerto, unsigned *estado)
+{
+    unsigned cam = 0;
+    int listo = 0;
+
+    control_escribir(addr, mps, HUB_CLR_PORT_FEATURE, 1, C_PORT_CONNECTION, (uint16_t)puerto);
+    control_escribir(addr, mps, HUB_SET_PORT_FEATURE, 3, PORT_RESET, (uint16_t)puerto);
+
+    for (int v = 0; v < 50 && !listo; v++) {
+        sleep(1);
+        if (hub_estado_puerto(addr, mps, puerto, estado, &cam) < 0) return -1;
+        if (!(*estado & PS_RESET) && (*estado & PS_ENABLE)) listo = 1;
+    }
+    control_escribir(addr, mps, HUB_CLR_PORT_FEATURE, 1, C_PORT_RESET, (uint16_t)puerto);
+    sleep(2);                          /* recuperacion tras el reset */
+    return listo ? 0 : -1;
+}
 
 static int hub_estado_puerto(int addr, int mps, int puerto,
                              unsigned *estado, unsigned *cambio)
@@ -1192,7 +1344,8 @@ int main(int argc, char **argv)
         control_escribir(DIR_HUB, mps0, HUB_SET_PORT_FEATURE, 3, PORT_POWER, (uint16_t)pt);
     sleep((pwr_good + 100) / 10 + 1);
 
-    int con_algo = 0;
+    int con_algo[8];
+    int n_con_algo = 0;
     for (int pt = 1; pt <= puertos; pt++) {
         unsigned est = 0, cam = 0;
         if (hub_estado_puerto(DIR_HUB, mps0, pt, &est, &cam) < 0) {
@@ -1205,66 +1358,76 @@ int main(int argc, char **argv)
                (est & PS_CONNECTION)
                  ? ((est & PS_HIGH_SPEED) ? " (alta)" :
                     (est & PS_LOW_SPEED)  ? " (baja)" : " (completa)") : "");
-        if ((est & PS_CONNECTION) && !con_algo) con_algo = pt;
+        if (est & PS_CONNECTION) con_algo[n_con_algo++] = pt;
     }
 
-    if (!con_algo) {
+    if (!n_con_algo) {
         printf("  [usb] ningun puerto tiene nada; en la Pi 3B eso no puede ser\n");
         for (;;) sleep(1000);
     }
 
-    /* --- 11. Resetear ese puerto y preguntarle a lo que hay detras ---------
+    /* --- 11. Cada puerto con algo: resetear, ver la velocidad, preguntar ---
      *
-     * Un reset de puerto de hub es lo mismo que el del puerto raiz, pero se
-     * pide por mensaje: SET_PORT_FEATURE(RESET), y el hub lo mantiene el
-     * tiempo que toca y avisa con C_PORT_RESET cuando ha acabado. Lo que sale
-     * del reset esta otra vez en la direccion 0, que ahora esta libre porque
-     * el hub ya vive en la 1. */
-    control_escribir(DIR_HUB, mps0, HUB_CLR_PORT_FEATURE, 1, C_PORT_CONNECTION, (uint16_t)con_algo);
-    control_escribir(DIR_HUB, mps0, HUB_SET_PORT_FEATURE, 3, PORT_RESET, (uint16_t)con_algo);
+     * Y darle una direccion a cada uno segun aparece, porque lo que sale del
+     * reset esta en la 0 y el siguiente tambien va a salir en la 0. La 1 es
+     * del hub; a partir de la 2, por orden de puerto.
+     *
+     * La velocidad decide COMO se le habla. De alta: directamente, como al
+     * hub. De completa o baja: partido, a traves del hub, que es el que sabe
+     * hablar lento. Y si es de baja, ademas hay que decirselo al canal. */
+    int siguiente_dir = 2;
+    int raiz_alta = HPRT_SPD(leer(HPRT0)) == 0;
 
-    unsigned est = 0, cam = 0;
-    int listo = 0;
-    for (int v = 0; v < 50 && !listo; v++) {
-        sleep(1);
-        if (hub_estado_puerto(DIR_HUB, mps0, con_algo, &est, &cam) < 0) break;
-        if (!(est & PS_RESET) && (est & PS_ENABLE)) listo = 1;
+    for (int i = 0; i < n_con_algo; i++) {
+        int pt = con_algo[i];
+        unsigned est = 0;
+
+        if (hub_resetear_puerto(DIR_HUB, mps0, pt, &est) < 0) {
+            printf("  [usb] el puerto %d no sale del reset (0x%04x)\n", pt, est);
+            continue;
+        }
+
+        int alta = (est & PS_HIGH_SPEED) != 0;
+        int baja = (est & PS_LOW_SPEED)  != 0;
+
+        split_activo     = raiz_alta && !alta;
+        split_hub        = DIR_HUB;
+        split_puerto     = pt;
+        dispositivo_baja = baja;
+
+        printf("  [usb] puerto %d reseteado, velocidad %s%s; le pregunto quien es\n",
+               pt, alta ? "alta" : baja ? "baja" : "completa",
+               split_activo ? " (a traves del hub, partido)" : "");
+
+        unsigned v2 = 0, p2 = 0, c2 = 0;
+        int mps2 = -1;
+        for (int intento = 1; intento <= 4 && mps2 < 0; intento++) {
+            mps2 = presentarse(0, &v2, &p2, &c2);
+            if (mps2 < 0) sleep(5);
+        }
+        if (mps2 < 0) {
+            printf("  [usb] lo que hay en el puerto %d no contesta\n", pt);
+            split_activo = 0;
+            continue;
+        }
+
+        if (v2 == 0x0424 && p2 == 0xec00)
+            printf("  [usb] 0424:ec00 es la Ethernet del LAN9514. Ahi esta la red.\n");
+        if (v2 == 0x046d)
+            printf("  [usb] 0x046d es Logitech: el receptor del teclado y el raton\n");
+
+        if (control_escribir(0, mps2, 0x00, 5, (uint16_t)siguiente_dir, 0) < 0) {
+            printf("  [usb] no acepta SET_ADDRESS(%d)\n", siguiente_dir);
+        } else {
+            sleep(1);
+            printf("  [usb] el del puerto %d ya es la direccion %d\n", pt, siguiente_dir);
+            siguiente_dir++;
+        }
+        split_activo = 0;
     }
-    control_escribir(DIR_HUB, mps0, HUB_CLR_PORT_FEATURE, 1, C_PORT_RESET, (uint16_t)con_algo);
 
-    if (!listo) {
-        printf("  [usb] el puerto %d no sale del reset (0x%04x)\n", con_algo, est);
-        for (;;) sleep(1000);
-    }
-
-    if (!(est & PS_HIGH_SPEED)) {
-        /* Detras de un hub de alta velocidad, un dispositivo de baja o completa
-         * necesita transferencias partidas -HCSPLT-, y eso es el planificador
-         * de micro-tramas que este driver no tiene. La Ethernet es de alta. */
-        printf("  [usb] el puerto %d es de %s velocidad: necesita transferencias "
-               "partidas, y eso es otro paso\n", con_algo,
-               (est & PS_LOW_SPEED) ? "baja" : "completa");
-        for (;;) sleep(1000);
-    }
-
-    sleep(2);
-    printf("  [usb] puerto %d reseteado, alta velocidad; le pregunto quien es\n", con_algo);
-
-    unsigned v2 = 0, p2 = 0, c2 = 0;
-    int mps2 = -1;
-    for (int intento = 1; intento <= 4 && mps2 < 0; intento++) {
-        mps2 = presentarse(0, &v2, &p2, &c2);
-        if (mps2 < 0) sleep(5);
-    }
-    if (mps2 < 0) {
-        printf("  [usb] lo que hay en el puerto %d no contesta\n", con_algo);
-        for (;;) sleep(1000);
-    }
-    if (v2 == 0x0424 && p2 == 0xec00)
-        printf("  [usb] 0424:ec00 es la Ethernet del LAN9514. Ahi esta la red.\n");
-
-    /* Y aqui se para. Lo que hay ahora es la Ethernet en la direccion 0 con
-     * su descriptor leido; lo siguiente es darle direccion y configuracion,
-     * leer sus endpoints bulk, y hablarle en su idioma: el del LAN9514. */
+    /* Y aqui se para, con cada dispositivo en su direccion. Lo siguiente es
+     * el HID: configurar el receptor, encontrar sus endpoints de interrupcion
+     * y leer una tecla. */
     for (;;) sleep(1000);
 }
