@@ -167,6 +167,16 @@ static void dump(struct trap_frame *f, uint64_t index)
 
 void panic(const char *msg)
 {
+    /* Lo PRIMERO: quitarle la UART a quien la tenga.
+     *
+     * Desde el paso 59, el texto del kernel va a un anillo que vacia el
+     * driver de consola. En un panico eso no sirve: el kernel se para aqui
+     * mismo, no vuelve a EL0, y el proceso que tendria que sacar el anillo no
+     * va a ejecutarse nunca mas. Un panico que se quedara en el anillo seria
+     * una maquina muerta sin decir por que, que es la unica cosa peor que
+     * morirse. */
+    uart_panico_toma_el_mando();
+
     uart_puts("\n*** PANIC: ");
     uart_puts(msg);
     uart_puts(" ***\nSistema detenido.\n");

@@ -45,3 +45,25 @@ int  uart_modo(int nuevo);
 /* Tirar la entrada pendiente: la linea a medias y lo ya entregado. Lo
  * llaman Ctrl-C y Ctrl-Z. */
 void uart_descartar_entrada(void);
+
+/* --- Ceder la UART, o dejar de ser dos drivers -------------------------
+ *
+ * Cuando un proceso reclama la UART, el kernel deja de escribir en el
+ * hardware y su texto se va a un anillo que ese proceso vacia. Es lo que
+ * convierte dos escritores en uno, y sin eso los dos se pisan en la FIFO de
+ * transmision y se pierden caracteres. Ver uart.c.
+ *
+ * Las dos las llama irq.c en el mismo sitio donde cambia de manos el
+ * teclado: es un solo dispositivo y se entrega entero. */
+void     uart_ceder(void);
+void     uart_recuperar(void);
+void     uart_panico_toma_el_mando(void);   /* lo llama panic() */
+
+/* Texto de un proceso. A diferencia del del kernel NO se puede perder, asi
+ * que si el anillo se llena esta espera a que lo vacien: control de flujo.
+ * Devuelve los bytes aceptados. */
+int64_t  uart_escribir_texto(const char *s, uint64_t n);
+
+uint64_t uart_klog_hay(void);               /* bytes esperando */
+uint64_t uart_klog_perdidos(void);          /* los que no cupieron */
+uint64_t uart_klog_saca(char *dst, uint64_t n);

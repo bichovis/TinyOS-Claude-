@@ -10,6 +10,10 @@ void     irq_send_resched(uint64_t core);  /* "mirate el turno" a otro nucleo */
 int      irq_register(uint64_t irq, int puerto);
 int      irq_ack(uint64_t irq);
 void     irq_release_port(int puerto);
+
+/* ¿Es ese proceso el duenyo de esa interrupcion? Lo usa la llamada que saca
+ * el texto del kernel: solo el duenyo de la UART puede leerlo. */
+int      irq_es_duenyo(uint64_t irq, uint64_t pid);
 extern uint64_t irq_avisos_perdidos;
 void     irq_handle(void);      /* lo llama el vector IRQ desde vectors.S */
 uint64_t irq_count(void);              /* atendidas entre los cuatro nucleos */

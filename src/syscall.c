@@ -21,6 +21,10 @@
 
 extern struct mutex *console_mutex(void);
 
+/* El trozo que se saca del anillo del kernel de una vez. Va en la pila del
+ * kernel, que es UNA pagina, asi que no puede ser grande. */
+#define BOUNCE_KLOG  256
+
 /* Un puntero que viene de EL0 NO es de fiar: puede apuntar al kernel, a un
  * periferico o a memoria de otro proceso. Antes de tocarlo hay que
  * comprobar que el proceso tiene derecho a leerlo, y eso lo sabe la MMU.
@@ -685,6 +689,24 @@ void syscall_dispatch(struct trap_frame *f)
         if (!task_en_primer_plano()) { ret = -EPERM; break; }
         ret = uart_modo((int)(int64_t)f->x[0]);
         break;
+
+    /* Sacar texto del anillo del kernel. Solo el duenyo de la consola, que
+     * es el unico que puede escribirlo: darselo a cualquiera seria dejar que
+     * un proceso le robara al conserver los mensajes del kernel. */
+    case SYS_klog: {
+        if (!irq_es_duenyo(IRQ_UART, current ? current->pid : 0))
+            { ret = -EPERM; break; }
+
+        char tmp[BOUNCE_KLOG];
+        uint64_t n = f->x[1];
+        if (n > sizeof(tmp)) n = sizeof(tmp);
+        if (!user_rango(f->x[0], n)) { ret = -EFAULT; break; }
+
+        uint64_t hay = uart_klog_saca(tmp, n);
+        if (hay && copy_to_user(f->x[0], tmp, hay) != 0) { ret = -EFAULT; break; }
+        ret = (int64_t)hay;
+        break;
+    }
 
     /* Un tramo de DMA. Devuelve la virtual y escribe la fisica donde le
      * digan; sin puntero, la fisica no se cuenta -que es legitimo: un

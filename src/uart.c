@@ -293,11 +293,245 @@ static void uart_release(uint64_t f)
 uint64_t uart_begin(void)        { return uart_acquire(); }
 void     uart_end(uint64_t f)    { uart_release(f); }
 
-static void putc_raw(char c)
+/* --- El anillo del kernel, o dejar de ser duenyo de la UART -----------
+ *
+ * Hasta el paso 59 habia DOS escritores sobre la misma PL011: el kernel, con
+ * su cerrojo, y el conserver, que escribe desde EL0 y no puede coger un
+ * cerrojo del kernel. Los dos hacen literalmente las mismas dos lineas:
+ *
+ *     while (FR & FR_TXFF) { }      // esperar hueco
+ *     DR = c;                       // escribir
+ *
+ * Y ese par no es indivisible. Los dos pueden ver hueco cuando queda UNO,
+ * los dos escriben, y la PL011 tira el segundo sin decir nada. No es que el
+ * texto se entrelace: es que se PIERDE. En la Pi, al arrancar, de 158
+ * caracteres salieron 71. El 55% destruido, en silencio.
+ *
+ * La solucion no es un cerrojo compartido -un proceso de EL0 con un spinlock
+ * del kernel cogido y desalojado por el planificador deja al kernel girando-.
+ * Es que haya UN escritor. Y como el que tiene que serlo es el que tiene el
+ * dispositivo concedido, lo que hace el kernel es CEDER: cuando el conserver
+ * reclama la UART, el texto del kernel deja de ir al hardware y va a un
+ * anillo, y el conserver lo saca y lo imprime con su propio escritor.
+ *
+ * Es lo que hace cualquier kernel de verdad, y tiene nombre: un anillo de
+ * mensajes del kernel que alguien vacia. De propina, esto le da al proyecto
+ * un sitio donde mirar lo que el kernel dijo, que antes se iba por el cable
+ * sin dejar rastro.
+ *
+ * putc_raw es el unico sitio donde hace falta decidirlo, porque es el cuello
+ * de botella: TODO byte que el kernel manda al hardware pasa por aqui. */
+#define KLOG_SIZE   4096
+
+static char              klog[KLOG_SIZE];
+static volatile uint32_t klog_head, klog_tail;
+static volatile uint64_t klog_perdidos;
+static volatile int      klog_desviar;   /* 1 = el texto va al anillo */
+
+/* Donde duerme quien escribe y no cabe. Ver uart_escribir_texto. */
+static struct waitqueue  klog_espacio;
+
+/* Se mete siempre con el cerrojo de la UART cogido, porque se llama desde
+ * putc_raw. No hace falta ningun cerrojo mas, y eso importa: pedir sched_lock
+ * aqui seria romper el orden de cerrojos que uart.h tiene escrito. */
+static void klog_meter(char c)
+{
+    uint32_t next = (klog_head + 1) % KLOG_SIZE;
+    if (next == klog_tail) { klog_perdidos++; return; }
+    klog[klog_head] = c;
+    klog_head = next;
+}
+
+static void putc_hw(char c)
 {
     /* Espera a que la FIFO de transmision tenga hueco. */
     while (mmio_read(UART0_FR) & FR_TXFF) { }
     mmio_write(UART0_DR, (uint32_t)c);
+}
+
+static void putc_raw(char c)
+{
+    if (klog_desviar) { klog_meter(c); return; }
+    putc_hw(c);
+}
+
+/* El conserver ha reclamado la UART: desde ahora el kernel no la toca. */
+void uart_ceder(void)
+{
+    uint64_t f = uart_begin();
+    klog_desviar = 1;
+    uart_end(f);
+}
+
+/* Y la devuelve -su driver ha muerto-, asi que el kernel vuelve a escribir.
+ *
+ * Lo que quedara en el anillo se saca AQUI y al hardware, porque si no se
+ * quedaria dentro para siempre mientras el texto nuevo sale por delante, o
+ * sea desordenado. Puede costar hasta 4 KB a 115200, que son 350 ms con el
+ * cerrojo cogido; es mucho, y pasa exactamente una vez: cuando se muere el
+ * driver de consola, que ya es un momento malo de por si. */
+void uart_recuperar(void)
+{
+    uint64_t f = uart_begin();
+
+    klog_desviar = 0;
+    while (klog_tail != klog_head) {
+        putc_hw(klog[klog_tail]);
+        klog_tail = (klog_tail + 1) % KLOG_SIZE;
+    }
+
+    uart_end(f);
+
+    /* Y despertar a quien esperara hueco: el que iba a vaciarlo ha muerto, y
+     * si no se les avisa se quedan dormidos esperando a nadie. Es el mismo
+     * cuidado que hay que tener siempre al retirar algo por lo que otros
+     * esperan. */
+    uint64_t sf = sched_lock_irqsave();
+    wq_wake_all(&klog_espacio);
+    sched_unlock_irqrestore(sf);
+}
+
+/* Y esto lo llama panic(): si el kernel se esta muriendo no puede depender de
+ * que un proceso siga vivo para contarlo. Se queda la UART y no la devuelve.
+ * No es una excepcion sucia, es la unica forma de que un panico se lea. */
+void uart_panico_toma_el_mando(void) { klog_desviar = 0; }
+
+/* --- Texto de un PROCESO, que no se puede perder ----------------------
+ *
+ * El del kernel si: un diagnostico que no cabe se cuenta y se tira, que es lo
+ * que hace el printk de cualquier Unix. El de un proceso no. Un `cat` de
+ * cien KB no puede salir con agujeros, y menos en silencio.
+ *
+ * Asi que este camino ESPERA cuando el anillo se llena, y esperar es lo que
+ * lo hace distinto: el que escribe es un proceso dentro de una llamada al
+ * sistema, o sea alguien que se puede dormir. El texto del kernel se escribe
+ * desde donde sea -un manejador de interrupcion, el eco de una tecla- y ahi
+ * dormir no es una opcion.
+ *
+ * Es control de flujo, y es lo que tiene cualquier capa de terminal de
+ * verdad. Lo que se gana con el es que el anillo pueda ser pequenyo: con
+ * bloqueo, 4 KB bastan para cualquier cosa; sin el, harian falta tantos como
+ * el mayor `cat` que se le ocurra a nadie.
+ *
+ * En la practica casi nunca espera: consola_write entrega 128 bytes como
+ * mucho por llamada y el anillo son 4096. */
+/* Y un trozo del anillo que el texto de los procesos NO puede usar.
+ *
+ * Existe por una prueba: volcando un ELF de 13 KB por la consola se perdieron
+ * exactamente 25 bytes, que eran el ECO de la siguiente orden que se teclo.
+ * El texto del proceso tiene control de flujo y espera; el eco no puede
+ * esperar, porque lo produce el kernel dentro de la llamada con la que el
+ * conserver le entrega las teclas, y bloquear ahi al conserver seria
+ * bloquear al unico que puede vaciar el anillo. O sea: un interbloqueo.
+ *
+ * Asi que si no puede esperar, se le guarda sitio. Un eco son unos pocos
+ * bytes por tecla y con 256 no se queda corto nunca; el que cede es el
+ * volcado, que sabe esperar. Es la misma idea que reservar memoria para lo
+ * que no puede fallar. */
+#define KLOG_RESERVA  256
+
+static int klog_hueco(uint64_t cuantos)
+{
+    uint64_t libre = KLOG_SIZE - 1 - uart_klog_hay();
+    return libre >= cuantos + KLOG_RESERVA;
+}
+
+int64_t uart_escribir_texto(const char *s, uint64_t n)
+{
+    /* Si la UART sigue siendo del kernel, esto es lo de siempre. */
+    if (!klog_desviar) {
+        uint64_t f = uart_begin();
+        for (uint64_t i = 0; i < n; i++) {
+            if (s[i] == '\n') putc_hw('\r');
+            putc_hw(s[i]);
+        }
+        uart_end(f);
+        return (int64_t)n;
+    }
+
+    uint64_t i = 0;
+
+    while (i < n) {
+        /* Meter lo que quepa. Un '\n' ocupa dos, asi que se comprueba por
+         * dos: partir un CRLF dejaria un retorno de carro sin su salto al
+         * otro lado de una espera. */
+        uint64_t f = uart_begin();
+        while (i < n) {
+            uint64_t hacen_falta = (s[i] == '\n') ? 2 : 1;
+            if (!klog_hueco(hacen_falta)) break;
+            if (s[i] == '\n') klog_meter('\r');
+            klog_meter(s[i]);
+            i++;
+        }
+        uart_end(f);
+
+        if (i >= n) break;
+
+        /* Lleno. A esperar a que el duenyo de la consola lo vacie; el tick le
+         * avisa, asi que esto no se queda colgado. Y si una senyal corta la
+         * espera se devuelve lo escrito, que es lo que hace un write. */
+        uint64_t sf = sched_lock_irqsave();
+        int cortado = 0;
+        if (!klog_hueco(1)) cortado = (wq_wait(&klog_espacio) < 0);
+        sched_unlock_irqrestore(sf);
+
+        if (cortado) break;
+    }
+
+    return (int64_t)i;
+}
+
+uint64_t uart_klog_hay(void)
+{
+    uint32_t h = klog_head, t = klog_tail;
+    return (h >= t) ? (h - t) : (KLOG_SIZE - t + h);
+}
+
+uint64_t uart_klog_perdidos(void) { return klog_perdidos; }
+
+/* Sacar hasta n bytes. Lo llama el conserver a traves de una llamada al
+ * sistema; el destino es un buffer del kernel y quien copia a EL0 es
+ * syscall.c, que es el unico que sabe hacerlo bien. */
+uint64_t uart_klog_saca(char *dst, uint64_t n)
+{
+    uint64_t f = uart_begin();
+    uint64_t i = 0;
+
+    while (i < n && klog_tail != klog_head) {
+        dst[i++] = klog[klog_tail];
+        klog_tail = (klog_tail + 1) % KLOG_SIZE;
+    }
+
+    uart_end(f);
+
+    /* Y despertar a quien estuviera esperando hueco. Fuera del cerrojo de la
+     * UART, porque wq_wake_all pide sched_lock y el orden es ese. */
+    if (i) {
+        uint64_t sf = sched_lock_irqsave();
+        wq_wake_all(&klog_espacio);
+        sched_unlock_irqrestore(sf);
+    }
+
+    /* Si se perdio algo, DECIRLO, y decirlo cuando el anillo se ha quedado
+     * vacio: es el unico momento en que se sabe que cabe el aviso.
+     *
+     * Perder texto del kernel es aceptable -un diagnostico no puede bloquear
+     * un manejador de interrupcion- pero perderlo en silencio no lo es: es lo
+     * que hacia la version de dos drivers, y por eso costo tanto verlo. El
+     * printk de Linux dice exactamente esto, y por el mismo motivo.
+     *
+     * No se repite hasta el infinito: el aviso ocupa sitio en el anillo, asi
+     * que el anillo deja de estar vacio y la condicion no se vuelve a cumplir
+     * hasta que alguien lo saque. */
+    if (klog_tail == klog_head && klog_perdidos) {
+        uint64_t p = klog_perdidos;
+        klog_perdidos = 0;
+        uart_puts("\n  [kernel] se han perdido ");
+        uart_dec(p);
+        uart_puts(" bytes de texto: el anillo se lleno\n");
+    }
+
+    return i;
 }
 
 void uart_putc(char c)

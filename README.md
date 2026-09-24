@@ -5382,6 +5382,177 @@ O sea que el paso que hace falta antes de mover un solo byte por USB no es de
 USB: es una fuente de tiempo fina, separada del planificador. Y conviene
 saberlo antes de empezar a escribir el otro.
 
+## Un solo escritor, o el kernel dejando de ser duenyo de la UART
+
+Esto lleva pendiente desde el paso 8, cuando el `conserver` demostro que un
+driver puede vivir en EL0 hablandole al hardware directamente. Lo demostro, y
+dejo el sistema con **dos** drivers sobre la misma PL011: el kernel con el
+suyo y el conserver con el de verdad.
+
+El README decia que se entrelazaban. Es peor: la Pi lo enseno al arrancar.
+
+```
+   ns[rse ]edvider de finhorasvivv  enEE00
+MC segun la GPU: 200000000 Hz
+```
+
+De **158 caracteres salieron 71**. El 55% destruido, sin un solo mensaje de
+error. No se entrelaza: se pierde.
+
+### Por que se pierde, y no solo se mezcla
+
+Las dos rutas de escritura son literalmente las mismas dos lineas. En el
+kernel, `putc_raw`:
+
+```c
+    while (mmio_read(UART0_FR) & FR_TXFF) { }   /* esperar hueco */
+    mmio_write(UART0_DR, (uint32_t)c);          /* escribir      */
+```
+
+Y en el conserver, `hw_putc`, con el comentario *"esperar hueco, igual que en
+el kernel"*, que resulta ser mas literal de lo que queria decir.
+
+Ese par no es indivisible. Los dos pueden ver hueco cuando queda **uno**, los
+dos escriben, y la PL011 se queda con el primero y tira el segundo sin
+avisar. A 115200 con una FIFO de transmision de 16 bytes, durante una rafaga
+la FIFO esta llena casi todo el tiempo, asi que los dos se pelean
+constantemente por el unico hueco que se libera cada 87 microsegundos. De ahi
+que el 55% no sea mala suerte: es lo que toca.
+
+El cerrojo compartido no es la salida, y esto ya estaba escrito: el cerrojo es
+del kernel, un proceso de EL0 no puede cogerlo, y si se le diera forma de
+hacerlo, un desalojo del planificador con el cerrojo cogido dejaria al kernel
+girando. La salida es que haya **un** escritor.
+
+### Ceder el dispositivo entero
+
+Y el que tiene que serlo es el que tiene el dispositivo concedido. Asi que
+cuando el conserver reclama la UART, el kernel se la da **entera**:
+
+```c
+    if (irq == IRQ_UART) uart_ceder();
+```
+
+Esa linea esta en `irq_register`, en el mismo sitio donde cambia de manos el
+teclado, y eso no es comodidad: es un solo dispositivo. Quedarse la escritura
+mientras otro se lleva la lectura es precisamente lo que llevaba cincuenta
+pasos sin funcionar.
+
+Desde ese momento el texto del kernel no va al hardware: va a un anillo de
+4 KB. El conserver lo saca con una llamada nueva y lo imprime con su propio
+escritor. `putc_raw` es el unico sitio donde hace falta decidirlo, porque es
+el cuello de botella por donde pasa **todo** byte que el kernel manda al
+cable.
+
+De propina, el proyecto gana algo que no tenia: un sitio donde esta lo que el
+kernel dijo. Antes se iba por el cable y no quedaba rastro.
+
+### Dos clases de texto, y una se puede perder
+
+Aqui es donde el diseno se complico, y el motivo es bueno.
+
+Metida toda la salida en el anillo, un `cat` de un ELF de 13 KB lo desborda
+tres veces. Un diagnostico del kernel que no cabe se puede tirar -es lo que
+hace el `printk` de cualquier Unix- pero la salida de un proceso no: un `cat`
+no puede salir con agujeros.
+
+Y no son el mismo problema porque no se escriben desde el mismo sitio:
+
+- El texto de un **proceso** entra por `consola_write`, o sea dentro de una
+  llamada al sistema: alguien que se puede **dormir**. Asi que cuando el
+  anillo se llena, **espera** a que lo vacien. Eso es control de flujo, y es
+  lo que tiene cualquier capa de terminal de verdad. Es tambien lo que permite
+  que el anillo sea pequenyo: con bloqueo bastan 4 KB; sin el harian falta
+  tantos como el mayor `cat` que se le ocurra a nadie.
+- El texto del **kernel** se escribe desde donde sea: un manejador de
+  interrupcion, un volcado de fallo, el eco de una tecla. Ahi dormir no es una
+  opcion, asi que si no cabe se cuenta y se tira.
+
+Pero **se dice**. Perder texto es aceptable; perderlo en silencio es lo que
+hacia la version de dos drivers y por eso costo cincuenta pasos verlo:
+
+```
+  [kernel] se han perdido 25 bytes de texto: el anillo se lleno
+```
+
+Se escribe cuando el anillo se queda vacio, que es el unico momento en que se
+sabe que el aviso cabe.
+
+### Y esos 25 bytes eran el eco
+
+El aviso aparecio en la primera prueba de esfuerzo, y los 25 bytes tenian
+nombre: eran el eco exacto de la orden que se teclo mientras el volcado
+corria. Mientras la pantalla escupia 13 KB, las teclas no se veian.
+
+El eco no puede esperar, y el motivo es bonito: lo produce el kernel **dentro
+de la llamada con la que el conserver le entrega las teclas**. Bloquear ahi es
+bloquear al unico proceso que puede vaciar el anillo. Un interbloqueo.
+
+Si no puede esperar, se le guarda sitio:
+
+```c
+#define KLOG_RESERVA  256
+
+static int klog_hueco(uint64_t cuantos)
+{
+    uint64_t libre = KLOG_SIZE - 1 - uart_klog_hay();
+    return libre >= cuantos + KLOG_RESERVA;
+}
+```
+
+Un cuarto de KB que el texto de los procesos no puede tocar. Un eco son unos
+pocos bytes por tecla y ahi no se queda corto nunca; el que cede es el
+volcado, que sabe esperar. Es la misma idea que reservar memoria para lo que
+no puede fallar.
+
+Con eso, 13.784 bytes por un anillo de 4.096 y **cero perdidas**, tecleando
+por encima.
+
+### El aviso, y por que llega por el reloj
+
+Falta decirle al conserver que hay texto. Y no se puede hacer donde se
+escribe, por el orden de cerrojos que `uart.h` lleva escrito desde el paso 13:
+quien tiene el cerrojo de la UART no puede pedir `sched_lock`, y avisar por un
+puerto lo pide. Escribir texto ocurre con el cerrojo de la UART cogido.
+
+Asi que el aviso va en el **tick del reloj**, que es un sitio donde ya se
+avisa por puertos -es lo que hace el reparto de interrupciones- y donde no hay
+ningun cerrojo de UART cogido. El precio es hasta 10 ms de retraso para un
+mensaje del kernel, que no se nota en algo que se lee con los ojos.
+
+El eco no paga ese precio: el conserver vacia el anillo **justo despues** de
+entregar las teclas, en la misma vuelta. Un eco con diez milisegundos de
+retraso se nota al escribir; un diagnostico, no.
+
+### panic() se lo queda todo
+
+```c
+void panic(const char *msg)
+{
+    uart_panico_toma_el_mando();
+```
+
+Un panico no puede depender de que un proceso siga vivo para contarlo: el
+kernel se para ahi mismo, no vuelve a EL0, y el conserver no va a ejecutarse
+nunca mas. Un panico que se quedara en el anillo seria una maquina muerta sin
+decir por que, que es la unica cosa peor que morirse.
+
+No es una excepcion sucia. Es la regla: lo ultimo que hace un sistema al
+morirse lo tiene que poder hacer solo.
+
+### Lo que esto NO arregla
+
+Dos **procesos** escribiendo a la vez siguen entrelazandose entre si: `lento a
+| lento b` saca las dos lineas trenzadas. Pero ya no es lo mismo, y la
+diferencia importa: ahi no se pierde nada, solo se mezcla, porque los dos
+pasan por el mismo anillo y el anillo tiene su cerrojo. Lo que falta es un
+cerrojo por descriptor para que una escritura entera sea indivisible, y eso es
+un paso aparte y mas pequenyo.
+
+Y queda el kernel escribiendo en crudo durante el arranque, que es correcto:
+cuando se imprime el rotulo no existe ni un proceso, y no hay con quien
+competir.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -5459,22 +5630,25 @@ saberlo antes de empezar a escribir el otro.
 - No hay sesiones, ni proceso lider, ni `SIGHUP`. Con un solo terminal y
   un solo shell, una sesion seria una etiqueta que no distingue nada.
 - Dos procesos que escriban a la vez en la consola se entrelazan letra a
-  letra: `lento a | lento b` saca las dos lineas trenzadas. El descriptor
-  de consola no tiene cerrojo, y ponerselo no bastaria mientras el kernel
-  y el `conserver` sigan siendo dos drivers sobre la misma UART.
+  letra: `lento a | lento b` saca las dos lineas trenzadas. El descriptor de
+  consola no tiene cerrojo, asi que una escritura entera no es indivisible.
 
-  En la Pi eso se ve **al arrancar**, que es donde mas molesta, porque el
-  conserver y el servidor de ficheros se presentan a la vez:
-
-  ```
-     ns[rse ]edvider de finhorasvivv  enEE00
-  ```
-
-  En QEMU no sale, porque los tiempos son otros. Lo unico que se ha hecho es
-  no meter una tercera voz en esa ventana -la semilla de USB arranca al final,
-  con un `sleep` de 100 ms que es una tirita y esta comentado como tal-. El
-  trenzado de las otras dos sigue ahi y seguira hasta que haya UN solo driver
-  de la UART.
+  Desde el paso 59 eso ya **no pierde nada**, que es la diferencia que
+  importa: los dos pasan por el mismo anillo y el anillo tiene su cerrojo, asi
+  que se mezclan pero llegan enteros. Antes habia dos drivers sobre la misma
+  PL011 y se destruia el 55% del texto en silencio.
+- El texto del KERNEL si se puede perder: un diagnostico se escribe desde
+  sitios donde no se puede dormir -un manejador de interrupcion, el eco de una
+  tecla- asi que si el anillo esta lleno se tira. Lo dice cuando pasa
+  (`se han perdido N bytes`), y hay 256 bytes reservados para que el eco no
+  compita con un volcado.
+- Un mensaje del kernel puede tardar hasta 10 ms en salir: el aviso al duenyo
+  de la consola va en el tick del reloj, porque avisar donde se escribe
+  romperia el orden de cerrojos. El eco no paga ese precio -el conserver vacia
+  el anillo en la misma vuelta en que entrega las teclas- pero un `[kernel]`
+  suelto, si.
+- El anillo del kernel son 4 KB y no se puede leer desde un programa: solo lo
+  saca quien tiene la UART. No hay `dmesg`, aunque ya hay donde ponerlo.
 - No hay `WCONTINUED`: "ha seguido" no es un suceso que nadie observe, asi
   que un `kill -18` a mano deja la lista diciendo "parado" de algo que corre.
   Los unicos SIGCONT de aqui los manda el propio shell con `fg` y `bg`, y

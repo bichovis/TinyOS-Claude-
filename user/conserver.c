@@ -55,6 +55,14 @@ static void hw_putc(uint64_t base, char c)
     *dr = (unsigned int)c;
 }
 
+/* Tal cual, sin tocar nada. Lo que sale del anillo del kernel YA lleva sus
+ * retornos de carro puestos -los pone la propia conversion del kernel antes de
+ * meterlo- y volver a convertirlo daria dobles saltos de linea. */
+static void hw_write_crudo(uint64_t base, const char *s, uint64_t n)
+{
+    for (uint64_t i = 0; i < n; i++) hw_putc(base, s[i]);
+}
+
 static void hw_write(uint64_t base, const char *s, uint64_t n)
 {
     for (uint64_t i = 0; i < n; i++) {
@@ -75,6 +83,30 @@ static void hw_puts(uint64_t base, const char *s)
  * desenmascare, con el agravante de que aqui el viaje de vuelta pasa por
  * el planificador. */
 static void hw_puts(uint64_t base, const char *s);
+
+/* --- Vaciar el anillo del kernel --------------------------------------
+ *
+ * Desde el paso 59 este proceso no es "un driver mas": es el UNICO que
+ * escribe en la PL011. El kernel le cede el hardware al reclamar la UART y
+ * todo su texto -sus diagnosticos, el eco de las teclas y la salida de
+ * cualquier proceso- se queda en un anillo esperando a que lo saquemos.
+ *
+ * Antes eramos dos escribiendo en la misma FIFO sin poder coordinarnos -el
+ * cerrojo es del kernel y un proceso de EL0 no puede cogerlo- y las dos
+ * escrituras se pisaban: en la Pi, al arrancar, de 158 caracteres salian 71.
+ *
+ * Se vacia en bucle hasta que no quede nada, y no de un trozo: la llamada
+ * devuelve como mucho 256 bytes porque el kernel copia por la pila, que es
+ * una pagina.
+ */
+static void vaciar_klog(uint64_t base)
+{
+    char buf[256];
+    int64_t n;
+
+    while ((n = klog(buf, sizeof(buf))) > 0)
+        hw_write_crudo(base, buf, (uint64_t)n);
+}
 
 static void drenar(uint64_t base)
 {
@@ -143,6 +175,12 @@ static void drenar(uint64_t base)
     if (interrumpir) console_int();
     if (parar)       console_stop();
 
+    /* Y sacar lo que el kernel haya escrito AHORA MISMO, sin esperar al
+     * aviso del reloj. Lo que el kernel acaba de escribir es el ECO de las
+     * teclas que le hemos dado dos lineas arriba, y un eco que llega diez
+     * milisegundos tarde se nota al escribir. */
+    vaciar_klog(base);
+
     if (perdidos) {
         /* Por el hardware y no por printf: printf escribe en el descriptor
          * 1, que acaba pidiendonoslo a nosotros mismos. */
@@ -189,6 +227,14 @@ int main(int argc, char **argv)
         if (m.type == CMSG_IRQ) {
             drenar(uart);
             irq_ack(IRQ_UART);
+            continue;
+        }
+
+        /* El kernel tiene texto. Lo manda el reloj, una vez por tick, y es
+         * lo que hace que un diagnostico del kernel o la salida de un
+         * proceso salgan aunque nadie toque una tecla. */
+        if (m.type == CMSG_KLOG) {
+            vaciar_klog(uart);
             continue;
         }
 

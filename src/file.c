@@ -135,13 +135,12 @@ static int64_t consola_write(uint64_t uva, uint64_t n)
     uint64_t hay = copiar_de_usuario(tmp, uva, n);
     if (!hay) return -1;
 
-    uint64_t lf = uart_begin();
-    for (uint64_t i = 0; i < hay; i++) {
-        if (tmp[i] == '\n') uart_putc('\r');
-        uart_putc(tmp[i]);
-    }
-    uart_end(lf);
-    return (int64_t)hay;
+    /* Y desde el paso 59 esto no escribe el hardware: se lo entrega a quien
+     * tenga la UART, que puede ser el kernel mismo o el driver de consola.
+     * Puede aceptar menos de lo que se le da -si el anillo se llena y una
+     * senyal corta la espera- y por eso se devuelve lo que acepto: es una
+     * escritura parcial, como la de cualquier Unix. */
+    return uart_escribir_texto(tmp, hay);
 }
 
 static int64_t consola_read(uint64_t uva, uint64_t n)

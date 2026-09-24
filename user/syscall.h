@@ -304,6 +304,13 @@ int64_t console_stop(void)  { return syscall2(SYS_console_stop, 0, 0); }
  *
  * Uno por proceso. Si un driver necesita varios buffers, reparte el suyo,
  * que ademas es como funciona un "DMA pool" de verdad. */
+/* Sacar texto del anillo del kernel. Solo lo puede llamar el duenyo de la
+ * UART, que desde el paso 59 es el UNICO que escribe en ella: el kernel le
+ * cede el hardware al reclamarla y le pasa su texto por aqui. Devuelve los
+ * bytes copiados, o 0 si no habia nada. */
+static inline int64_t klog(char *buf, uint64_t n)
+{ return syscall2(SYS_klog, (uint64_t)buf, n); }
+
 static inline int64_t dma_alloc(uint64_t paginas, uint64_t *pa)
 { return revisar(syscall2(SYS_dma_alloc, paginas, (uint64_t)pa)); }
 

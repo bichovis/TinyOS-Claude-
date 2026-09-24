@@ -42,6 +42,7 @@ struct message {
 /* Tipos de mensaje que entiende el servidor de consola */
 #define CMSG_PRINT     1
 #define CMSG_IRQ       2    /* lo manda el KERNEL: ha llegado una interrupcion */
+#define CMSG_KLOG      3    /* lo manda el KERNEL: tiene texto que sacar      */
 
 /* Las interrupciones que un proceso puede reclamar.
  *
@@ -134,6 +135,12 @@ struct message {
 #define SYS_pipe         22    /* (int fds[2]) -> 0 | -1                     */
 #define SYS_close        23    /* (fd) -> 0 | -1                             */
 #define SYS_dup2         24    /* (viejo, nuevo) -> nuevo | -1               */
+
+/* Sacar texto del anillo del kernel. Lo llama el duenyo de la consola, que
+ * desde el paso 59 es el UNICO que escribe en la UART: el kernel le cede el
+ * hardware y le pasa su texto por aqui. Devuelve los bytes copiados, 0 si no
+ * hay nada, o -EPERM si quien pregunta no tiene la UART. */
+#define SYS_klog         53    /* (buffer, bytes) -> copiados | -errno     */
 
 /* --- Memoria para DMA -------------------------------------------------
  *

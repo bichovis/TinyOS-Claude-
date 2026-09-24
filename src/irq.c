@@ -208,6 +208,12 @@ int irq_register(uint64_t irq, int puerto)
      * abrirla no hace danyo; las demas no lo estaban, porque hasta ahora no
      * habia nadie que supiera atenderlas. */
     irq_abrir(irq);
+
+    /* Y si lo que se reclama es la UART, el kernel le CEDE tambien la
+     * salida. Es un solo dispositivo y se entrega entero: quedarse la
+     * escritura mientras otro se lleva la lectura es lo que hacia que dos
+     * escritores se pisaran en la FIFO y se perdiera la mitad del texto. */
+    if (irq == IRQ_UART) uart_ceder();
     return 0;
 }
 
@@ -228,9 +234,20 @@ void irq_release_port(int puerto)
         irqs_el0[i].irq    = 0;
         irqs_el0[i].puerto = -1;
 
-        if (irq == IRQ_UART) irq_abrir(irq);
-        else                 irq_cerrar(irq);
+        if (irq == IRQ_UART) { irq_abrir(irq); uart_recuperar(); }
+        else                   irq_cerrar(irq);
     }
+}
+
+/* ¿Es ESE proceso el duenyo de esa interrupcion? Lo pregunta syscall.c para
+ * saber quien puede sacar el texto del kernel: el duenyo de la UART y nadie
+ * mas. La tabla guarda puertos, no pids, asi que hay que preguntarle a ipc.c
+ * de quien es el puerto. */
+int irq_es_duenyo(uint64_t irq, uint64_t pid)
+{
+    int h = hueco_de(irq);
+    if (h < 0 || !pid) return 0;
+    return port_owner(irqs_el0[h].puerto) == pid;
 }
 
 int irq_ack(uint64_t irq)
@@ -238,6 +255,25 @@ int irq_ack(uint64_t irq)
     if (hueco_de(irq) < 0) return -1;    /* no es tuya, no la reabres */
     irq_abrir(irq);
     return 0;
+}
+
+/* Decirle al duenyo de la consola que hay texto del kernel esperando.
+ *
+ * Con una bandera para no inundarle: mientras no haya vaciado, un aviso basta.
+ * La bandera se levanta cuando el anillo se queda vacio, que es lo unico que
+ * significa "ya lo tiene todo". */
+static volatile int klog_avisado;
+
+static void klog_avisar(void)
+{
+    int h = hueco_de(IRQ_UART);
+    if (h < 0) return;                    /* la UART la lleva el kernel */
+
+    if (!uart_klog_hay()) { klog_avisado = 0; return; }
+    if (klog_avisado)     return;
+
+    if (port_notify(irqs_el0[h].puerto, CMSG_KLOG) == 0)
+        klog_avisado = 1;
 }
 
 void irq_handle(void)
@@ -249,8 +285,23 @@ void irq_handle(void)
      * de lo que le ha pasado al 2. */
     uint32_t src = mmio_read(CORE_IRQ_SOURCE(core));
 
-    if (src & SRC_CNTPNSIRQ)
+    if (src & SRC_CNTPNSIRQ) {
         timer_irq();
+
+        /* Y de paso, avisar al duenyo de la consola de que el kernel ha
+         * escrito algo.
+         *
+         * Aqui y no en el sitio donde se escribe, y el motivo es el orden de
+         * cerrojos que uart.h tiene escrito: quien tiene el de la UART no
+         * puede pedir sched_lock, y port_notify lo pide. Escribir texto
+         * ocurre con el cerrojo de la UART cogido; este manejador, no.
+         *
+         * El precio es hasta 10 ms de retraso para un mensaje del kernel, que
+         * no se nota en algo que se lee con los ojos. Y el eco de las teclas
+         * no pasa por aqui: de eso se encarga el propio conserver, que vacia
+         * el anillo justo despues de entregar lo que ha leido. */
+        klog_avisar();
+    }
 
     /* Un toque de otro nucleo. Reconocerlo es escribir de vuelta lo que se
      * lee; no hay mas que hacer, porque el aviso no lleva contenido: el
