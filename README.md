@@ -5644,6 +5644,127 @@ Lo que si se puede medir aqui es el MECANISMO -cuantas llamadas al sistema
 cuesta un `fprintf`- y eso es determinista y falla cuando debe. El sintoma hay
 que verlo en la Pi.
 
+## El DWC2 se enciende, y una correccion que cambia el plan
+
+Antes del codigo, una correccion mia. Habia escrito que el bloqueo para tener
+red por USB eran los **125 microsegundos** de las transferencias partidas
+frente a los 10 milisegundos del tick, y que hacia falta una fuente de tiempo
+fina antes de mover un byte. No es verdad.
+
+Las transferencias partidas (*split transactions*) existen para que un
+anfitrion de alta velocidad hable con dispositivos de **baja o completa** a
+traves de un hub: el hub hace la senyalizacion lenta y el anfitrion tiene que
+colocar cada trozo en su micro-trama. El LAN9514 no es eso. Es un hub de alta
+velocidad con la Ethernet colgada de un puerto **interno, tambien de alta
+velocidad**, asi que se le habla con transferencias normales.
+
+Y hay una comprobacion que lo zanja sin mirar ninguna hoja de datos: la Pi hace
+unos 90 Mbit/s por Ethernet. Por un enlace de velocidad completa, que son 12,
+eso es imposible.
+
+Asi que para la red hacen falta transferencias de **control** y **bulk**, que
+se atienden con una interrupcion por transferencia terminada y no con ocho mil
+por segundo. Un driver en EL0 sirve. Los 125 microsegundos haran falta el dia
+que se enchufe un teclado, que es de baja velocidad, y entonces el problema
+sera de verdad.
+
+### Poner el chip en un estado conocido
+
+El firmware de la Pi deja el DWC2 encendido y a medio configurar. Heredar eso
+es como se depura durante tres dias algo que funciona en un arranque y no en el
+siguiente, asi que lo primero es un reset. El orden no es negociable:
+
+1. **Quitar las puertas de reloj** (`PCGCCTL = 0`). Con el reloj cortado los
+   registros contestan basura, y todo lo que venga despues seria un misterio.
+2. **Cerrar la salida de interrupciones** mientras se configura. Todavia no hay
+   nadie escuchando, y una fuente abierta sin manejador es el sistema girando
+   en el vector.
+3. **Esperar a que el bus AHB este quieto** antes de resetear. Resetear con una
+   transferencia a medias deja el bus colgado, y con el medio chip.
+4. **El reset**: se pide poniendo un bit y se sabe que acabo cuando el propio
+   chip lo quita. No hay que quitarlo a mano.
+
+Luego el modo anfitrion. Este controlador es OTG -puede ser las dos cosas y
+decide mirando un pin- y en la Pi siempre es anfitrion, pero decirselo a mano
+quita una variable: si el pin flotara, el chip se quedaria esperando a que
+alguien le hable en vez de hablar el. Y el PHY: UTMI+ de alta velocidad, con
+`PHYSEL` a cero, que es lo que significa "no me pongas el serie de velocidad
+completa". Sin esa linea, la Ethernet no se veria nunca.
+
+### El registro mas traicionero del chip
+
+`HPRT0` es el puerto raiz, y tiene tres clases de bit mezcladas:
+
+- de solo lectura: si hay algo conectado, a que velocidad, el estado de las
+  lineas;
+- de los que se **borran escribiendo un uno**: los avisos de "ha cambiado
+  algo";
+- y `PRTENA`, que leido dice si el puerto esta habilitado y **escrito con un
+  uno lo deshabilita**.
+
+O sea que un `leer, poner un bit, escribir` sobre este registro apaga el puerto
+y de paso borra los avisos que ibas a leer. Es un clasico, y por eso toda
+escritura pasa por una funcion de dos lineas que quita esos bits antes:
+
+```c
+#define HPRT_W1C  (HPRT_CONNDET | HPRT_ENA | HPRT_ENCHNG | HPRT_OVRCURCHNG)
+
+static void hprt_escribir(uint32_t v) { escribir(HPRT0, v & ~HPRT_W1C); }
+```
+
+### Dos escalas de tiempo en la misma funcion
+
+La espera por un bit acabo con dos fases, y el motivo es que aqui se juntan dos
+escalas que no se parecen: el bus AHB contesta en **micro**segundos y un reset
+de puerto USB dura decenas de **mili**segundos. Con un tick de 10 ms, dormir
+para esperar lo primero es pasarse mil veces.
+
+Asi que primero se mira a pelo unas cuantas veces -que resuelve todo lo rapido
+sin dormir a nadie- y solo si eso no basta se pasa a dormir por ticks. Es en
+pequenyo el problema del planificador de micro-tramas, y parte de la razon de
+que ese no pueda vivir aqui.
+
+Con tope, siempre: un bucle sin tope esperando un registro de hardware es la
+forma mas comoda de colgar un driver.
+
+### Lo que contesto
+
+En QEMU, sin nada enchufado:
+
+```
+  [usb] nucleo en modo anfitrion; HPRT0 = 0x00001000
+  [usb] no hay nada conectado al puerto raiz
+```
+
+`0x1000` es el bit 12: puerto alimentado y nada mas. Correcto, porque la
+raspi3b emulada trae el controlador pero no trae nada conectado.
+
+Asi que se le enchufa uno -`-device usb-storage`- y aparece el camino entero:
+
+```
+  [usb] nucleo en modo anfitrion; HPRT0 = 0x00021003
+  [usb] algo conectado, velocidad completa (12 Mbit/s)
+  [usb] tras el reset: HPRT0 = 0x0002100d, puerto habilitado
+  [usb] micro-trama 7697: el bus esta vivo
+```
+
+Tres cosas de ahi valen la pena. El **bit 2 puesto** despues del reset dice que
+el puerto quedo habilitado, o sea que el enmascarado de los W1C funciono: si
+hubiera hecho un read-modify-write ingenuo, ese bit habria salido a cero y el
+puerto apagado. El **contador de micro-tramas corriendo** dice que el bus tiene
+reloj: el chip esta emitiendo *start of frame* cada 125 microsegundos por su
+cuenta, que es el trabajo que un anfitrion hace sin que nadie le diga. Y la
+**velocidad completa** es de QEMU; en la Pi, el LAN9514 tiene que decir alta.
+
+### Lo que falta para hablar con el
+
+Tener el puerto habilitado no es hablar. Lo siguiente es un canal, una
+transferencia de control y un `GET_DESCRIPTOR`, que es donde el hub dira quien
+es. Y ahi apareceran las cosas que este paso solo ha preparado: el buffer de
+DMA del paso 58 -porque los descriptores llegan por DMA- y la interrupcion 9,
+que hasta ahora esta reclamada y sin usar, porque `GINTMSK` sigue a cero y el
+chip no ha pedido atencion ni una vez.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -5817,10 +5938,18 @@ que verlo en la Pi.
 - La memoria de DMA se pide y no se devuelve hasta que el proceso muere: no
   hay `dma_free`. Un driver la pide al arrancar y la tiene para siempre, que
   es lo que hace un driver, pero no es una regla que el kernel imponga.
-- El tick son 10 ms, y el USB de la Pi necesita planificar transferencias
-  partidas cada 125 us. Antes de mover un byte por USB hace falta una fuente
-  de tiempo fina y separada del planificador; el driver de la Fundacion usa
-  una FIQ para eso.
+- El tick son 10 ms, y las transferencias partidas del USB piden 125 us. Eso
+  NO bloquea la red -el LAN9514 es de alta velocidad y no usa transferencias
+  partidas- pero si bloquea cualquier dispositivo de baja o completa velocidad
+  enchufado por fuera: un teclado USB necesita una fuente de tiempo fina y
+  separada del planificador, y el driver de la Fundacion usa una FIQ para eso.
+- El driver de USB no pide ninguna interrupcion todavia: `GINTMSK` esta a cero
+  y se pregunta mirando los registros. La IRQ 9 esta reclamada y sin usar.
+- Los mensajes del driver de USB salen DESPUES del prompt del shell, porque
+  encender el puerto y resetearlo lleva mas de los 100 ms que init espera. Las
+  lineas salen enteras -de eso se encargan los pasos 59 y 60- pero llegan
+  tarde. Un Linux hace lo mismo: la enumeracion del USB aparece despues del
+  login.
 - El servidor entiende FAT16 y FAT32, pero nada de FAT12 ni exFAT, y
   escribe los nombres en 8.3.
 - El entorno son 16 variables y 512 bytes de texto por proceso, en un
