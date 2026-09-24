@@ -176,6 +176,13 @@ int main(int argc, char **argv)
      *
      * No espera a nadie ni nadie la espera: si falla, se queja y el sistema
      * sigue igual. */
+    /* 4a. La pila de red. Un servidor sin dispositivo, como el shell: no
+     *     toca hardware, solo puertos. Va ANTES del driver de USB para que
+     *     cuando aparezca la tarjeta haya alguien en PORT_RED a quien
+     *     decirselo (el driver insiste cada segundo de todas formas). */
+    if (bootstrap("red", 0, environ, DEV_NINGUNO) < 0)
+        printf("  [init] la pila de red no arranca, sigo sin ella\n");
+
     if (bootstrap("usb", 0, environ, DEV_USB) < 0)
         printf("  [init] la semilla de USB no arranca, sigo sin ella\n");
     else

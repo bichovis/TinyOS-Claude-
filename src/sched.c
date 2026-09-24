@@ -1269,6 +1269,7 @@ extern const uint8_t  user_fs[];         extern const uint64_t user_fs_size;
 extern const uint8_t  user_sh[];         extern const uint64_t user_sh_size;
 extern const uint8_t  user_init[];       extern const uint64_t user_init_size;
 extern const uint8_t  user_usb[];        extern const uint64_t user_usb_size;
+extern const uint8_t  user_red[];        extern const uint64_t user_red_size;
 
 struct empotrado {
     const char     *nombre;
@@ -1282,6 +1283,7 @@ static const struct empotrado empotrados[] = {
     { "sh",        user_sh,        &user_sh_size        },
     { "init",      user_init,      &user_init_size      },
     { "usb",       user_usb,       &user_usb_size       },
+    { "red",       user_red,       &user_red_size       },
     { 0, 0, 0 }
 };
 

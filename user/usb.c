@@ -26,6 +26,7 @@
 #include "syscall.h"
 #include "fs_abi.h"
 #include "blk_abi.h"
+#include "net_abi.h"
 
 /* --- Registros del DWC2 ----------------------------------------------- */
 #define PCGCCTL    0xE00    /* puertas de reloj y pinza de alimentacion      */
@@ -1460,7 +1461,6 @@ static int ecm_arrancar(void)
  * es leer un registro, y se hace a cada alarma. Es lo que en Linux hace la
  * URB de recepcion siempre pendiente, y aqui sale sin interrupciones. */
 static int rx_armado, rx_tog;
-static unsigned tramas_recibidas, tramas_bytes;
 
 static void rx_armar(void)
 {
@@ -1541,95 +1541,51 @@ static int nic_enviar(const uint8_t *f, int n)
     return 0;
 }
 
-/* --- Una trama que valga como prueba: DHCP DISCOVER ---------------------------
+/* --- La pila esta en otro proceso ----------------------------------------
  *
- * Para saber que la red contesta hace falta preguntarle algo a lo que
- * conteste sin conocernos. DHCP es exactamente eso: "soy la MAC tal, no
- * tengo direccion, alguien me da una?", a todos (broadcast), desde 0.0.0.0.
- * Cualquier red con un router responde con una OFERTA. Es la primera trama
- * de la pila que vendra en el paso siguiente; aqui solo se construye a mano,
- * byte a byte, para ver que el cable funciona en los dos sentidos. */
-static uint16_t suma_ip(const uint8_t *p, int n)
+ * Aqui habia un DHCP DISCOVER escrito a mano y un lector de tramas que
+ * ensenyaba lo que llegaba. Valia como sonda del cable; no vale como
+ * disenyo: el driver de una tarjeta no tiene por que saber lo que es una
+ * direccion IP, igual que el del pendrive no sabe lo que es un fichero.
+ *
+ * Asi que las tramas se entregan enteras al servidor de red (PORT_RED,
+ * net_abi.h), y las suyas llegan por este mismo puerto para mandarlas. Al
+ * arrancar la tarjeta se le avisa de que existe; si no esta, se insiste cada
+ * segundo, y si un dia deja de estar -su puerto desaparece- se vuelve a
+ * insistir. Mientras no hay pila, lo que llega se cuenta y se tira. */
+static int      pila_avisada;
+static unsigned tramas_recibidas, tramas_perdidas;
+
+static void nic_anunciar(uint64_t puerto)
 {
-    uint32_t s = 0;
-    for (int i = 0; i + 1 < n; i += 2) s += (uint32_t)((p[i] << 8) | p[i + 1]);
-    if (n & 1) s += (uint32_t)(p[n - 1] << 8);
-    while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
-    return (uint16_t)~s;
+    static struct message m;
+    struct net_tarjeta *t = (struct net_tarjeta *)m.data;
+    const char *nom = nic.tipo == NIC_LAN9514 ? "LAN9514" : "CDC-ECM";
+
+    m.type = NMSG_TARJETA; m.len = sizeof(*t);
+    t->port = (unsigned long)puerto;
+    for (int i = 0; i < 6; i++) t->mac[i] = nic.mac[i];
+    int i = 0;
+    for (; nom[i] && i < 15; i++) t->nombre[i] = nom[i];
+    t->nombre[i] = 0;
+
+    pila_avisada = (msg_send(PORT_RED, &m) == 0);
 }
 
-static int dhcp_descubrir(uint8_t *f)
-{
-    int n = 0;
-    for (int i = 0; i < 6; i++) f[n++] = 0xFF;                 /* a todos */
-    for (int i = 0; i < 6; i++) f[n++] = nic.mac[i];
-    f[n++] = 0x08; f[n++] = 0x00;                                /* IPv4 */
-
-    int ip = n;
-    uint8_t cab[20] = { 0x45, 0, 0, 0, 0x12, 0x34, 0, 0, 64, 17, 0, 0,
-                        0, 0, 0, 0, 255, 255, 255, 255 };
-    for (int i = 0; i < 20; i++) f[n++] = cab[i];
-
-    int udp = n;
-    f[n++] = 0; f[n++] = 68; f[n++] = 0; f[n++] = 67; f[n++] = 0; f[n++] = 0; f[n++] = 0; f[n++] = 0;
-
-    int bootp = n;
-    f[n++] = 1; f[n++] = 1; f[n++] = 6; f[n++] = 0;              /* peticion, Ethernet */
-    f[n++] = 'T'; f[n++] = 'i'; f[n++] = 'n'; f[n++] = 'y';      /* xid */
-    f[n++] = 0; f[n++] = 0; f[n++] = 0x80; f[n++] = 0;           /* secs, flags: contestame a todos */
-    for (int i = 0; i < 16; i++) f[n++] = 0;                     /* ciaddr yiaddr siaddr giaddr */
-    for (int i = 0; i < 6; i++) f[n++] = nic.mac[i];
-    for (int i = 0; i < 10 + 64 + 128; i++) f[n++] = 0;
-    f[n++] = 99; f[n++] = 130; f[n++] = 83; f[n++] = 99;         /* la galleta magica */
-    f[n++] = 53; f[n++] = 1; f[n++] = 1;                          /* DISCOVER */
-    f[n++] = 55; f[n++] = 4; f[n++] = 1; f[n++] = 3; f[n++] = 6; f[n++] = 42;  /* mascara, router, DNS, NTP */
-    f[n++] = 255;
-    while (n - bootp < 300) f[n++] = 0;                          /* BOOTP minimo */
-
-    int ludp = n - udp, lip = n - ip;
-    f[udp + 4] = (uint8_t)(ludp >> 8); f[udp + 5] = (uint8_t)ludp;
-    f[ip + 2]  = (uint8_t)(lip >> 8);  f[ip + 3]  = (uint8_t)lip;
-    uint16_t c = suma_ip(f + ip, 20);
-    f[ip + 10] = (uint8_t)(c >> 8); f[ip + 11] = (uint8_t)c;
-    return n;
-}
-
-/* Lo que llega, por ahora, se ensenya: las primeras tramas enteras en su
- * cabecera, y de las que se entienden -ARP, una oferta DHCP- lo que dicen. */
 static void trama_llego(const uint8_t *f, int n)
 {
+    static struct message m;
+
     tramas_recibidas++;
-    tramas_bytes += (unsigned)n;
-    if (n < 14) return;
+    if (n > TRAMA_MAX) n = TRAMA_MAX;
+    if (detallado && n >= 14)
+        printf("  [usb] trama %u, %d bytes, tipo 0x%02x%02x\n", tramas_recibidas, n, f[12], f[13]);
 
-    unsigned tipo = (f[12] << 8) | f[13];
-    if (tramas_recibidas <= 6)
-        printf("  [usb] trama %u, %d bytes: de %02x:%02x:%02x:%02x:%02x:%02x para %02x:%02x:%02x:%02x:%02x:%02x, tipo 0x%04x\n",
-               tramas_recibidas, n, f[6], f[7], f[8], f[9], f[10], f[11],
-               f[0], f[1], f[2], f[3], f[4], f[5], tipo);
-
-    if (tipo == 0x0806 && n >= 42 && f[21] == 1 && tramas_recibidas <= 6)
-        printf("  [usb]   ARP: quien tiene %d.%d.%d.%d? pregunta %d.%d.%d.%d\n",
-               f[38], f[39], f[40], f[41], f[28], f[29], f[30], f[31]);
-
-    if (tipo == 0x0800 && n >= 34 + 8 + 240 && f[23] == 17) {
-        int ihl = (f[14] & 0xF) * 4, udp = 14 + ihl, b = udp + 8;
-        unsigned dst = (f[udp + 2] << 8) | f[udp + 3];
-        if (dst == 68 && f[b] == 2) {
-            const uint8_t *o = f + b + 240;
-            int msg = 0; const uint8_t *srv = 0;
-            while (o + 1 < f + n && o[0] != 255) {
-                if (o[0] == 53) msg = o[2];
-                if (o[0] == 54) srv = o + 2;
-                o += (o[0] == 0) ? 1 : 2 + o[1];
-            }
-            printf("  [usb]   DHCP: %s de %d.%d.%d.%d, me %s %d.%d.%d.%d\n",
-                   msg == 2 ? "OFERTA" : msg == 5 ? "ACK" : "mensaje",
-                   srv ? srv[0] : f[26], srv ? srv[1] : f[27], srv ? srv[2] : f[28], srv ? srv[3] : f[29],
-                   msg == 2 ? "ofrece" : "da",
-                   f[b + 16], f[b + 17], f[b + 18], f[b + 19]);
-        }
-    }
+    if (!pila_avisada) { tramas_perdidas++; return; }
+    m.type = NMSG_TRAMA;
+    m.len  = (uint64_t)n;
+    for (int i = 0; i < n; i++) m.data[i] = (char)f[i];
+    if (msg_send(PORT_RED, &m) < 0) { pila_avisada = 0; tramas_perdidas++; }
 }
 
 /* A cada alarma: si el canal de recepcion se ha detenido, hay trama; se
@@ -1667,11 +1623,6 @@ static int nic_arrancar(void)
 
     rx_tog = 0; nic.tog_out = 0;
     rx_armar();
-
-    static uint8_t trama[600];
-    int n = dhcp_descubrir(trama);
-    if (nic_enviar(trama, n) == 0)
-        printf("  [usb] DHCP DISCOVER mandado (%d bytes): a ver quien contesta\n", n);
     return 0;
 }
 
@@ -2568,13 +2519,15 @@ int main(int argc, char **argv)
             printf("  [usb] no hay servidor de ficheros a quien ofrecerle el disco\n");
     }
 
+    if (nic.hay) nic_anunciar((uint64_t)puerto);
+
     if (!teclado.hay && !disco.hay && !nic.hay)
         printf("  [usb] ni teclado, ni disco, ni red; me quedo esperando\n");
 
     uint8_t inf[64];
-    unsigned vueltas = 0;
+    unsigned vueltas = 0, sin_pila = 0;
     for (;;) {
-        struct message m;
+        static struct message m;
         if (msg_recv((uint64_t)puerto, &m) < 0) break;
 
         if (m.type == CMSG_IRQ) { irq_ack(IRQ_USB); continue; }
@@ -2587,10 +2540,18 @@ int main(int argc, char **argv)
             continue;
         }
 
+        /* Una trama de la pila: al cable. */
+        if (m.type == NMSG_ENVIAR) {
+            if (nic.hay && m.len >= 14) nic_enviar((const uint8_t *)m.data, (int)m.len);
+            continue;
+        }
+
         if (m.type != CMSG_ALARMA) continue;
 
-        /* La red primero: mirar si el canal 1 ha recibido, y volver a armarlo. */
+        /* La red primero: mirar si el canal 1 ha recibido, y volver a armarlo.
+         * Y si la pila aun no sabe que hay tarjeta, decirselo cada segundo. */
         red_sondear();
+        if (nic.hay && !pila_avisada && (++sin_pila % 100) == 0) nic_anunciar((uint64_t)puerto);
         if (!teclado.hay) continue;
 
         /* Un teclado USB no avisa: se le pregunta. Cada bInterval milisegundos

@@ -26,11 +26,14 @@
  * es el sintoma de un protocolo que mete todo en un mensaje de tamanyo
  * fijo. Lo limpio seria separar la ruta de los datos; mientras tanto,
  * esto es un numero que se sube cuando hace falta. */
-/* 512 eran los bytes justos de una peticion al servidor de ficheros. Desde
- * el paso 68 un mensaje tiene que poder llevar un SECTOR entero (512 bytes)
- * mas la cabecera que dice que sector es y a donde contestar: 544. Los
- * programas viejos que suponian 512 siguen bien, porque data[] va al final. */
-#define MSG_DATA_MAX         544
+/* 512 eran los bytes justos de una peticion al servidor de ficheros; 544,
+ * un sector con su cabecera (paso 68). Desde el paso 70 un mensaje tiene
+ * que poder llevar una TRAMA ETHERNET entera -1514 bytes- entre el driver
+ * de la tarjeta y la pila de red. Un mensaje mas grande cuesta mas copiar
+ * -cuatro copias por viaje- y las colas ocupan mas; se paga a cambio de no
+ * tener que partir tramas en trozos. Los programas viejos siguen bien
+ * porque data[] va al final. */
+#define MSG_DATA_MAX        1536
 
 struct message {
     unsigned long from;             /* pid del remitente: lo pone el kernel */
@@ -488,9 +491,10 @@ struct estado {
  * CMSG_ALARMA al puerto cada 'cada' ticks, y el driver espera en msg_recv
  * como para todo lo demas. Con cada = 0 se cancela.
  *
- * Solo para drivers (los que tienen MMIO concedido), y solo sobre un puerto
- * propio: un mensaje cada 10 ms es un recurso, no un derecho. */
-#define SYS_alarma       55    /* (puerto, cada_ticks) -> 0 | -EPERM       */
+ * Solo sobre un puerto propio, y un mensaje cada 10 ms es un recurso, no un
+ * derecho: un reloj tan fino es para drivers (los que tienen MMIO); a un
+ * proceso normal se le da como mucho diez veces por segundo (cada >= 10). */
+#define SYS_alarma       55    /* (puerto, cada_ticks) -> 0 | -EPERM | -EINVAL */
 
 /* La MAC de la placa, para el driver de la tarjeta de red. Solo drivers. */
 #define SYS_mac          56    /* () -> 48 bits, byte 0 abajo; 0 si no hay  */

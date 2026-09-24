@@ -356,9 +356,11 @@ void syscall_dispatch(struct trap_frame *f)
         break;
     }
 
-    /* El reloj como mensaje: solo drivers, y solo sobre un puerto propio. */
+    /* El reloj como mensaje, sobre un puerto propio. Cada tick solo para
+     * drivers; los demas, diez por segundo como mucho. */
     case SYS_alarma: {
-        if (!current || !current->mmio_va) { ret = -EPERM; break; }
+        if (!current) { ret = -EPERM; break; }
+        if (!current->mmio_va && f->x[1] && f->x[1] < 10) { ret = -EINVAL; break; }
         ret = alarma_poner(current->pid, (int)f->x[0], f->x[1]) < 0 ? -EPERM : 0;
         break;
     }

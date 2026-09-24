@@ -195,7 +195,7 @@ int port_notify(int id, uint64_t tipo)
  *
  * La entrada se borra sola cuando el puerto cambia de duenyo: un driver que
  * muere no deja un reloj sonando en un puerto que ya es de otro. */
-#define MAX_ALARMAS 4
+#define MAX_ALARMAS 8
 
 static struct alarma {
     uint64_t pid;                    /* 0 = ranura libre */

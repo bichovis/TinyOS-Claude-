@@ -6921,6 +6921,87 @@ El cable funciona en los dos sentidos. La oferta no se acepta todavia: eso
 es la pila del paso siguiente. En la Pi, ademas de la oferta del router, se
 veran las primeras tramas de la casa: ARP de quien pregunte por quien.
 
+## La pila de red, en su propio proceso
+
+En la placa, el LAN9514 fue a la primera: enlace a 100 full, la MAC de la
+GPU, y las primeras tramas de la casa -el router preguntando por ARP-. El
+cable funciona. Ahora hay que darle sentido a lo que pasa por el, y la
+primera decision es DONDE.
+
+### El driver mueve bytes; otro les da sentido
+
+El DHCP DISCOVER a mano del paso anterior vivia en el driver de USB. Valia
+como sonda; no vale como disenyo: el driver de una tarjeta no tiene por que
+saber lo que es una direccion IP, igual que el del pendrive no sabe lo que
+es un fichero. Asi que la pila es OTRO proceso, `red`, un servidor como el
+de ficheros: vive en `PORT_RED` (el 3, reservado como el 0, el 1 y el 2),
+recibe del driver cada trama entera (`NMSG_TRAMA`), le manda las suyas
+(`NMSG_ENVIAR`), y no toca un registro. Si se cuelga, se cuelga el; el
+teclado y el pendrive, que viven en el driver, siguen. El driver le avisa de
+que hay tarjeta (`NMSG_TARJETA`, con su puerto y la MAC) y, si no hay nadie
+en `PORT_RED`, insiste cada segundo.
+
+Eso obliga a que un mensaje lleve una trama: `MSG_DATA_MAX` pasa de 544 a
+1536. Se paga en copias -cuatro por viaje, todas de 1,5 KB- y en colas (8
+mensajes por puerto, 12 KB); se compra no tener que partir tramas. Y
+`alarma()` deja de ser solo de drivers: un proceso normal puede pedir un
+reloj de diez veces por segundo como mucho; cada tick sigue siendo para
+quien tiene MMIO.
+
+### La cebolla
+
+Una pila de red es una cebolla de cabeceras, cada una con su direccion:
+Ethernet (14 bytes, de que tarjeta a que tarjeta), IPv4 (20, de que maquina
+a que maquina), UDP (8, de que programa a que programa), y dentro lo que
+sea. Todo en "orden de red", el byte alto primero, que es al reves de como
+guarda los numeros el ARM: en `red.c` no se lee ni escribe un numero de una
+cabecera directamente nunca; siempre byte a byte, con `be16`/`be32`. Y una
+sola suma de comprobacion -de 16 en 16 bits con acarreo circular- que sirve
+para IP, ICMP y UDP.
+
+Dos protocolos no llevan nada dentro y sirven a los demas. **ARP** traduce
+una IP a la MAC que la tiene: "quien tiene 192.168.1.1? que conteste a
+192.168.1.144", a todos, y la respuesta va a una tabla de ocho. De paso se
+apunta a cualquiera que hable desde nuestra red, y se contesta cuando
+preguntan por nosotros, que es lo que hace que el router pueda mandarnos
+algo. Una trama IP cuyo destino no esta en la tabla se queda esperando
+-una sola- a que ARP conteste. **ICMP** es el ping: llega un *echo request*
+a nuestra direccion, se devuelve igual con el tipo cambiado. Con eso la Pi
+es una maquina mas de la red: desde el Mac, `ping 192.168.1.144` contesta.
+
+### DHCP: cuatro mensajes y un reloj
+
+DISCOVER ("soy esta MAC, alguien me da direccion?"), OFFER ("te ofrezco
+esta"), REQUEST ("vale, esa, la de ese servidor"), ACK ("tuya durante tanto;
+y la mascara, el router, el DNS y, si lo hay, el servidor de hora"). Todos a
+255.255.255.255, porque al principio no se sabe ni quien es el servidor. El
+formato es BOOTP, de 1985, con la galleta magica delante de las opciones:
+236 bytes fijos, casi todos a cero. Es feo y es lo que hay: todas las redes
+del mundo lo hablan. Se pide la opcion 42 -NTP- por si el router la da.
+
+El reloj: si nadie contesta se pregunta otra vez esperando el doble cada
+vez (2, 4, 8... 32 s); a la mitad del alquiler se renueva; un NAK vuelve al
+principio. Sin direccion todavia, lo unico que puede venir para nosotros es
+la respuesta del DHCP, y algunos servidores la mandan a la IP que van a
+darnos en vez de a todos: se acepta cualquier UDP al puerto 68 aunque el
+destino IP no sea aun el nuestro.
+
+### La prueba
+
+En QEMU (`-netdev user -device usb-net`), con el teclado y el pendrive
+enchufados a la vez:
+
+    [red] pila de red viva en EL0, puerto 3
+    [usb] tarjeta de red CDC-ECM, MAC 52:54:00:12:34:57
+    [red] tarjeta CDC-ECM, MAC 52:54:00:12:34:57: pido direccion (DHCP)
+    [red] DHCP: 10.0.2.2 me ofrece 10.0.2.15; la pido
+    [red] DHCP: tengo la 10.0.2.15/24, router 10.0.2.2, DNS 10.0.2.3, NTP 0.0.0.0, alquiler 86400 s
+
+El teclado escribe, `/mnt` lee y escribe, la SD sigue igual. Falta lo que
+va encima de UDP: DNS para saber donde esta el servidor de hora, y NTP para
+preguntarle. Es el paso siguiente, y con el la hora del kernel y las fechas
+de los ficheros.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -7113,6 +7194,14 @@ veran las primeras tramas de la casa: ARP de quien pregunte por quien.
   servirle al `fs` los sectores que quiera: el `fs` no tiene forma de saber
   si quien le habla es un driver. Un proceso podria "montar" lo que
   quisiera en /mnt.
+- La pila de red guarda UNA trama esperando a ARP; si llegan dos seguidas a
+  destinos desconocidos, la primera se pierde y el protocolo de arriba tiene
+  que reintentar. La tabla ARP no caduca. No hay fragmentacion IP: un
+  datagrama partido se tira. Y el driver se BLOQUEA si la cola de la pila
+  esta llena (`msg_send` espera): una pila colgada pararia el teclado.
+- Cualquier proceso podria ponerse en `PORT_RED` antes que `red` y quedarse
+  con las tramas; y cualquier proceso puede mandar `NMSG_ENVIAR` al driver.
+  Misma falta de identidad que con `FS_DISCO`.
 - La red se sondea a cada alarma, 10 ms: una trama tarda hasta eso en verse.
   El driver sigue sin usar la IRQ 9; el canal 1 que se queda esperando es el
   sustituto barato de una interrupcion de canal, y el dia que haga falta

@@ -39,7 +39,7 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir lento clave vi usb
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir lento clave vi usb red
 
 # Los que van a /usr/bin de la tarjeta: todos menos los cinco que el kernel
 # lleva dentro (init, sh, fs, conserver, client) y por tanto no necesitan
@@ -50,7 +50,7 @@ UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd tr
 # 'init' en ninguna. Un programa nuevo habia que acordarse de anyadirlo en
 # tres sitios, y olvidarse de uno no da ningun error: simplemente ese
 # programa no esta en la tarjeta y el shell dice que no existe.
-BINPROGS := $(filter-out init sh fs conserver client usb,$(UPROGS))
+BINPROGS := $(filter-out init sh fs conserver client usb red,$(UPROGS))
 
 # Programas de usuario con mas de un fichero fuente
 EXTRA_fs := user/sd.c

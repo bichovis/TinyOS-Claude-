@@ -25,7 +25,7 @@
  * pasar en cuanto init pidio un puerto antes que el servidor de ficheros:
  * se llevo el 1, y el servidor se encontro su sitio ocupado y se murio.
  * Un numero reservado que no esta reservado no es un numero reservado. */
-#define PORT_PRIMERO_LIBRE  3
+#define PORT_PRIMERO_LIBRE  4   /* el 3 es la pila de red (PORT_RED, net_abi.h) */
 
 struct port {
     int          in_use;
