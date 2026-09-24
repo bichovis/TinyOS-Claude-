@@ -6505,11 +6505,62 @@ En QEMU el raiz emulado es de velocidad completa, asi que la particion no se
 activa nunca -no hay nada rapido por medio- y el pendrive del hub se enumera
 directo y recibe la direccion 2. La particion de verdad solo la prueba la placa.
 
+### Y en la placa, a la primera
+
+```
+  [usb] puerto 3 reseteado, velocidad completa (a traves del hub, partido); le pregunto quien es
+  [usb] descriptor: 12 01 00 02 00 00 00 40 6d 04 48 c5 03 05 01 02 00 01
+  [usb] direccion 0: es 046d:c548, clase 0, USB 2.00, paquete maximo 64
+  [usb] 0x046d es Logitech: el receptor del teclado y el raton
+  [usb] el del puerto 3 ya es la direccion 3
+```
+
+`046d:c548` es el receptor Logitech Bolt, de velocidad completa, hablando a
+traves del hub con la particion sincrona. Con `bMaxPacketSize0 = 64` el
+descriptor cupo en un ciclo; la ruta de varios paquetes por transferencia la
+prueba el descriptor de configuracion del paso siguiente, que mide mas.
+
+## HID, o preguntarle a un teclado
+
+Un dispositivo HID describe con un *report descriptor* el formato de lo que
+manda, y un driver de verdad lo interpreta. Pero los teclados y ratones tienen
+ademas el **protocolo boot**: un formato fijo que existe para que una BIOS pueda
+leerlos sin interpretar nada. Teclado: 8 bytes, modificadores y hasta seis
+teclas pulsadas. Raton: botones, dx, dy. Es lo que se usa aqui.
+
+Donde estan sus endpoints lo dice el descriptor de configuracion, que se lee
+entero -su `wTotalLength`- y se recorre descriptor a descriptor: interfaces de
+clase 3 con protocolo 1 o 2, y detras de cada una su endpoint de interrupcion,
+con su tamanyo y su intervalo. No se supone que sea el 0x81: se busca.
+
+Y despues de `SET_CONFIGURATION`, dos peticiones de clase a la interfaz: el
+protocolo boot, y *idle* a cero para que solo avise cuando cambie algo.
+
+### Un teclado no avisa: se le pregunta
+
+Cada `bInterval` milisegundos el anfitrion le manda un IN al endpoint de
+interrupcion, y el teclado contesta NAK -"nada"- o un informe. Aqui se pregunta
+cada tick, 10 ms, y se traduce lo que llega. Los codigos de tecla no son ASCII
+sino *usages* del HID -la 'a' es el 4-, y una tabla pequenya traduce lo justo.
+
+Para sondear hace falta que una lectura partida que reciba NAK vuelva
+enseguida, y hasta aqui insistia cuarenta veces: para un descriptor NAK es
+"espera un poco", pero para un teclado NAK es la respuesta normal el 99% de las
+veces. Asi que el numero de intentos es un parametro, y el sondeo lo pone a uno.
+
+El DATA0/DATA1 del endpoint **persiste** entre sondeos: es un estado del
+endpoint, no de la transferencia, y se guarda con el. Equivocarse ahi no da
+error, da informes repetidos o perdidos en silencio.
+
+Y esto es lo que en un sistema con planificador de micro-tramas haria el
+hardware; aqui lo hace un proceso. Es la razon de que sirva para teclados y
+ratones y no para nada que pida mas de cien preguntas por segundo.
+
 ### Lo que falta
 
-El HID: configurar el receptor, leer su descriptor de configuracion para
-encontrar los endpoints de interrupcion, y leer una tecla. Y luego la Ethernet,
-que ya esta en su direccion esperando.
+Que las teclas vayan a la consola en vez de imprimirse: el driver de USB
+entregandoselas a la disciplina de linea, como hace el conserver con las de la
+UART. Y luego la Ethernet, que esta en la direccion 2 esperando.
 
 ## Limitaciones conocidas
 

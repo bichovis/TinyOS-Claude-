@@ -585,6 +585,12 @@ static void esperar_microtramas(int n)
  * con CERO bytes, para que el nucleo no vuelva a pedirle datos a la FIFO. */
 static int ultimo_recibido;   /* bytes que llegaron en la ultima lectura */
 
+/* Cuantas veces insistir con un dispositivo partido que dice NAK. Para un
+ * descriptor, muchas: NAK es "espera un poco". Para SONDEAR un teclado, una:
+ * NAK es "no hay tecla", que es la respuesta normal el 99% de las veces, y hay
+ * que volver enseguida para no tener el bus ocupado con un teclado callado. */
+static int split_intentos = 40;
+
 static uint32_t canal_transferir(int entrada, int tipo, int mps, int addr,
                                  int ep, int pid, uint64_t pa, int bytes)
 {
@@ -607,7 +613,7 @@ static uint32_t canal_transferir(int entrada, int tipo, int mps, int addr,
         uint32_t r = 0;
         int listo = 0;
 
-        for (int vuelta = 0; vuelta < 40 && !listo; vuelta++) {
+        for (int vuelta = 0; vuelta < split_intentos && !listo; vuelta++) {
             /* Start split: para un OUT lleva los datos; para un IN, el
              * tamanyo del paquete que se espera. */
             r = canal_hacer(0, entrada, tipo, mps, addr, ep, pid, pa + hecho,
@@ -871,6 +877,134 @@ static int hub_estado_puerto(int addr, int mps, int puerto,
         return -1;
     *estado = (unsigned)(d[0] | (d[1] << 8));
     *cambio = (unsigned)(d[2] | (d[3] << 8));
+    return 0;
+}
+
+/* --- HID: el idioma de los teclados -------------------------------------------
+ *
+ * Un dispositivo HID describe con un "report descriptor" el formato de lo que
+ * manda, y un driver de verdad lo interpreta. Pero los teclados y ratones
+ * tienen ademas el PROTOCOLO BOOT: un formato fijo que existe para que una
+ * BIOS pueda leerlos sin interpretar nada. Es lo que se usa aqui.
+ *
+ *   teclado, 8 bytes: modificadores, reservado, y hasta 6 teclas pulsadas
+ *   raton,   3 bytes: botones, dx, dy
+ *
+ * Los codigos de tecla no son ASCII: son "usages" del HID, y la 'a' es el 4.
+ * La tabla de abajo traduce lo justo para ver que llega. */
+#define HID_SET_IDLE      0x0A
+#define HID_SET_PROTOCOL  0x0B
+#define HID_PROTO_BOOT    0
+
+struct hid_ep {
+    int addr, ep, mps, intervalo, iface;
+    int split, puerto, baja;         /* como se le habla */
+    int toggle;                      /* DATA0/DATA1 del endpoint, que persiste */
+    int hay;
+};
+
+#define DIR_HUB 1
+
+static struct hid_ep teclado, raton;
+
+/* Leer la configuracion entera y apuntar donde estan el teclado y el raton. */
+static int hid_descubrir(int addr, int mps)
+{
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+
+    if (control_leer(addr, mps, 0x80, 6, 0x0200, 0, 9) < 0) return -1;
+    int total = d[2] | (d[3] << 8);
+    if (total > 255) total = 255;
+
+    /* El descriptor entero: interfaces y endpoints seguidos, cada uno con su
+     * longitud en el byte 0 y su tipo en el 1. Se recorre; no se supone. */
+    if (control_leer(addr, mps, 0x80, 6, 0x0200, 0, total) < 0) return -1;
+
+    int config = d[5];
+    int iface = -1, clase = 0, sub = 0, proto = 0;
+
+    for (int i = 0; i + 1 < total; i += d[i] ? d[i] : 1) {
+        int tipo = d[i + 1];
+
+        if (tipo == 4) {                            /* interfaz */
+            iface = d[i + 2]; clase = d[i + 5]; sub = d[i + 6]; proto = d[i + 7];
+            printf("  [usb]   interfaz %d: clase %d.%d protocolo %d%s\n",
+                   iface, clase, sub, proto,
+                   clase == 3 ? (proto == 1 ? " (teclado boot)" :
+                                 proto == 2 ? " (raton boot)" : " (HID)") : "");
+        }
+        if (tipo == 5 && clase == 3 && (d[i + 2] & 0x80)) {   /* endpoint IN */
+            struct hid_ep *e = (proto == 1) ? &teclado : (proto == 2) ? &raton : 0;
+            printf("  [usb]     endpoint 0x%02x, %d bytes, cada %d ms\n",
+                   d[i + 2], d[i + 4] | (d[i + 5] << 8), d[i + 6]);
+            if (e && !e->hay) {
+                e->hay = 1; e->addr = addr; e->iface = iface;
+                e->ep = d[i + 2] & 0xF;
+                e->mps = d[i + 4] | (d[i + 5] << 8);
+                e->intervalo = d[i + 6];
+                e->split = split_activo; e->puerto = split_puerto;
+                e->baja = dispositivo_baja; e->toggle = 0;
+            }
+        }
+    }
+
+    if (control_escribir(addr, mps, 0x00, 9, (uint16_t)config, 0) < 0) return -1;
+
+    /* Protocolo boot e "idle" a cero -avisa solo cuando cambie algo- en las
+     * dos interfaces. Son peticiones de clase a la INTERFAZ (recipient 1). Si
+     * el dispositivo no las acepta no pasa nada: casi todos ya nacen en boot. */
+    struct hid_ep *es[2] = { &teclado, &raton };
+    for (int k = 0; k < 2; k++) {
+        if (!es[k]->hay || es[k]->addr != addr) continue;
+        control_escribir(addr, mps, 0x21, HID_SET_PROTOCOL, HID_PROTO_BOOT, (uint16_t)es[k]->iface);
+        control_escribir(addr, mps, 0x21, HID_SET_IDLE, 0, (uint16_t)es[k]->iface);
+    }
+    return 0;
+}
+
+/* Una lectura del endpoint de interrupcion: un solo ciclo, y NAK es "nada".
+ * Devuelve los bytes leidos, 0 si no habia nada, -1 si fue mal. */
+static int hid_sondear(struct hid_ep *e, uint8_t *out)
+{
+    split_activo = e->split; split_hub = DIR_HUB; split_puerto = e->puerto;
+    dispositivo_baja = e->baja;
+    split_intentos = 1;
+
+    uint32_t r = canal_transferir(1, EP_INT, e->mps, e->addr, e->ep,
+                                  e->toggle ? PID_DATA1 : PID_DATA0,
+                                  dma_pa + OFF_DATOS, e->mps);
+
+    split_intentos = 40;
+    split_activo = 0;
+
+    if (r & HCI_XFERCOMPL) {
+        e->toggle ^= 1;
+        volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+        int n = ultimo_recibido;
+        for (int i = 0; i < n && i < 64; i++) out[i] = d[i];
+        return n;
+    }
+    if (r & (HCI_NAK | HCI_NYET)) return 0;
+    if (!r) return 0;
+    return -1;
+}
+
+/* Del "usage" del teclado boot a un caracter, para lo que cabe en una tabla
+ * pequenya. Lo que no cabe se ensenya como numero. */
+static char hid_tecla(int usage, int shift)
+{
+    if (usage >= 4 && usage <= 29)  return (char)((shift ? 'A' : 'a') + usage - 4);
+    if (usage >= 30 && usage <= 38) return shift ? "!@#$%^&*("[usage - 30] : (char)('1' + usage - 30);
+    if (usage == 39) return shift ? ')' : '0';
+    if (usage == 40) return '\n';
+    if (usage == 42) return 8;                   /* borrar */
+    if (usage == 43) return '\t';
+    if (usage == 44) return ' ';
+    if (usage == 45) return shift ? '_' : '-';
+    if (usage == 46) return shift ? '+' : '=';
+    if (usage == 54) return shift ? '<' : ',';
+    if (usage == 55) return shift ? '>' : '.';
+    if (usage == 56) return shift ? '?' : '/';
     return 0;
 }
 
@@ -1295,7 +1429,6 @@ int main(int argc, char **argv)
      * VIEJA: el dispositivo cambia de nombre despues de decir "hecho". Y la
      * norma le da 2 ms para acostumbrarse antes de que nadie le hable por el
      * nuevo. */
-    #define DIR_HUB 1
     if (control_escribir(0, mps0, 0x00, 5, DIR_HUB, 0) < 0) {
         printf("  [usb] no acepta SET_ADDRESS\n");
         for (;;) sleep(1000);
@@ -1418,16 +1551,60 @@ int main(int argc, char **argv)
 
         if (control_escribir(0, mps2, 0x00, 5, (uint16_t)siguiente_dir, 0) < 0) {
             printf("  [usb] no acepta SET_ADDRESS(%d)\n", siguiente_dir);
-        } else {
-            sleep(1);
-            printf("  [usb] el del puerto %d ya es la direccion %d\n", pt, siguiente_dir);
-            siguiente_dir++;
+            split_activo = 0;
+            continue;
         }
+        sleep(1);
+        printf("  [usb] el del puerto %d ya es la direccion %d\n", pt, siguiente_dir);
+
+        /* Si es un HID -clase 0 en el dispositivo y clase 3 en la interfaz-,
+         * mirar dentro y dejarlo listo para sondearlo. */
+        if (c2 == 0 && hid_descubrir(siguiente_dir, mps2) == 0 && (teclado.hay || raton.hay))
+            printf("  [usb] HID configurado: %s%s%s\n",
+                   teclado.hay ? "teclado" : "", (teclado.hay && raton.hay) ? " y " : "",
+                   raton.hay ? "raton" : "");
+
+        siguiente_dir++;
         split_activo = 0;
     }
 
-    /* Y aqui se para, con cada dispositivo en su direccion. Lo siguiente es
-     * el HID: configurar el receptor, encontrar sus endpoints de interrupcion
-     * y leer una tecla. */
-    for (;;) sleep(1000);
+    if (!teclado.hay) {
+        printf("  [usb] no hay teclado; me quedo aqui\n");
+        for (;;) sleep(1000);
+    }
+
+    /* --- 12. Sondear el teclado --------------------------------------------
+     *
+     * Un teclado USB no avisa: se le pregunta. Cada bInterval milisegundos el
+     * anfitrion le manda un IN a su endpoint de interrupcion, y el teclado
+     * contesta NAK -"nada"- o un informe de 8 bytes. Aqui se pregunta cada
+     * 10 ms, que es un tick, y se traduce lo que llega.
+     *
+     * Y esto es lo que en un sistema con planificador de micro-tramas haria
+     * el hardware; aqui lo hace un proceso, que es la razon de que solo sirva
+     * para teclados y ratones y no para nada que pida mas de cien preguntas
+     * por segundo. */
+    printf("  [usb] escuchando el teclado: pulsa algo\n");
+
+    uint8_t inf[64], antes[8] = { 0 };
+    for (;;) {
+        int n = hid_sondear(&teclado, inf);
+        if (n >= 8) {
+            int shift = (inf[0] & 0x22) != 0;
+            for (int k = 2; k < 8; k++) {
+                int u = inf[k];
+                if (!u) continue;
+                int ya = 0;
+                for (int j = 2; j < 8; j++) if (antes[j] == u) ya = 1;
+                if (ya) continue;                      /* sigue pulsada */
+                char c = hid_tecla(u, shift);
+                if (c) printf("%c", c); else printf("[%02x]", u);
+            }
+            for (int k = 0; k < 8; k++) antes[k] = inf[k];
+        } else if (n < 0) {
+            printf("  [usb] el teclado ha fallado al sondearlo\n");
+            sleep(50);
+        }
+        sleep(1);
+    }
 }
