@@ -186,21 +186,35 @@
  * chip ha escrito en otra parte. Sin ese patron, las dos cosas se ven igual. */
 #define BUS(pa)   ((uint32_t)((uint64_t)(pa) | 0xC0000000UL))
 
-/* Y este chip quiere la FISICA, no la de bus. Lo dijo el experimento, y de
- * paso me corrigio:
+/* Y este chip quiere la DE BUS. Esta linea ha cambiado de valor dos veces, y
+ * las dos veces por un razonamiento mio que parecia un experimento y no lo era.
  *
- * Con la de bus, HCDMA volvia avanzado ocho bytes y yo lo lei como "el nucleo
- * leyo los ocho bytes del SETUP". Solo probaba que movio su puntero.
- * 0xC015C000 esta muy por encima de los 996 MB de RAM de esta placa, asi que
- * leyo de ninguna parte, avanzo igual y se atasco sin decir nada.
+ * Primero puse el alias 0xC0000000, que es lo que hacen Linux y Circle. Luego,
+ * con otros tres fallos vivos a la vez -MC a cero, el reloj del PHY mal, el
+ * dominio de alimentacion a medias-, vi que con la fisica a secas salia un
+ * XACTERR y con el alias no salia nada, y "conclui" que este chip queria la
+ * fisica. La comparacion estaba confundida por los otros tres fallos: no media
+ * la direccion, media el ruido.
  *
- * Con la fisica a secas, la transferencia SALIO -llego a dar un XACTERR, que es
- * un error de verdad en el cable-, y eso es lo que distingue "no hizo nada" de
- * "lo hizo y fue mal".
+ * Lo que de verdad lo zanja es esto: con la fisica a secas, el hub recibe el
+ * SETUP tal como estaba ANTES de que la CPU lo escribiera. En el buffer
+ * reescrito recibia el paquete viejo (wLength 8) y mandaba 8 bytes; en un
+ * buffer virgen recibia ceros y contestaba STALL. Y la CPU, releyendo la RAM,
+ * veia el paquete correcto. Entre la RAM y el chip solo hay una cosa que pueda
+ * guardar una copia vieja: la L2 de la VideoCore.
  *
- * La leccion: un contador que avanza no prueba que lo que se leyo fuera lo
- * correcto. Prueba que alguien conto. */
-static int dma_bus = 0;
+ * En el BCM283x, la RAM se ve desde el bus de la GPU por cuatro alias, y se
+ * distinguen en si pasan por esa L2. El alias 0x00000000 -que es la fisica del
+ * ARM tal cual- pasa por ella: la primera lectura del DWC2 mete la linea en la
+ * L2 con el contenido de ese momento, la CPU escribe la RAM sin que la L2 se
+ * entere, y la siguiente lectura del DWC2 acierta en la L2 y trae lo viejo. El
+ * alias 0xC0000000 no pasa por ella. Por eso Linux declara "dma-ranges" con
+ * 0xC0000000 para este SoC y Circle envuelve toda direccion de DMA en
+ * BUS_ADDRESS(): no es un capricho de numeracion, es coherencia de cache.
+ *
+ * La leccion, dos veces aprendida: un experimento con tres variables sueltas
+ * no mide ninguna. */
+static int dma_bus = 1;
 
 /* Lo que quedo en el canal al detenerse la ultima transferencia. */
 static uint32_t ultimo_hctsiz, ultimo_hcdma;
@@ -531,21 +545,14 @@ static void quejarse_canal(const char *que, uint32_t i)
 static uint64_t dma_va, dma_pa;
 
 #define OFF_SETUP   0
-#define OFF_SETUP_B 16       /* el segundo, que nunca ha tenido un wLength de 8 */
 #define OFF_DATOS  64
-
-/* Alternar el buffer del SETUP entre peticiones es un experimento, no un
- * disenyo: si la hipotesis es que el DMA lee el paquete de la vez anterior,
- * darle un sitio que nunca tuvo paquete anterior la confirma o la mata sin
- * gastar un arranque en una suposicion. */
-static int setup_turno;
 
 #define PATRON  0xA5      /* con que se rellena para saber si el DMA llego */
 
 static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
                         uint16_t valor, uint16_t indice, int bytes)
 {
-    uint64_t off_setup = (setup_turno++ & 1) ? OFF_SETUP_B : OFF_SETUP;
+    uint64_t off_setup = OFF_SETUP;
     volatile uint8_t *setup = (volatile uint8_t *)(dma_va + off_setup);
     volatile uint8_t *datos = (volatile uint8_t *)(dma_va + OFF_DATOS);
 
@@ -585,7 +592,8 @@ static int control_leer(int addr, int mps, uint8_t tipo, uint8_t peticion,
                "HCINT 0x%03x, HCTSIZ 0x%08x -> recibidos %d, HCDMA avanzo %ld\n",
                bytes, programado, (unsigned long)off_setup, (unsigned int)r,
                (unsigned int)ultimo_hctsiz, programado - restante,
-               (long)(ultimo_hcdma - (uint32_t)(dma_pa + OFF_DATOS)));
+               (long)(ultimo_hcdma - (dma_bus ? BUS(dma_pa + OFF_DATOS)
+                                              : (uint32_t)(dma_pa + OFF_DATOS))));
         printf("  [usb]   SETUP tal como esta en memoria:");
         for (int i = 0; i < 8; i++) printf(" %02x", (unsigned)setup[i]);
         printf("\n");

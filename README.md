@@ -6303,6 +6303,41 @@ nunca ha contenido un `wLength` de 8. Si con eso llegan los 18, era eso. Si
 siguen llegando 8 desde un buffer virgen, no lo era, y el testigo dira donde
 mirar.
 
+### El testigo hablo: la L2 de la VideoCore
+
+```
+  lectura de 8  (SETUP en +0):  recibidos 8, HCDMA avanzo 8      <- bien
+  SETUP tal como esta en memoria: 80 06 00 01 00 00 08 00
+  los datos no llegaron: HCINT = 0x0000000a STALL                <- con el SETUP en +16
+```
+
+Con el SETUP en un buffer **virgen**, el hub contesta STALL: rechazo la peticion
+porque no la entendio. Con el buffer reescrito, antes mandaba 8 bytes: la
+peticion *anterior*. Y la CPU, releyendo la RAM, ve el paquete correcto.
+
+Asi que en los dos casos el hub recibio **lo que habia en ese buffer antes de
+que la CPU escribiera**: el paquete viejo en `+0`, ceros en `+16` -y un SETUP de
+ceros es un `GET_STATUS` mal formado, que se contesta con STALL-. Las escrituras
+de la CPU llegan a la RAM; el DWC2 no las ve. Entre la RAM y el chip solo hay una
+cosa que pueda guardar una copia vieja.
+
+En el BCM283x la RAM se ve desde el bus de la GPU por cuatro alias, y se
+distinguen en si pasan por la **L2 de la VideoCore**, que no es coherente con el
+ARM. El alias `0x00000000` -la fisica del ARM tal cual- pasa por ella: la primera
+lectura del DWC2 mete la linea en esa L2 con el contenido de ese momento, la CPU
+escribe la RAM sin que la L2 se entere, y la siguiente lectura del DWC2 acierta
+en la L2 y trae lo viejo. El alias `0xC0000000` no pasa por ella. Por eso Linux
+declara `dma-ranges` con `0xC0000000` para este SoC y Circle envuelve toda
+direccion de DMA en `BUS_ADDRESS()`: no es un capricho de numeracion, es
+coherencia de cache.
+
+Y con eso, la direccion de DMA vuelve a ser la que era al principio. Esta linea
+ha cambiado de valor dos veces, y las dos por un razonamiento mio que parecia un
+experimento y no lo era: la comparacion del paso 62f se hizo con otros tres
+fallos vivos a la vez -MC a cero, el reloj del PHY, el dominio de alimentacion-
+y no media la direccion, media el ruido. **Un experimento con tres variables
+sueltas no mide ninguna.** Segunda vez que lo escribo en este paso.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es
