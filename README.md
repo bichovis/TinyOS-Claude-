@@ -6136,6 +6136,60 @@ me llevo es de metodo y no de registro: **poner las caracteristicas de un canal 
 su bit de arranque en la misma escritura** le pide al nucleo que empiece con
 valores que estan llegando en ese mismo ciclo de bus. Separarlo es gratis.
 
+### Un XACTERR no es el final, y otro arreglo mio que era un error
+
+Con la secuencia alineada, la placa dio por fin algo que no habia dado nunca:
+
+```
+  intento 1:  HCINT = 0x00000080 XACTERR
+  intento 2:  GAHBCFG = 0x0000001f (DMA APAGADO), HCCHAR = 0xc0100008
+```
+
+Y esas dos lineas juntas son un diagnostico completo, leidas contra Linux y
+CherryUSB en vez de contra mi memoria.
+
+**El `XACTERR` del intento 1 no lleva el bit 1, `CHHLTD`.** El canal reporto un
+error de transaccion y **seguia activo**: un XACTERR es el nucleo diciendo "esta
+transaccion fue mal" mientras reintenta las veces que diga MC. Mi bucle volvia
+en cuanto veia cualquier bit, `control_leer` reintentaba, y `canal_hacer`
+reprogramaba `HCCHAR`, `HCTSIZ` y `HCDMA` de un canal que **todavia estaba
+transfiriendo**. Eso es comportamiento indefinido en el DWC2, y lo que sale
+despues -`ChEna` y `ChDis` a la vez, el DMA apagandose solo- es el aspecto de un
+nucleo con un canal corrompido. Los dos sintomas que mas me habian
+desconcertado eran consecuencia de mi propio reintento.
+
+El final de una transferencia es **uno**: el bit de detenido. Se detiene al
+acabar bien y al acabar mal, y solo entonces el resto de `HCINT` dice cual de
+las dos. Y detener un canal a mano, en modo DMA, es poner `ChEna` **y** `ChDis`
+-`dwc2_hc_halt`- y esperar a que el nucleo lo confirme. Yo ponia solo `ChDis` y
+volvia en el acto.
+
+**Y por que hubo un XACTERR en el primer intento, que era genuino.** El paso 62b
+puso `HCFG.FSLSPCLKSEL` a 48 MHz cuando el enlace era de velocidad completa,
+razonando "el reloj del bus tiene que ser el del enlace". Lo saque de una
+implementacion para STM32, y en un STM32 es correcto: lleva un PHY dedicado de
+velocidad completa a 48 MHz. **Este chip lleva un PHY UTMI+ de alta velocidad,
+y ese PHY corre a 30/60 MHz siempre**, hable a la velocidad que hable; el nucleo
+divide por dentro. Lo dice `dwc2_init_fs_ls_pclk_sel`: *"High speed PHY running
+at full speed or high speed -> 30/60 MHz"*.
+
+Con el reloj mal, los bits salen al cable a una velocidad que no es la del
+cable. El dispositivo recibe basura y no contesta. Eso es un XACTERR, y aparecio
+justo cuando MC dejo de valer cero y la transaccion empezo a existir.
+
+Lo que si depende del enlace es `HFIR`, relojes por trama: a 60 MHz -PHY de 8
+bits, segun `GUSBCFG.PHYIF`- una trama de velocidad completa son 60000 y una
+micro-trama de alta 7500. Es la formula de `dwc2_calc_frame_interval`.
+
+**Y el buzon.** Contestaba `0xffffffff`, mi centinela de "no contesto", con el
+dispositivo encendiendose debajo. El timeout de `mbox_call` eran 100 ms, y
+encender un dominio de alimentacion con espera es la GPU arrancando un bloque de
+silicio: tarda lo que tarde. Ahora es un segundo -el buzon solo se usa al
+arrancar- y ademas se distingue "no contesto" de "contesto con un codigo de
+error", que el booleano de antes fundia en un cero.
+
+Tres cosas, las tres leidas en el codigo de alguien que lo tiene funcionando.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es

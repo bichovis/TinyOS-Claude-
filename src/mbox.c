@@ -48,7 +48,17 @@ static volatile uint32_t buf[16] __attribute__((aligned(16)));
  * implementa el buzon, un firmware al que no le gusta la peticion) no
  * podemos quedarnos esperando para siempre: eso seria colgar el arranque
  * entero. Nos damos 100 ms y nos rendimos.                              */
-#define MBOX_TIMEOUT_MS  100
+/* Un segundo, no cien milisegundos. El buzon solo se usa al arrancar y no hay
+ * nada que dependa de que conteste rapido; en cambio, encender un dominio de
+ * alimentacion CON espera -que es lo que pide SET_POWER_STATE con el bit 1- es
+ * la GPU arrancando un bloque de silicio, y eso tarda lo que tarde. Con 100 ms
+ * la llamada expiraba mientras la GPU seguia trabajando, y el driver veia "no
+ * contesta" con el dispositivo encendiendose debajo. */
+#define MBOX_TIMEOUT_MS  1000
+
+/* El codigo de la ultima respuesta, para poder distinguir "no contesto" de
+ * "contesto que no". mbox_call devuelve un booleano y eso pierde la diferencia. */
+static uint32_t mbox_ultimo_codigo;
 
 void dcache_clean_range(const void *addr, uint64_t bytes);       /* cache.S */
 void dcache_invalidate_range(const void *addr, uint64_t bytes);  /* cache.S */
@@ -81,6 +91,7 @@ static int mbox_call(uint32_t channel)
             /* Y simetricamente: tirar lo que tengamos cacheado del buffer,
              * porque lo que vale es lo que la GPU acaba de dejar en RAM. */
             dcache_invalidate_range((const void *)buf, sizeof(buf));
+            mbox_ultimo_codigo = buf[1];
             return buf[1] == CODE_RESP_OK;
         }
         if (timer_now() > limit)
@@ -147,7 +158,13 @@ uint32_t mbox_power_on(uint32_t device_id)
     buf[6] = PWR_ON | PWR_ESPERAR;
     buf[7] = TAG_END;
 
-    if (!mbox_call(MBOX_CH_PROP)) return 0xFFFFFFFFu;   /* ni contesto */
+    mbox_ultimo_codigo = 0;
+    if (!mbox_call(MBOX_CH_PROP)) {
+        /* Dos fallos distintos con el mismo booleano: o la GPU no contesto a
+         * tiempo -y entonces el codigo se quedo a cero- o contesto con un
+         * codigo de error (0x8000000x). Se devuelve lo que distinga los dos. */
+        return mbox_ultimo_codigo ? mbox_ultimo_codigo : 0xFFFFFFFFu;
+    }
 
     /* Se devuelve el estado TAL CUAL, sin juzgarlo.
      *

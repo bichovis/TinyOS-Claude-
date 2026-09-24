@@ -401,12 +401,25 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
     /* Y ahora arranca. */
     escribir(HCCHAR(canal), c | HCC_ENABLE);
 
-    /* Y esperar. El canal acaba avisando por HCINT, y las dos formas de acabar
-     * son "completada" y "detenida"; lo segundo puede ser bueno o malo, y lo
-     * dice el resto de los bits. */
+    /* Y esperar a que el canal se DETENGA. Solo a eso.
+     *
+     * Aqui estaba el fallo de protocolo que corrompia el nucleo. Mi bucle
+     * volvia en cuanto veia CUALQUIER bit -un XACTERR, por ejemplo- y un
+     * XACTERR no es el final: es el nucleo diciendo "esta transaccion ha ido
+     * mal" mientras sigue con el canal activo, reintentando las veces que diga
+     * MC. Yo volvia, control_leer reintentaba, y canal_hacer reprogramaba
+     * HCCHAR, HCTSIZ y HCDMA de un canal que TODAVIA ESTABA TRANSFIRIENDO.
+     * Eso es comportamiento indefinido en el DWC2, y lo que la placa ensenyaba
+     * despues -ChEna y ChDis a la vez, el DMA apagandose solo- es el aspecto
+     * de un canal corrompido.
+     *
+     * El final de una transferencia es UNO: el bit de "detenido". Se detiene
+     * al acabar bien y se detiene al acabar mal, y solo entonces el resto de
+     * HCINT dice cual de las dos. Es lo que hacen CherryUSB y Linux, y es por
+     * lo que la mascara del canal lleva ese bit y nada mas. */
     for (int v = 0; v < 2000000; v++) {
         uint32_t i = leer(HCINT(canal));
-        if (i & (HCI_XFERCOMPL | HCI_CHHLTD | HCI_MALO)) return i;
+        if (i & HCI_CHHLTD) return i;
     }
 
     /* Nada en un par de millones de vueltas. Antes de rendirse, contar lo que
@@ -428,7 +441,15 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
            (leer(GAHBCFG) & AHB_DMAEN) ? "encendido" : "APAGADO",
            (unsigned int)leer(HCDMA(canal)));
 
-    escribir(HCCHAR(canal), fin | HCC_DISABLE);
+    /* Detenerlo como manda el modo DMA: ChEna Y ChDis a la vez -Linux,
+     * dwc2_hc_halt: "in DMA mode, always sets the Channel Enable and Channel
+     * Disable bits"- y luego ESPERAR a que el nucleo confirme con el bit de
+     * detenido. Antes ponia solo ChDis y volvia en el acto, dejando el canal
+     * a medio detener para que la siguiente llamada lo reprogramara encima. */
+    escribir(HCCHAR(canal), fin | HCC_ENABLE | HCC_DISABLE);
+    for (int v = 0; v < 200000; v++)
+        if (leer(HCINT(canal)) & HCI_CHHLTD) break;
+    escribir(HCINT(canal), 0xFFFFFFFF);
     return 0;
 }
 
@@ -629,42 +650,38 @@ static void puerto_reset(void)
     sleep(3);                          /* y tiempo para recuperarse */
 }
 
-/* --- El reloj del bus tiene que ser el del enlace ----------------------
+/* --- El reloj del PHY, que NO es el del enlace ---------------------------
  *
- * Esto es lo que faltaba, y es el fallo mas instructivo de todo el USB hasta
- * ahora, porque une dos sintomas que yo tenia separados.
+ * Aqui hubo un arreglo equivocado, y merece quedar contado porque el error es
+ * de los que se repiten: en el paso 62b puse HCFG.FSLSPCLKSEL a 48 MHz cuando
+ * el puerto enumeraba a velocidad completa, razonando que "el reloj del bus
+ * tiene que ser el del enlace". Lo saque de una implementacion para STM32, y
+ * en un STM32 es correcto: aquel chip lleva un PHY DEDICADO de velocidad
+ * completa que corre a 48 MHz.
  *
- * HCFG.FSLSPCLKSEL le dice al nucleo a que reloj corre el PHY: 0 son 30/60 MHz
- * -lo que toca a alta velocidad- y 1 son 48 MHz, lo que toca a velocidad
- * completa. Yo lo ponia a 0 SIEMPRE, en la configuracion inicial, cuando
- * todavia no se puede saber a que velocidad va a enumerar el puerto.
+ * Este no. Este lleva un PHY UTMI+ de alta velocidad, y ese PHY corre a
+ * 30/60 MHz SIEMPRE, hable a la velocidad que hable: el nucleo divide por
+ * dentro. Linux lo dice en dwc2_init_fs_ls_pclk_sel: "High speed PHY running
+ * at full speed or high speed -> 30/60 MHz". FSLSPCLKSEL = 48 MHz es solo para
+ * quien tiene un PHY de velocidad completa con su propio reloj de 48.
  *
- * Y el puerto de la Pi enumero a velocidad completa. Con la base de tiempo
- * equivocada, una transferencia no falla: simplemente NO TERMINA. HCINT se
- * queda a cero, que es lo que decia la placa, y eso no se parece a un error
- * porque no lo es -es el canal esperando a unos plazos que no van a llegar-.
+ * Con el reloj mal, el nucleo pone los bits en el cable a una velocidad que no
+ * es la del cable. El dispositivo recibe basura, no contesta, y eso es un
+ * XACTERR: exactamente lo que dio la placa en cuanto MC dejo de valer cero.
  *
- * La leccion es la del sitio, no la del bit: esto no se puede configurar antes
- * del reset del puerto, porque el dato que hace falta -la velocidad- es
- * justamente lo que el reset averigua. Yo lo habia puesto en la inicializacion
- * del nucleo, que es donde parecia que iba.
- *
- * Y la anomalia que habia apuntado como "rara pero inofensiva" -que enumerase
- * a velocidad completa- era la causa. */
+ * Lo que si depende del enlace es HFIR, el numero de relojes por trama: a
+ * 60 MHz (PHY de 8 bits, que es lo que dice GUSBCFG.PHYIF), una trama de
+ * velocidad completa dura 1 ms = 60000 relojes, y una micro-trama de alta
+ * velocidad 125 us = 7500. Es la formula de dwc2_calc_frame_interval. */
 static void reloj_del_enlace(uint32_t hprt)
 {
-    uint32_t hcfg = leer(HCFG) & ~3u;
+    escribir(HCFG, leer(HCFG) & ~3u);           /* 30/60 MHz, siempre aqui */
 
-    if (HPRT_SPD(hprt) == 0) {
-        escribir(HCFG, hcfg);            /* alta: 30/60 MHz */
-    } else {
-        escribir(HCFG, hcfg | 1u);       /* completa o baja: 48 MHz */
+    int phy16 = (leer(GUSBCFG) & USB_PHYIF16) != 0;
+    uint32_t mhz = phy16 ? 30 : 60;
 
-        /* Y la trama: a 48 MHz, un milisegundo son 48000 relojes. El valor de
-         * despues del reset es para 60 MHz, asi que a velocidad completa las
-         * tramas saldrian a destiempo. */
-        escribir(HFIR, 48000);
-    }
+    if (HPRT_SPD(hprt) == 0) escribir(HFIR, 125 * mhz);     /* alta      */
+    else                     escribir(HFIR, 1000 * mhz);    /* completa/baja */
 }
 
 static const char *velocidad(uint32_t hprt)
