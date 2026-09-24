@@ -4958,6 +4958,54 @@ El barrido no es que se haya quitado: es que ha dejado de ser codigo. Sale
 del mismo bucle, y eso es lo que suele pasar cuando una respuesta empieza a
 traer la informacion que le faltaba.
 
+### Un anuncio no es un mensaje
+
+Esto salio en la primera prueba en la Pi, y de las dos cosas que estaban mal
+solo una se veia.
+
+```
+/ $ wc &
+  [1] en el fondo  wc
+/ $ jobs
+  [1] parado (queria el teclado)  9  wc
+  [1] parado (queria el teclado)   wc     <- otra vez, en el prompt
+```
+
+La segunda linea la saca `anunciar()` en el prompt siguiente, porque el aviso
+seguia pendiente: `jobs` te lo habia contado y no se habia dado por contado.
+Y ahi estaba el error de concepto, pequenyo y con consecuencias: yo trataba el
+anuncio como un mensaje que hay que emitir, cuando es **asegurarse de que lo
+sabes**. Ensenyarte el estado ya es eso. bash marca los trabajos como
+notificados cuando los lista, y ahora se por que.
+
+Lo que no se veia es peor. Entre el `anunciar()` del prompt y el momento en
+que `jobs` se ejecuta esta **todo el rato que tardas en teclear la orden**. Un
+trabajo que termine en esa ventana llega a la lista con sus pids ya a cero, con
+`parado` en falso y con su aviso sin contar... y se listaba como "corriendo".
+En el codigo de antes del arreglo las dos lineas contradictorias salen
+seguidas:
+
+```
+  [2] corriendo  10  lento 1 z     <- jobs, sobre un proceso ya enterrado
+  [2] hecho    lento 1 z           <- el prompt, una linea despues
+```
+
+En QEMU esa ventana es la de un guion, o sea milisegundos. En la Pi es la de
+unos dedos.
+
+El arreglo es que `jobs` salde lo que ensenya: a los parados les da el aviso
+por contado, y a los terminados no los lista -no les queda estado que
+ensenyar- sino que los cuenta y suelta su ranura. Son las dos unicas
+respuestas posibles una vez que se acepta que listar y anunciar son lo mismo
+dicho de dos maneras.
+
+Y hay una tercera cosa que aprendi mirandolo: el fallo no lo trajo este paso.
+Lo trajo el 54, cuando el anuncio se separo de la recogida para que el
+manejador de SIGCHLD pudiera llamar a una sin la otra. Desde entonces habia
+dos sitios que imprimian el estado de un trabajo y solo uno se acordaba del
+aviso. Partir una funcion en dos es facil; acordarse de que ahora hay dos
+sitios que tienen que estar de acuerdo, menos.
+
 ### Lo que sigue sin haber
 
 No hay `WCONTINUED`, o sea que "ha seguido" no es una noticia. El shell se

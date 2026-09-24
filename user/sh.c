@@ -620,6 +620,18 @@ static void recoger(void)
  *
  * Va justo antes del prompt y no en otro sitio, asi que ninguna noticia
  * aparece en medio de la linea que estas escribiendo. */
+/* Contar que un trabajo ha terminado, y soltar su ranura.
+ *
+ * Esta suelto porque lo hacen DOS: el prompt, que es lo normal, y 'jobs',
+ * que se lo encuentra cuando el trabajo acabo mientras escribias la orden. Y
+ * un trabajo terminado no se puede LISTAR -no le queda estado que ensenyar-
+ * asi que el unico sitio donde cabe es este mensaje. */
+static void decir_hecho(struct trabajo *t)
+{
+    printf("  [%d] hecho    %s\n", t->numero, t->orden);
+    t->usado = 0;
+}
+
 static void anunciar(void)
 {
     for (int i = 0; i < MAX_TRABAJOS; i++) {
@@ -631,8 +643,7 @@ static void anunciar(void)
                    por_que(t->parada_sig), t->orden);
             t->aviso = AVISO_NADA;
         } else {
-            printf("  [%d] hecho    %s\n", t->numero, t->orden);
-            t->usado = 0;                /* ahora si */
+            decir_hecho(t);
         }
     }
 }
@@ -662,20 +673,44 @@ static void sigchld(int sig)
     recoger();
 }
 
+/* 'jobs', que ademas SALDA los avisos que ensenya.
+ *
+ * Eso ultimo faltaba, y lo que ensenya es que estaba entendiendo mal lo que
+ * es un anuncio. No es un mensaje que haya que emitir: es asegurarse de que
+ * lo sabes. Y ensenyarte el estado ya es eso, asi que despues de un 'jobs' no
+ * queda nada que contar. Sin ello, el prompt siguiente repetia palabra por
+ * palabra lo que acababas de leer. bash marca los trabajos como notificados
+ * al listarlos, por esto mismo.
+ *
+ * Lo que arregla de verdad es lo otro, que no se veia: entre el anuncio del
+ * prompt y este momento esta TODO el rato que tardas en teclear "jobs" y
+ * pulsar Enter. Un trabajo que termine en esa ventana llega aqui con sus pids
+ * a cero, con 'parado' en falso y con su aviso sin contar, y se listaba como
+ * "corriendo". Un trabajo muerto y enterrado, anunciado como vivo. En QEMU la
+ * ventana era la de un guion; en la Pi es la de unos dedos. */
 static void listar_trabajos(void)
 {
     int hay = 0;
-    for (int i = 0; i < MAX_TRABAJOS; i++)
-        if (trabajos[i].usado) {
-            if (trabajos[i].parado)
-                printf("  [%d] parado (%s)  %lu  %s\n", trabajos[i].numero,
-                       por_que(trabajos[i].parada_sig),
-                       (unsigned long)trabajos[i].pgid, trabajos[i].orden);
-            else
-                printf("  [%d] corriendo  %lu  %s\n", trabajos[i].numero,
-                       (unsigned long)trabajos[i].pgid, trabajos[i].orden);
-            hay = 1;
-        }
+
+    for (int i = 0; i < MAX_TRABAJOS; i++) {
+        struct trabajo *t = &trabajos[i];
+        if (!t->usado) continue;
+
+        /* Uno que ya ha terminado no se lista: se cuenta y se suelta. */
+        if (t->aviso == AVISO_HECHO) { decir_hecho(t); hay = 1; continue; }
+
+        if (t->parado)
+            printf("  [%d] parado (%s)  %lu  %s\n", t->numero,
+                   por_que(t->parada_sig),
+                   (unsigned long)t->pgid, t->orden);
+        else
+            printf("  [%d] corriendo  %lu  %s\n", t->numero,
+                   (unsigned long)t->pgid, t->orden);
+
+        t->aviso = AVISO_NADA;          /* ensenyar el estado ES contarlo */
+        hay = 1;
+    }
+
     if (!hay) printf("  no hay trabajos\n");
 }
 
