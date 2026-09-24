@@ -5939,6 +5939,47 @@ De paso, el diagnostico de un canal que no contesta ahora dice si `ChEna` sigue
 puesto. Es la diferencia entre "el nucleo cogio la orden y esta a lo suyo" y "la
 acabo y no lo conto", que con `HCINT` a cero se veian igual.
 
+### Un canal armado que no hace nada
+
+El arreglo del reloj no bastaba, pero el diagnostico nuevo dijo bastante:
+
+```
+  [usb] el canal 0 no contesta: HCCHAR = 0x80000008 (sigue habilitado),
+        HCTSIZ = 0x60080008
+  GINTSTS = 0x14008029
+```
+
+`HCCHAR` y `HCTSIZ` son exactamente lo que se programo -8 bytes, un paquete, PID
+de SETUP, endpoint 0, control, direccion 0- y **ChEna sigue puesto**, o sea que el
+nucleo cogio la orden y no la ha terminado.
+
+`GINTSTS` es el que habla. Bit 0: modo anfitrion. Bit 3: las tramas salen. Bit 5:
+**la FIFO de transmision esta vacia**. Bit 25, el que diria que algun canal ha
+avisado de algo: apagado.
+
+O sea que el canal esta armado, el nucleo esta en modo anfitrion, el bus tiene
+reloj... y **nadie ha metido los ocho bytes del SETUP en la FIFO**. En modo DMA
+eso lo hace el propio nucleo, leyendo de memoria. Si no lo hace, o el DMA esta
+apagado o la direccion que se le da no es la que quiere.
+
+Y ahi, en vez de elegir una de las dos y gastar un arranque por intento, se le
+pregunta al chip:
+
+- Se **imprime `GAHBCFG`** y si el bit de DMA esta puesto. Si esta apagado, ya
+  esta: no hay nada mas que mirar.
+- Y se prueban **las dos formas de direccion en el mismo arranque**. Empieza por
+  la de bus -que es la que usan Linux y los proyectos de bare metal de esta
+  placa- y si no contesta reintenta con la fisica a secas, diciendo cual
+  funciono. Una adivinanza cuesta un arranque por intento; un experimento,
+  ninguno.
+
+De paso se pone la mascara del canal. Yo la dejaba a cero -"no quiero
+interrupciones, voy a preguntar mirando"- y eso da por hecho que los bits de
+`HCINT` se encienden solos. En QEMU se encienden; hay silicio que usa la mascara
+tambien para decidir si el bit se enciende, y ponerla no provoca ninguna
+interrupcion porque para eso hace falta ademas `GINTMSK.HChInt`, que sigue a
+cero.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es

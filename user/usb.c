@@ -41,6 +41,8 @@
 #define GRXFSIZ    0x024    /* tamanyo de la FIFO de recepcion               */
 #define GNPTXFSIZ  0x028    /* ...y de la de transmision no periodica        */
 #define HPTXFSIZ   0x100    /* ...y de la periodica                          */
+#define HAINT      0x414    /* que canales han avisado                       */
+#define HAINTMSK   0x418
 #define HCFG       0x400    /* configuracion de anfitrion                    */
 #define HFIR       0x404    /* cada cuantos relojes empieza una trama        */
 #define HFNUM      0x408    /* numero de micro-trama: el reloj del USB        */
@@ -165,6 +167,13 @@
  * descriptor aparece, la direccion era buena; si el patron sigue intacto, el
  * chip ha escrito en otra parte. Sin ese patron, las dos cosas se ven igual. */
 #define BUS(pa)   ((uint32_t)((uint64_t)(pa) | 0xC0000000UL))
+
+/* Y como no se puede saber a ciencia cierta cual de las dos quiere ESTE chip
+ * sin probarlo, se prueba. Empieza en 1 -la direccion de bus, que es lo que
+ * usan tanto Linux como los proyectos de bare metal de esta placa- y si no
+ * contesta se reintenta con la fisica a secas. Una adivinanza cuesta un
+ * arranque por intento; un experimento, ninguno. */
+static int dma_bus = 1;
 
 static volatile uint32_t *reg;
 
@@ -328,12 +337,25 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
      * con el ACK de la transferencia anterior puesto es creerse que esta ya
      * termino. */
     escribir(HCINT(canal), 0xFFFFFFFF);
-    escribir(HCINTMSK(canal), 0);
+
+    /* La mascara del canal, PUESTA, aunque no queramos interrupciones.
+     *
+     * Yo la dejaba a cero -"no quiero que me interrumpa, voy a preguntar
+     * mirando"- y eso da por hecho que los bits de HCINT se encienden solos.
+     * En QEMU se encienden; el databook dice que la mascara gobierna si el
+     * aviso SALE, y hay silicio que ademas la usa para decidir si el bit se
+     * enciende. Ponerla no cuesta nada y no provoca ninguna interrupcion,
+     * porque para eso hace falta ademas GINTMSK.HChInt, que sigue a cero.
+     *
+     * HAINTMSK es el mismo cuento un nivel mas arriba: dice de que canales se
+     * hace caso. */
+    escribir(HCINTMSK(canal), 0x7FF);
+    escribir(HAINTMSK, leer(HAINTMSK) | (1u << canal));
     escribir(HCSPLT(canal), 0);         /* sin particion: cuelga del raiz */
 
     escribir(HCTSIZ(canal), HCT_PID(pid) | HCT_PAQUETES(paquetes) |
                             HCT_BYTES(bytes));
-    escribir(HCDMA(canal), BUS(pa));
+    escribir(HCDMA(canal), dma_bus ? BUS(pa) : (uint32_t)pa);
 
     escribir(HCCHAR(canal), HCC_ENABLE | HCC_ADDR(addr) | HCC_TIPO(tipo) |
                             (entrada ? HCC_IN : 0) | HCC_EP(ep) | HCC_MPS(mps));
@@ -354,10 +376,16 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
      * suyo; si se bajo solo, la acabo y no lo conto. */
     uint32_t c = leer(HCCHAR(canal));
     printf("  [usb] el canal %d no contesta: HCCHAR = 0x%08x (%s), "
-           "HCTSIZ = 0x%08x, GINTSTS = 0x%08x\n",
+           "HCTSIZ = 0x%08x\n",
            canal, (unsigned int)c,
            (c & HCC_ENABLE) ? "sigue habilitado" : "se deshabilito solo",
-           (unsigned int)leer(HCTSIZ(canal)), (unsigned int)leer(GINTSTS));
+           (unsigned int)leer(HCTSIZ(canal)));
+    printf("  [usb]   GINTSTS = 0x%08x, HAINT = 0x%08x, GAHBCFG = 0x%08x "
+           "(DMA %s), HCDMA = 0x%08x\n",
+           (unsigned int)leer(GINTSTS), (unsigned int)leer(HAINT),
+           (unsigned int)leer(GAHBCFG),
+           (leer(GAHBCFG) & AHB_DMAEN) ? "encendido" : "APAGADO",
+           (unsigned int)leer(HCDMA(canal)));
 
     escribir(HCCHAR(canal), c | HCC_DISABLE);
     return 0;
@@ -771,9 +799,21 @@ int main(int argc, char **argv)
      * se puede leer. El descriptor te dice como leer el descriptor. */
     volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
 
+    /* Y si no contesta, se prueba con la otra forma de direccion ANTES de
+     * rendirse. Las dos posibilidades son "el chip quiere la direccion de bus"
+     * y "el chip quiere la fisica", y averiguarlo probando cuesta un segundo;
+     * averiguarlo a base de arrancar la placa cuesta un arranque por intento. */
     if (control_leer(0, 8, 0x80, 6, 0x0100, 0, 8) < 0) {
-        printf("  [usb] el dispositivo no contesta a un GET_DESCRIPTOR\n");
-        for (;;) sleep(1000);
+        printf("  [usb] con la direccion de bus no contesta; pruebo con la "
+               "fisica a secas\n");
+        dma_bus = 0;
+
+        if (control_leer(0, 8, 0x80, 6, 0x0100, 0, 8) < 0) {
+            printf("  [usb] tampoco: el dispositivo no contesta a un "
+                   "GET_DESCRIPTOR de ninguna de las dos formas\n");
+            for (;;) sleep(1000);
+        }
+        printf("  [usb] con la fisica SI: este chip no quiere la de bus\n");
     }
 
     int mps0 = d[7];
