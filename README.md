@@ -6836,6 +6836,91 @@ Y la contraprueba que no se puede fingir: montar la imagen en el Mac
 despues y encontrar `NUEVO.TXT` con ese texto. La SD sigue igual (`t7`), y
 el teclado USB sigue escribiendo con el bucle de mensajes.
 
+## La tarjeta de red: tramas por un cable USB
+
+Objetivo declarado: conectarse a un servidor de hora y tener la hora exacta
+en la Pi para poner fechas de verdad en los ficheros. Son tres pasos: que la
+tarjeta mande y reciba tramas (este), una pila IP minima con DHCP (el
+siguiente) y NTP mas el reloj del kernel (el ultimo).
+
+### Dos tarjetas, un driver
+
+Una tarjeta de red USB hace dos cosas: acepta tramas Ethernet por un
+endpoint bulk OUT y las entrega por uno bulk IN. Todo lo demas -direcciones,
+puertos, la hora- va DENTRO de las tramas y no es asunto suyo.
+
+Hay dos tarjetas porque hay dos maquinas. En la Pi, el LAN9514 de SMSC: una
+tarjeta de verdad, con un chip Ethernet y un PHY, que se configura por
+REGISTROS -peticiones de fabricante por el endpoint 0, `0xA1` para leer y
+`0xA0` para escribir, cuatro bytes cada una- y que envuelve cada trama con
+una cabecera propia: dos palabras delante al enviar, una de estado delante y
+el CRC detras al recibir. En QEMU, CDC-ECM: la clase estandar de "Ethernet
+por USB", sin registros ni cabeceras, que solo pide activar la interfaz de
+datos (`SET_INTERFACE` a su alternativa 1: la 0 no tiene endpoints) y guarda
+la MAC como una CADENA de doce hexadecimales en un descriptor de texto. A
+partir de "manda esta trama" no se distinguen.
+
+El arranque del LAN9514 es el de `smsc95xx_reset` de Linux, en su orden:
+reset lite, reset del PHY, la MAC en `ADDRL/ADDRH` (la placa no tiene EEPROM:
+la MAC la sabe la GPU y se pide por el buzon, `SYS_mac`, solo para drivers),
+una trama por transferencia sin modo turbo, LEDs, control de flujo, sin
+descarga de sumas, y el PHY por MDIO a traves de `MII_ADDR/MII_DATA`: reset,
+anunciar 10/100 en los dos duplex, negociar y esperar el enlace. Con el
+resultado de la negociacion se pone `MAC_CR` en full o half duplex, y al
+final TX y RX encendidos. Un control OUT con datos (`control_escribir_datos`)
+es lo unico que ha hecho falta anyadir al endpoint 0.
+
+### Varias configuraciones
+
+La tarjeta de QEMU trae DOS configuraciones -RNDIS, el protocolo de
+Microsoft, la primera; CDC-ECM la segunda- y `descubrir` solo leia la
+primera. Ahora `presentarse` apunta cuantas hay y `descubrir` las recorre en
+orden, quedandose con la primera en la que entienda algo. Es lo que hace
+cualquier sistema: elegir configuracion es parte de enumerar.
+
+### Un canal que se queda esperando
+
+Aqui estaba la decision de disenyo. Una tarjeta de red no avisa de que tiene
+una trama: hay que preguntarle con un IN. Pero preguntar cada 10 ms con el
+canal 0 -el de todo lo demas- tiene un problema que no tiene el teclado:
+cuando no hay trama la tarjeta contesta NAK, y para un bulk IN el DWC2 no se
+detiene con el NAK, sino que lo reintenta el solo hasta que haya datos
+(comprobado en el modelo de QEMU, `hcd-dwc2.c`: "for ctrl/bulk, automatically
+retry on NAK"). El canal 0 se quedaria colgado esperando una trama, con el
+teclado y el disco detras.
+
+El DWC2 tiene ocho canales. La recepcion va por el 1: se programa un IN de 2
+KB, se deja habilitado, y se vuelve a lo demas. Mientras no hay tramas el
+nucleo repite el IN por su cuenta y el canal sigue activo; cuando llega una,
+se detiene con `XFERCOMPL` y ahi esta. Mirar si se ha detenido es leer un
+registro, y se hace a cada alarma. Es lo que en Linux hace la URB de
+recepcion siempre pendiente, y aqui sale sin interrupciones. Por eso no se
+pone `HW_CFG_BIR` en el LAN9514, que Linux si pone: con ese bit la tarjeta
+contesta un paquete vacio en vez de NAK, y el canal se detendria cada vez
+sin nada dentro.
+
+### La sonda: DHCP DISCOVER
+
+Para saber que la red contesta hace falta preguntarle algo a lo que
+conteste sin conocernos. DHCP es exactamente eso: "soy esta MAC, no tengo
+direccion, alguien me da una?", a todos, desde 0.0.0.0. Se construye a mano,
+byte a byte -Ethernet, IPv4 con su suma, UDP 68 a 67, BOOTP con la galleta
+magica y las opciones 53 y 55- y se manda nada mas arrancar la tarjeta. En
+QEMU, con `-netdev user` y `-device usb-net`:
+
+    [usb]   configuracion 2 de 2:
+    [usb]   interfaz 0: clase 2.6 protocolo 0 (Ethernet CDC-ECM, control)
+    [usb]     endpoint 0x82 bulk, 64 bytes
+    [usb]     endpoint 0x02 bulk, 64 bytes
+    [usb] tarjeta de red CDC-ECM, MAC 52:54:00:12:34:57
+    [usb] DHCP DISCOVER mandado (342 bytes): a ver quien contesta
+    [usb] trama 1, 590 bytes: de 52:55:0a:00:02:02 para ff:ff:ff:ff:ff:ff, tipo 0x0800
+    [usb]   DHCP: OFERTA de 10.0.2.2, me ofrece 10.0.2.15
+
+El cable funciona en los dos sentidos. La oferta no se acepta todavia: eso
+es la pila del paso siguiente. En la Pi, ademas de la oferta del router, se
+veran las primeras tramas de la casa: ARP de quien pregunte por quien.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -7028,6 +7113,14 @@ el teclado USB sigue escribiendo con el bucle de mensajes.
   servirle al `fs` los sectores que quiera: el `fs` no tiene forma de saber
   si quien le habla es un driver. Un proceso podria "montar" lo que
   quisiera en /mnt.
+- La red se sondea a cada alarma, 10 ms: una trama tarda hasta eso en verse.
+  El driver sigue sin usar la IRQ 9; el canal 1 que se queda esperando es el
+  sustituto barato de una interrupcion de canal, y el dia que haga falta
+  menos latencia, `GINTMSK` y `HAINTMSK` estan a un bit de dar el aviso por
+  mensaje como la UART.
+- El LAN9514 va sin modo turbo: una trama por transferencia. Y el driver no
+  mira el endpoint de interrupcion de la tarjeta, asi que un cable que se
+  desenchufa no se nota hasta que algo falla.
 - Si el driver de USB muere ENTRE una peticion de sector y su respuesta, el
   `fs` se queda esperando para siempre, y con el todo el que use ficheros.
   Si muere en cualquier otro momento, el siguiente `msg_send` falla y /mnt

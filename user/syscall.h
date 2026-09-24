@@ -315,6 +315,7 @@ static inline int64_t klog(char *buf, uint64_t n)
 
 /* Pedirle a la GPU que encienda un dispositivo de la placa y espere a que este
  * listo. Devuelve 1 si quedo encendido. Solo para drivers. */
+static inline uint64_t mac(void)      { return (uint64_t)syscall2(SYS_mac, 0, 0); }
 static inline int64_t dev_power(uint64_t dispositivo)
 { return syscall2(SYS_dev_power, dispositivo, 0); }
 

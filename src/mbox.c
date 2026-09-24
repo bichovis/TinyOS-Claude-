@@ -36,6 +36,7 @@
 #define TAG_GET_ARM_MEMORY  0x00010005u
 #define TAG_GET_CLOCK_RATE  0x00030002u
 #define TAG_SET_POWER_STATE 0x00028001u
+#define TAG_GET_BOARD_MAC   0x00010003u
 #define TAG_END             0x00000000u
 #define CODE_REQUEST        0x00000000u
 #define CODE_RESP_OK        0x80000000u
@@ -195,4 +196,27 @@ uint32_t mbox_clock_rate(uint32_t clock_id)
         return 0;
 
     return buf[6];
+}
+
+/* La direccion MAC de la placa. En la Pi no hay EEPROM en la tarjeta de red:
+ * la MAC la conoce la GPU, que la saca de la OTP del chip, y se pide por el
+ * buzon como todo lo demas. Se devuelve empaquetada en 48 bits, el primer
+ * byte del cable en el byte bajo; 0 si la GPU no contesta. */
+uint64_t mbox_mac(void)
+{
+    buf[0] = 8 * 4;
+    buf[1] = CODE_REQUEST;
+    buf[2] = TAG_GET_BOARD_MAC;
+    buf[3] = 8;                      /* espacio para la respuesta         */
+    buf[4] = 0;                      /* la peticion no lleva nada         */
+    buf[5] = 0;
+    buf[6] = 0;
+    buf[7] = TAG_END;
+
+    if (!mbox_call(MBOX_CH_PROP)) return 0;
+
+    const volatile uint8_t *m = (const volatile uint8_t *)&buf[5];
+    uint64_t r = 0;
+    for (int i = 5; i >= 0; i--) r = (r << 8) | m[i];
+    return r;
 }

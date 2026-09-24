@@ -492,6 +492,9 @@ struct estado {
  * propio: un mensaje cada 10 ms es un recurso, no un derecho. */
 #define SYS_alarma       55    /* (puerto, cada_ticks) -> 0 | -EPERM       */
 
+/* La MAC de la placa, para el driver de la tarjeta de red. Solo drivers. */
+#define SYS_mac          56    /* () -> 48 bits, byte 0 abajo; 0 si no hay  */
+
 #define PWR_USB           3    /* el DWC2, segun la numeracion de la GPU   */
 
 /* Relojes que un driver de EL0 puede preguntar. El kernel es el dueño del

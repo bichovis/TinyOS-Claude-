@@ -363,6 +363,11 @@ void syscall_dispatch(struct trap_frame *f)
         break;
     }
 
+    case SYS_mac:
+        if (!current || !current->mmio_va) { ret = -EPERM; break; }
+        ret = (int64_t)mbox_mac();
+        break;
+
     case SYS_clock_rate: {
         uint64_t id = f->x[0];
         if (id != CLK_EMMC && id != CLK_UART && id != CLK_CORE) { ret = -1; break; }

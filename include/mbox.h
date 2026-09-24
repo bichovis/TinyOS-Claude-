@@ -14,3 +14,4 @@ uint32_t mbox_clock_rate(uint32_t clock_id);
  * Devuelve 1 si quedo encendido. Para el USB no es solo corriente: incluye
  * arrancar su PHY, y sin eso los registros funcionan y los paquetes no salen. */
 uint32_t mbox_power_on(uint32_t device_id);   /* el estado, sin juzgarlo */
+uint64_t mbox_mac(void);            /* 48 bits, byte 0 del cable abajo; 0 si no */

@@ -836,11 +836,47 @@ static int control_escribir(int addr, int mps, uint8_t tipo, uint8_t peticion,
     return 0;
 }
 
+/* Un control OUT CON datos: SETUP, los bytes (DATA1), y el estado como un IN
+ * vacio. Es lo que necesita una tarjeta de red para que se le escriba un
+ * registro: la orden dice cual, y los cuatro bytes van detras. */
+static int control_escribir_datos(int addr, int mps, uint8_t tipo, uint8_t peticion,
+                                  uint16_t valor, uint16_t indice, int bytes)
+{
+    volatile uint8_t *setup = (volatile uint8_t *)(dma_va + OFF_SETUP);
+
+    setup[0] = tipo;
+    setup[1] = peticion;
+    setup[2] = (uint8_t)(valor & 0xFF);
+    setup[3] = (uint8_t)(valor >> 8);
+    setup[4] = (uint8_t)(indice & 0xFF);
+    setup[5] = (uint8_t)(indice >> 8);
+    setup[6] = (uint8_t)(bytes & 0xFF);
+    setup[7] = (uint8_t)(bytes >> 8);
+
+    uint32_t r;
+
+    r = canal_transferir(0, EP_CONTROL, mps, addr, 0, PID_SETUP,
+                         dma_pa + OFF_SETUP, 8);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el SETUP no paso", r); return -1; }
+
+    r = canal_transferir(0, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                         dma_pa + OFF_DATOS, bytes);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("los datos no pasaron", r); return -1; }
+
+    r = canal_transferir(1, EP_CONTROL, mps, addr, 0, PID_DATA1,
+                         dma_pa + OFF_DATOS, 0);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("el estado no paso", r); return -1; }
+
+    return 0;
+}
+
 /* --- "Quien eres": el descriptor de dispositivo, en dos veces -------------
  *
  * Ocho bytes con paquetes de ocho, porque es lo unico que se sabe seguro de un
  * desconocido; en el byte 7 viene su tamanyo de paquete, y con ese se pide el
  * resto. Devuelve el tamanyo de paquete, o -1. */
+static int num_configs = 1;          /* del ultimo descriptor de dispositivo leido */
+
 static int presentarse(int addr, unsigned *vendedor, unsigned *producto,
                        unsigned *clase)
 {
@@ -855,6 +891,7 @@ static int presentarse(int addr, unsigned *vendedor, unsigned *producto,
     }
 
     if (control_leer(addr, mps0, 0x80, 6, 0x0100, 0, 18) < 0) return -1;
+    num_configs = d[17] ? d[17] : 1;
 
     *vendedor = (unsigned)(d[8]  | (d[9]  << 8));
     *producto = (unsigned)(d[10] | (d[11] << 8));
@@ -1165,6 +1202,479 @@ static void disco_atender(const struct message *pet)
     msg_send(b->port, &resp);
 }
 
+/* --- La tarjeta de red: tramas por un cable USB ------------------------------
+ *
+ * Una tarjeta de red USB es un dispositivo que hace dos cosas: acepta tramas
+ * Ethernet por un endpoint bulk OUT y las entrega por uno bulk IN. Todo lo
+ * demas -direcciones IP, puertos, la hora- va DENTRO de las tramas y no es
+ * asunto suyo. Este paso llega hasta ahi: mandar una trama y ver que la red
+ * contesta.
+ *
+ * Hay dos tarjetas porque hay dos maquinas. En la Pi, el LAN9514 de SMSC:
+ * una tarjeta de verdad, con un chip Ethernet y un PHY, que se configura por
+ * REGISTROS (peticiones de fabricante por el endpoint 0: "escribe este valor
+ * en esta direccion") y que envuelve cada trama con una cabecera propia. En
+ * QEMU, CDC-ECM: la clase estandar de "Ethernet por USB", sin registros ni
+ * cabeceras, que solo pide que se active la interfaz de datos. El mismo
+ * driver los lleva a los dos, y a partir de "manda esta trama" no se
+ * distinguen. */
+#define NIC_NINGUNA  0
+#define NIC_LAN9514  1
+#define NIC_ECM      2
+
+struct nic {
+    int hay, tipo, addr, mps0;
+    int ep_in, ep_out, mps_in, mps_out, tog_out;
+    int iface_datos, idx_mac;            /* ECM: la interfaz de datos y la MAC */
+    int enlace;                          /* hay cable y se ha negociado       */
+    uint8_t mac[6];
+};
+static struct nic nic;
+
+#define OFF_RX    16384                  /* 2 KB para recibir                 */
+#define OFF_TX    20480                  /* 2 KB para enviar                  */
+#define RX_BYTES   2048                  /* una trama de 1522 cabe de sobra   */
+#define CANAL_RX      1                  /* el segundo canal del DWC2         */
+
+/* --- Los registros del LAN9514, por el endpoint 0 ------------------------ */
+#define LAN_ID_REV      0x00
+#define LAN_INT_STS     0x08
+#define LAN_TX_CFG      0x10
+#define LAN_HW_CFG      0x14
+#define LAN_PM_CTRL     0x20
+#define LAN_LED_GPIO    0x24
+#define LAN_AFC_CFG     0x2C
+#define LAN_BURST_CAP   0x38
+#define LAN_BULK_IN_DLY 0x6C
+#define LAN_MAC_CR      0x100
+#define LAN_ADDRH       0x104
+#define LAN_ADDRL       0x108
+#define LAN_HASHH       0x10C
+#define LAN_HASHL       0x110
+#define LAN_MII_ADDR    0x114
+#define LAN_MII_DATA    0x118
+#define LAN_FLOW        0x11C
+#define LAN_VLAN1       0x120
+#define LAN_COE_CR      0x130
+
+#define HW_CFG_LRST     0x00000008
+#define HW_CFG_RXDOFF   0x00000600
+#define PM_CTL_PHY_RST  0x00000010
+#define TX_CFG_ON       0x00000004
+#define MAC_CR_FDPX     0x00100000
+#define MAC_CR_RCVOWN   0x00800000
+#define MAC_CR_MCPAS    0x00080000
+#define MAC_CR_PRMS     0x00040000
+#define MAC_CR_HPFILT   0x00002000
+#define MAC_CR_TXEN     0x00000008
+#define MAC_CR_RXEN     0x00000004
+#define LED_SPD_LNK_FDX 0x01110000
+#define AFC_CFG_DEFECTO 0x00F830A1
+#define MII_BUSY        0x01
+#define MII_WRITE       0x02
+#define PHY_ID          1
+#define TX_CMD_A_FIRST  0x00002000
+#define TX_CMD_A_LAST   0x00001000
+#define RX_STS_ES       0x00008000
+
+static int lan_leer(uint32_t reg, uint32_t *v)
+{
+    if (control_leer(nic.addr, nic.mps0, 0xC0, 0xA1, 0, (uint16_t)reg, 4) < 0) return -1;
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+    *v = d[0] | (d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+    return 0;
+}
+
+static int lan_escribir(uint32_t reg, uint32_t v)
+{
+    volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+    d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); d[2] = (uint8_t)(v >> 16); d[3] = (uint8_t)(v >> 24);
+    return control_escribir_datos(nic.addr, nic.mps0, 0x40, 0xA0, 0, (uint16_t)reg, 4);
+}
+
+/* El PHY -el chip que habla con el cable- no esta en el bus USB: se le llega
+ * a traves de dos registros del LAN9514, direccion y dato, con un bit de
+ * "ocupado" que hay que esperar. Es MDIO, el mismo bus serie de dos hilos
+ * de cualquier tarjeta Ethernet, solo que aqui cada acceso son dos o tres
+ * peticiones USB. */
+static int mii_espera(void)
+{
+    for (int i = 0; i < 100; i++) {
+        uint32_t v;
+        if (lan_leer(LAN_MII_ADDR, &v) < 0) return -1;
+        if (!(v & MII_BUSY)) return 0;
+    }
+    return -1;
+}
+
+static int mii_leer(int reg, uint32_t *v)
+{
+    if (mii_espera() < 0) return -1;
+    if (lan_escribir(LAN_MII_ADDR, (PHY_ID << 11) | (reg << 6) | MII_BUSY) < 0) return -1;
+    if (mii_espera() < 0) return -1;
+    if (lan_leer(LAN_MII_DATA, v) < 0) return -1;
+    *v &= 0xFFFF;
+    return 0;
+}
+
+static int mii_escribir(int reg, uint32_t v)
+{
+    if (mii_espera() < 0) return -1;
+    if (lan_escribir(LAN_MII_DATA, v) < 0) return -1;
+    if (lan_escribir(LAN_MII_ADDR, (PHY_ID << 11) | (reg << 6) | MII_WRITE | MII_BUSY) < 0) return -1;
+    return mii_espera();
+}
+
+/* Arrancar el LAN9514: el orden es el de smsc95xx_reset de Linux, que es la
+ * implementacion de referencia y la que lleva anyos en esta misma placa.
+ *
+ *   1. reset "lite" del chip y reset del PHY;
+ *   2. la MAC en sus dos registros (la placa no tiene EEPROM: viene de la
+ *      GPU, por el buzon);
+ *   3. una trama por transferencia -sin modo turbo- y sin desplazamiento
+ *      de datos: la trama va justo detras de su palabra de estado;
+ *   4. LEDs, control de flujo, sin descarga de sumas, solo unicast y
+ *      broadcast;
+ *   5. el PHY: reset, anunciar todo, negociar, y esperar el enlace;
+ *   6. y por fin, TX y RX encendidos.
+ *
+ * Una diferencia a proposito con Linux: no se pone HW_CFG_BIR. Con ese bit
+ * la tarjeta contesta un paquete vacio cuando no tiene tramas; sin el,
+ * contesta NAK, y un NAK es justo lo que hace que el canal de recepcion se
+ * quede esperando solo, sin que nadie tenga que preguntar. */
+static int lan_arrancar(void)
+{
+    uint32_t v;
+
+    if (lan_escribir(LAN_HW_CFG, HW_CFG_LRST) < 0) return -1;
+    for (int i = 0; i < 100; i++) {
+        sleep(1);
+        if (lan_leer(LAN_HW_CFG, &v) < 0) return -1;
+        if (!(v & HW_CFG_LRST)) break;
+    }
+    if (v & HW_CFG_LRST) { printf("  [usb] el LAN9514 no sale del reset\n"); return -1; }
+
+    if (lan_leer(LAN_PM_CTRL, &v) < 0) return -1;
+    if (lan_escribir(LAN_PM_CTRL, v | PM_CTL_PHY_RST) < 0) return -1;
+    for (int i = 0; i < 100; i++) {
+        sleep(1);
+        if (lan_leer(LAN_PM_CTRL, &v) < 0) return -1;
+        if (!(v & PM_CTL_PHY_RST)) break;
+    }
+
+    uint64_t m = mac();
+    if (!m) { printf("  [usb] la GPU no me da la MAC de la placa\n"); return -1; }
+    for (int i = 0; i < 6; i++) nic.mac[i] = (uint8_t)(m >> (8 * i));
+    lan_escribir(LAN_ADDRL, (uint32_t)(m & 0xFFFFFFFF));
+    lan_escribir(LAN_ADDRH, (uint32_t)((m >> 32) & 0xFFFF));
+
+    if (lan_leer(LAN_HW_CFG, &v) < 0) return -1;
+    lan_escribir(LAN_HW_CFG, v & ~HW_CFG_RXDOFF);      /* sin BIR, sin turbo */
+    lan_escribir(LAN_BURST_CAP, 0);
+    lan_escribir(LAN_BULK_IN_DLY, 0x2000);
+    lan_escribir(LAN_INT_STS, 0xFFFFFFFF);
+
+    if (lan_leer(LAN_ID_REV, &v) == 0)
+        printf("  [usb] LAN9514: ID_REV = 0x%08x (chip %04x, revision %04x)\n",
+               (unsigned)v, (unsigned)(v >> 16), (unsigned)(v & 0xFFFF));
+
+    if (lan_leer(LAN_LED_GPIO, &v) == 0) lan_escribir(LAN_LED_GPIO, v | LED_SPD_LNK_FDX);
+    lan_escribir(LAN_FLOW, 0);
+    lan_escribir(LAN_AFC_CFG, AFC_CFG_DEFECTO);
+    lan_escribir(LAN_VLAN1, 0x8100);
+    lan_escribir(LAN_COE_CR, 0);
+    lan_escribir(LAN_HASHH, 0);
+    lan_escribir(LAN_HASHL, 0);
+
+    uint32_t mac_cr;
+    if (lan_leer(LAN_MAC_CR, &mac_cr) < 0) return -1;
+    mac_cr &= ~(MAC_CR_PRMS | MAC_CR_MCPAS | MAC_CR_HPFILT);
+
+    /* El PHY: reset, anunciar 10/100 en ambos duplex con pausa, y negociar. */
+    mii_escribir(0, 0x8000);
+    for (int i = 0; i < 50; i++) { sleep(1); if (mii_leer(0, &v) == 0 && !(v & 0x8000)) break; }
+    mii_escribir(4, 0x0DE1);
+    mii_escribir(0, 0x1200);
+
+    /* Esperar el enlace, hasta 3 s. BMSR guarda el "se cayo" hasta que se lee:
+     * se lee dos veces para ver el estado de ahora. */
+    nic.enlace = 0;
+    for (int i = 0; i < 300; i++) {
+        sleep(1);
+        if (mii_leer(1, &v) < 0) break;
+        if (mii_leer(1, &v) < 0) break;
+        if (v & 0x0004) { nic.enlace = 1; break; }
+    }
+    if (nic.enlace) {
+        uint32_t lpa = 0;
+        mii_leer(5, &lpa);
+        int full = (lpa & 0x0140) != 0;          /* 100 o 10 en full duplex */
+        int cien = (lpa & 0x0180) != 0;
+        if (full) mac_cr = (mac_cr | MAC_CR_FDPX) & ~MAC_CR_RCVOWN;
+        else      mac_cr = (mac_cr & ~MAC_CR_FDPX) | MAC_CR_RCVOWN;
+        printf("  [usb] enlace: %s Mbit/s, %s duplex\n", cien ? "100" : "10", full ? "full" : "half");
+    } else {
+        printf("  [usb] sin enlace: hay cable?\n");
+    }
+
+    lan_escribir(LAN_TX_CFG, TX_CFG_ON);
+    lan_escribir(LAN_MAC_CR, mac_cr | MAC_CR_TXEN | MAC_CR_RXEN);
+    return 0;
+}
+
+/* CDC-ECM: activar la interfaz de datos (su alternativa 0 no tiene endpoints;
+ * la 1 si) y leer la MAC, que la clase guarda como una CADENA de doce
+ * hexadecimales en un descriptor de texto. */
+static int ecm_arrancar(void)
+{
+    if (control_escribir(nic.addr, nic.mps0, 0x01, 11, 1, (uint16_t)nic.iface_datos) < 0) {
+        printf("  [usb] la tarjeta no activa su interfaz de datos\n");
+        return -1;
+    }
+    if (nic.idx_mac &&
+        control_leer(nic.addr, nic.mps0, 0x80, 6, (uint16_t)(0x0300 | nic.idx_mac), 0x0409, 26) >= 0) {
+        volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+        for (int i = 0; i < 12; i++) {
+            int c = d[2 + 2 * i];
+            int h = (c >= '0' && c <= '9') ? c - '0' : (c | 0x20) - 'a' + 10;
+            nic.mac[i / 2] = (uint8_t)((nic.mac[i / 2] << 4) | (h & 0xF));
+        }
+    }
+    nic.enlace = 1;
+    return 0;
+}
+
+/* --- Recibir: un canal que se queda esperando --------------------------------
+ *
+ * Una tarjeta de red no avisa de que tiene una trama; hay que preguntarle
+ * con un IN. Pero preguntar cada 10 ms con el canal 0 -el de todo lo demas-
+ * tiene un problema que no tiene el teclado: cuando no hay trama la tarjeta
+ * contesta NAK, y para un bulk IN el DWC2 no se detiene con el NAK, sino que
+ * lo reintenta el solo hasta que haya datos. El canal 0 se quedaria colgado
+ * esperando una trama, con el teclado y el disco detras.
+ *
+ * El DWC2 tiene ocho canales. La recepcion va por el 1: se programa un IN de
+ * 2 KB, se deja habilitado, y se vuelve a lo demas. Mientras no hay tramas el
+ * nucleo repite el IN por su cuenta y el canal sigue "activo"; cuando llega
+ * una, el canal se detiene con XFERCOMPL y ahi esta. Mirar si se ha detenido
+ * es leer un registro, y se hace a cada alarma. Es lo que en Linux hace la
+ * URB de recepcion siempre pendiente, y aqui sale sin interrupciones. */
+static int rx_armado, rx_tog;
+static unsigned tramas_recibidas, tramas_bytes;
+
+static void rx_armar(void)
+{
+    int paquetes = RX_BYTES / nic.mps_in;
+
+    escribir(HCINTMSK(CANAL_RX), 0);
+    escribir(HCINT(CANAL_RX), 0xFFFFFFFF);
+    escribir(HAINTMSK, leer(HAINTMSK) | (1u << CANAL_RX));
+    escribir(HCSPLT(CANAL_RX), 0);                    /* de alta, o raiz completa */
+    escribir(HCCHAR(CANAL_RX), HCC_MC(1) | HCC_ADDR(nic.addr) | HCC_TIPO(EP_BULK) |
+                               HCC_IN | HCC_EP(nic.ep_in) | HCC_MPS(nic.mps_in));
+    escribir(HCTSIZ(CANAL_RX), HCT_PID(rx_tog ? PID_DATA1 : PID_DATA0) |
+                               HCT_PAQUETES(paquetes) | HCT_BYTES(RX_BYTES));
+    escribir(HCDMA(CANAL_RX), dma_bus ? BUS(dma_pa + OFF_RX) : (uint32_t)(dma_pa + OFF_RX));
+    escribir(HCINTMSK(CANAL_RX), HCI_CHHLTD);
+    barrera();
+    escribir(HCCHAR(CANAL_RX), leer(HCCHAR(CANAL_RX)) | HCC_ENABLE);
+    rx_armado = 1;
+}
+
+/* Bytes que han llegado al canal 1, 0 si sigue esperando, -1 si fue mal. */
+static int rx_mirar(void)
+{
+    if (!rx_armado) return 0;
+    uint32_t i = leer(HCINT(CANAL_RX));
+    if (!(i & HCI_CHHLTD)) return 0;
+
+    barrera();
+    uint32_t t = leer(HCTSIZ(CANAL_RX));
+    escribir(HCINT(CANAL_RX), 0xFFFFFFFF);
+    rx_armado = 0;
+
+    if (!(i & HCI_XFERCOMPL)) {
+        if (detallado) quejarse_canal("recepcion", i);
+        if (i & HCI_STALL) {
+            control_escribir(nic.addr, nic.mps0, 0x02, 1, 0, (uint16_t)(nic.ep_in | 0x80));
+            rx_tog = 0;
+        }
+        return -1;
+    }
+    int n = RX_BYTES - (int)(t & 0x7FFFF);
+    int paquetes = n ? (n + nic.mps_in - 1) / nic.mps_in : 1;
+    rx_tog ^= (paquetes & 1);
+    return n;
+}
+
+/* Mandar una trama. El LAN9514 quiere delante dos palabras -"primer y ultimo
+ * trozo, tantos bytes" y "tantos bytes"-; ECM, nada. Y si el total es un
+ * multiplo del paquete maximo, un paquete vacio detras: es como el otro lado
+ * sabe que la transferencia ha terminado. */
+static int nic_enviar(const uint8_t *f, int n)
+{
+    volatile uint8_t *t = (volatile uint8_t *)(dma_va + OFF_TX);
+    int off = 0;
+
+    if (n > 1514 || !nic.hay) return -1;
+
+    if (nic.tipo == NIC_LAN9514) {
+        uint32_t a = (uint32_t)n | TX_CMD_A_FIRST | TX_CMD_A_LAST, b = (uint32_t)n;
+        t[0] = (uint8_t)a; t[1] = (uint8_t)(a >> 8); t[2] = (uint8_t)(a >> 16); t[3] = (uint8_t)(a >> 24);
+        t[4] = (uint8_t)b; t[5] = (uint8_t)(b >> 8); t[6] = (uint8_t)(b >> 16); t[7] = (uint8_t)(b >> 24);
+        off = 8;
+    }
+    for (int i = 0; i < n; i++) t[off + i] = f[i];
+    int total = off + n;
+
+    uint32_t r = canal_transferir(0, EP_BULK, nic.mps_out, nic.addr, nic.ep_out,
+                                  nic.tog_out ? PID_DATA1 : PID_DATA0, dma_pa + OFF_TX, total);
+    if (!(r & HCI_XFERCOMPL)) { quejarse_canal("no pude mandar la trama", r); return -1; }
+    nic.tog_out ^= (((total + nic.mps_out - 1) / nic.mps_out) & 1);
+
+    if (total % nic.mps_out == 0) {
+        r = canal_transferir(0, EP_BULK, nic.mps_out, nic.addr, nic.ep_out,
+                             nic.tog_out ? PID_DATA1 : PID_DATA0, dma_pa + OFF_TX, 0);
+        if (!(r & HCI_XFERCOMPL)) return -1;
+        nic.tog_out ^= 1;
+    }
+    return 0;
+}
+
+/* --- Una trama que valga como prueba: DHCP DISCOVER ---------------------------
+ *
+ * Para saber que la red contesta hace falta preguntarle algo a lo que
+ * conteste sin conocernos. DHCP es exactamente eso: "soy la MAC tal, no
+ * tengo direccion, alguien me da una?", a todos (broadcast), desde 0.0.0.0.
+ * Cualquier red con un router responde con una OFERTA. Es la primera trama
+ * de la pila que vendra en el paso siguiente; aqui solo se construye a mano,
+ * byte a byte, para ver que el cable funciona en los dos sentidos. */
+static uint16_t suma_ip(const uint8_t *p, int n)
+{
+    uint32_t s = 0;
+    for (int i = 0; i + 1 < n; i += 2) s += (uint32_t)((p[i] << 8) | p[i + 1]);
+    if (n & 1) s += (uint32_t)(p[n - 1] << 8);
+    while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
+    return (uint16_t)~s;
+}
+
+static int dhcp_descubrir(uint8_t *f)
+{
+    int n = 0;
+    for (int i = 0; i < 6; i++) f[n++] = 0xFF;                 /* a todos */
+    for (int i = 0; i < 6; i++) f[n++] = nic.mac[i];
+    f[n++] = 0x08; f[n++] = 0x00;                                /* IPv4 */
+
+    int ip = n;
+    uint8_t cab[20] = { 0x45, 0, 0, 0, 0x12, 0x34, 0, 0, 64, 17, 0, 0,
+                        0, 0, 0, 0, 255, 255, 255, 255 };
+    for (int i = 0; i < 20; i++) f[n++] = cab[i];
+
+    int udp = n;
+    f[n++] = 0; f[n++] = 68; f[n++] = 0; f[n++] = 67; f[n++] = 0; f[n++] = 0; f[n++] = 0; f[n++] = 0;
+
+    int bootp = n;
+    f[n++] = 1; f[n++] = 1; f[n++] = 6; f[n++] = 0;              /* peticion, Ethernet */
+    f[n++] = 'T'; f[n++] = 'i'; f[n++] = 'n'; f[n++] = 'y';      /* xid */
+    f[n++] = 0; f[n++] = 0; f[n++] = 0x80; f[n++] = 0;           /* secs, flags: contestame a todos */
+    for (int i = 0; i < 16; i++) f[n++] = 0;                     /* ciaddr yiaddr siaddr giaddr */
+    for (int i = 0; i < 6; i++) f[n++] = nic.mac[i];
+    for (int i = 0; i < 10 + 64 + 128; i++) f[n++] = 0;
+    f[n++] = 99; f[n++] = 130; f[n++] = 83; f[n++] = 99;         /* la galleta magica */
+    f[n++] = 53; f[n++] = 1; f[n++] = 1;                          /* DISCOVER */
+    f[n++] = 55; f[n++] = 4; f[n++] = 1; f[n++] = 3; f[n++] = 6; f[n++] = 42;  /* mascara, router, DNS, NTP */
+    f[n++] = 255;
+    while (n - bootp < 300) f[n++] = 0;                          /* BOOTP minimo */
+
+    int ludp = n - udp, lip = n - ip;
+    f[udp + 4] = (uint8_t)(ludp >> 8); f[udp + 5] = (uint8_t)ludp;
+    f[ip + 2]  = (uint8_t)(lip >> 8);  f[ip + 3]  = (uint8_t)lip;
+    uint16_t c = suma_ip(f + ip, 20);
+    f[ip + 10] = (uint8_t)(c >> 8); f[ip + 11] = (uint8_t)c;
+    return n;
+}
+
+/* Lo que llega, por ahora, se ensenya: las primeras tramas enteras en su
+ * cabecera, y de las que se entienden -ARP, una oferta DHCP- lo que dicen. */
+static void trama_llego(const uint8_t *f, int n)
+{
+    tramas_recibidas++;
+    tramas_bytes += (unsigned)n;
+    if (n < 14) return;
+
+    unsigned tipo = (f[12] << 8) | f[13];
+    if (tramas_recibidas <= 6)
+        printf("  [usb] trama %u, %d bytes: de %02x:%02x:%02x:%02x:%02x:%02x para %02x:%02x:%02x:%02x:%02x:%02x, tipo 0x%04x\n",
+               tramas_recibidas, n, f[6], f[7], f[8], f[9], f[10], f[11],
+               f[0], f[1], f[2], f[3], f[4], f[5], tipo);
+
+    if (tipo == 0x0806 && n >= 42 && f[21] == 1 && tramas_recibidas <= 6)
+        printf("  [usb]   ARP: quien tiene %d.%d.%d.%d? pregunta %d.%d.%d.%d\n",
+               f[38], f[39], f[40], f[41], f[28], f[29], f[30], f[31]);
+
+    if (tipo == 0x0800 && n >= 34 + 8 + 240 && f[23] == 17) {
+        int ihl = (f[14] & 0xF) * 4, udp = 14 + ihl, b = udp + 8;
+        unsigned dst = (f[udp + 2] << 8) | f[udp + 3];
+        if (dst == 68 && f[b] == 2) {
+            const uint8_t *o = f + b + 240;
+            int msg = 0; const uint8_t *srv = 0;
+            while (o + 1 < f + n && o[0] != 255) {
+                if (o[0] == 53) msg = o[2];
+                if (o[0] == 54) srv = o + 2;
+                o += (o[0] == 0) ? 1 : 2 + o[1];
+            }
+            printf("  [usb]   DHCP: %s de %d.%d.%d.%d, me %s %d.%d.%d.%d\n",
+                   msg == 2 ? "OFERTA" : msg == 5 ? "ACK" : "mensaje",
+                   srv ? srv[0] : f[26], srv ? srv[1] : f[27], srv ? srv[2] : f[28], srv ? srv[3] : f[29],
+                   msg == 2 ? "ofrece" : "da",
+                   f[b + 16], f[b + 17], f[b + 18], f[b + 19]);
+        }
+    }
+}
+
+/* A cada alarma: si el canal de recepcion se ha detenido, hay trama; se
+ * saca de su envoltorio y se vuelve a armar. */
+static void red_sondear(void)
+{
+    if (!nic.hay) return;
+    int n = rx_mirar();
+    if (n > 0) {
+        const uint8_t *rx = (const uint8_t *)(dma_va + OFF_RX);
+        if (nic.tipo == NIC_LAN9514) {
+            if (n >= 4) {
+                uint32_t h = rx[0] | (rx[1] << 8) | ((uint32_t)rx[2] << 16) | ((uint32_t)rx[3] << 24);
+                int tam = (int)((h >> 16) & 0x3FFF);
+                if (!(h & RX_STS_ES) && tam >= 18 && tam <= n - 4)
+                    trama_llego(rx + 4, tam - 4);       /* sin la palabra ni el CRC */
+                else if (detallado)
+                    printf("  [usb] trama con error: estado 0x%08x, %d bytes\n", (unsigned)h, n);
+            }
+        } else {
+            trama_llego(rx, n);
+        }
+    }
+    if (!rx_armado) rx_armar();
+}
+
+static int nic_arrancar(void)
+{
+    int r = (nic.tipo == NIC_LAN9514) ? lan_arrancar() : ecm_arrancar();
+    if (r < 0) return -1;
+
+    printf("  [usb] tarjeta de red %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+           nic.tipo == NIC_LAN9514 ? "LAN9514" : "CDC-ECM",
+           nic.mac[0], nic.mac[1], nic.mac[2], nic.mac[3], nic.mac[4], nic.mac[5]);
+
+    rx_tog = 0; nic.tog_out = 0;
+    rx_armar();
+
+    static uint8_t trama[600];
+    int n = dhcp_descubrir(trama);
+    if (nic_enviar(trama, n) == 0)
+        printf("  [usb] DHCP DISCOVER mandado (%d bytes): a ver quien contesta\n", n);
+    return 0;
+}
+
 /* --- HID: el idioma de los teclados -------------------------------------------
  *
  * Un dispositivo HID describe con un "report descriptor" el formato de lo que
@@ -1197,32 +1707,63 @@ static unsigned sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error
 
 /* Leer la configuracion entera y apuntar donde esta lo que se entiende: un
  * teclado, un raton, un disco. */
-static int descubrir(int addr, int mps)
+static int descubrir(int addr, int mps, unsigned vendedor, unsigned producto)
 {
     volatile uint8_t *d = (volatile uint8_t *)(dma_va + OFF_DATOS);
+    int config = 0;
 
-    if (control_leer(addr, mps, 0x80, 6, 0x0200, 0, 9) < 0) return -1;
+    /* Un dispositivo puede traer VARIAS configuraciones, y solo una esta
+     * activa. La tarjeta de red de QEMU trae dos: RNDIS -el protocolo de
+     * Microsoft- la primera, y CDC-ECM -el estandar- la segunda. Se leen en
+     * orden y se elige la primera en la que haya algo que se entienda. */
+    for (int ci = 0; ci < num_configs && ci < 4; ci++) {
+    if (control_leer(addr, mps, 0x80, 6, (uint16_t)(0x0200 | ci), 0, 9) < 0) return -1;
     int total = d[2] | (d[3] << 8);
     if (total > 255) total = 255;
 
     /* El descriptor entero: interfaces y endpoints seguidos, cada uno con su
      * longitud en el byte 0 y su tipo en el 1. Se recorre; no se supone. */
-    if (control_leer(addr, mps, 0x80, 6, 0x0200, 0, total) < 0) return -1;
+    if (control_leer(addr, mps, 0x80, 6, (uint16_t)(0x0200 | ci), 0, total) < 0) return -1;
 
-    int config = d[5];
-    int iface = -1, clase = 0, sub = 0, proto = 0;
+    config = d[5];
+    int iface = -1, clase = 0, sub = 0, proto = 0, alt = 0;
+    if (num_configs > 1) printf("  [usb]   configuracion %d de %d:\n", ci + 1, num_configs);
 
     for (int i = 0; i + 1 < total; i += d[i] ? d[i] : 1) {
         int tipo = d[i + 1];
 
         if (tipo == 4) {                            /* interfaz */
-            iface = d[i + 2]; clase = d[i + 5]; sub = d[i + 6]; proto = d[i + 7];
+            iface = d[i + 2]; alt = d[i + 3]; clase = d[i + 5]; sub = d[i + 6]; proto = d[i + 7];
             printf("  [usb]   interfaz %d: clase %d.%d protocolo %d%s\n",
                    iface, clase, sub, proto,
                    clase == 3 ? (proto == 1 ? " (teclado boot)" :
                                  proto == 2 ? " (raton boot)" : " (HID)") :
                    clase == 8 ? (sub == 6 && proto == 0x50 ? " (disco SCSI, bulk-only)"
-                                                           : " (almacenamiento)") : "");
+                                                           : " (almacenamiento)") :
+                   clase == 2 && sub == 6 ? " (Ethernet CDC-ECM, control)" :
+                   clase == 10 ? (alt ? " (datos, activa)" : " (datos, apagada)") :
+                   clase == 255 && vendedor == 0x0424 ? " (LAN9514)" : "");
+            if (clase == 2 && sub == 6 && !nic.hay) {
+                nic.tipo = NIC_ECM; nic.addr = addr; nic.mps0 = mps;
+            }
+        }
+        /* ECM guarda el indice de la cadena con la MAC en un descriptor
+         * propio de la clase: tipo 0x24, subtipo 0x0F. */
+        if (tipo == 0x24 && d[i + 2] == 0x0F && nic.tipo == NIC_ECM && nic.addr == addr)
+            nic.idx_mac = d[i + 3];
+
+        /* Los endpoints bulk de una tarjeta de red: los de la interfaz de
+         * datos activa (ECM) o los de la unica interfaz del LAN9514. */
+        int es_red = (nic.tipo == NIC_ECM && nic.addr == addr && clase == 10 && alt == 1) ||
+                     (clase == 255 && vendedor == 0x0424 && producto == 0xec00);
+        if (tipo == 5 && es_red && (d[i + 3] & 3) == 2) {
+            int mps_ep = d[i + 4] | (d[i + 5] << 8);
+            printf("  [usb]     endpoint 0x%02x bulk, %d bytes\n", d[i + 2], mps_ep);
+            if (nic.tipo != NIC_ECM) { nic.tipo = NIC_LAN9514; nic.addr = addr; nic.mps0 = mps; }
+            nic.iface_datos = iface;
+            if (d[i + 2] & 0x80) { nic.ep_in  = d[i + 2] & 0xF; nic.mps_in  = mps_ep; }
+            else                 { nic.ep_out = d[i + 2] & 0xF; nic.mps_out = mps_ep; }
+            if (nic.ep_in && nic.ep_out) nic.hay = 1;
         }
         /* Un disco: clase 8, subclase 6 (ordenes SCSI transparentes) y
          * protocolo 0x50 (bulk-only). Sus dos endpoints bulk, uno por sentido. */
@@ -1253,6 +1794,13 @@ static int descubrir(int addr, int mps)
         }
     }
 
+    /* Algo entendido en esta configuracion? Entonces es la que se pone. */
+    if ((teclado.hay && teclado.addr == addr) || (raton.hay && raton.addr == addr) ||
+        (disco.hay && disco.addr == addr) || (nic.hay && nic.addr == addr))
+        break;
+    if (nic.tipo == NIC_ECM && nic.addr == addr && !nic.hay) nic.tipo = NIC_NINGUNA;
+    }   /* configuraciones */
+
     if (control_escribir(addr, mps, 0x00, 9, (uint16_t)config, 0) < 0) return -1;
 
     /* Protocolo boot e "idle" a cero -avisa solo cuando cambie algo- en las
@@ -1272,6 +1820,9 @@ static int descubrir(int addr, int mps)
         if (disco_arrancar() < 0) disco.hay = 0;
         else disco_presentar_sector0();
     }
+
+    /* Y si es una tarjeta de red, arrancarla y mandar la primera trama. */
+    if (nic.hay && nic.addr == addr && nic_arrancar() < 0) nic.hay = 0;
     return 0;
 }
 
@@ -1962,9 +2513,10 @@ int main(int argc, char **argv)
         sleep(1);
         printf("  [usb] el del puerto %d ya es la direccion %d\n", pt, siguiente_dir);
 
-        /* Si es un HID -clase 0 en el dispositivo y clase 3 en la interfaz-,
-         * mirar dentro y dejarlo listo para sondearlo. */
-        if (c2 == 0 && descubrir(siguiente_dir, mps2) == 0 && (teclado.hay || raton.hay))
+        /* Mirar dentro de lo que sea -menos un hub- y dejar listo lo que se
+         * entienda: teclado, raton, disco, tarjeta de red. */
+        if (c2 != 9 && descubrir(siguiente_dir, mps2, v2, p2) == 0 &&
+            ((teclado.hay && teclado.addr == siguiente_dir) || (raton.hay && raton.addr == siguiente_dir)))
             printf("  [usb] HID configurado: %s%s%s\n",
                    teclado.hay ? "teclado" : "", (teclado.hay && raton.hay) ? " y " : "",
                    raton.hay ? "raton" : "");
@@ -1989,10 +2541,10 @@ int main(int argc, char **argv)
      * acto, y el teclado sigue mirandose cada 10 ms. Y el canal 0 del DWC2,
      * que es uno solo, nunca lo usan dos cosas a la vez, porque el bucle
      * atiende un mensaje entero antes de mirar el siguiente. */
-    if (teclado.hay) {
+    if (teclado.hay || nic.hay) {
         if (alarma((uint64_t)puerto, 1) < 0)
-            printf("  [usb] el kernel no me da el reloj: sin teclado\n");
-        else
+            printf("  [usb] el kernel no me da el reloj: sin teclado ni red\n");
+        else if (teclado.hay)
             printf("  [usb] teclado USB listo: lo que teclees va a la consola\n");
     }
 
@@ -2016,8 +2568,8 @@ int main(int argc, char **argv)
             printf("  [usb] no hay servidor de ficheros a quien ofrecerle el disco\n");
     }
 
-    if (!teclado.hay && !disco.hay)
-        printf("  [usb] ni teclado ni disco; me quedo esperando\n");
+    if (!teclado.hay && !disco.hay && !nic.hay)
+        printf("  [usb] ni teclado, ni disco, ni red; me quedo esperando\n");
 
     uint8_t inf[64];
     unsigned vueltas = 0;
@@ -2035,7 +2587,11 @@ int main(int argc, char **argv)
             continue;
         }
 
-        if (m.type != CMSG_ALARMA || !teclado.hay) continue;
+        if (m.type != CMSG_ALARMA) continue;
+
+        /* La red primero: mirar si el canal 1 ha recibido, y volver a armarlo. */
+        red_sondear();
+        if (!teclado.hay) continue;
 
         /* Un teclado USB no avisa: se le pregunta. Cada bInterval milisegundos
          * el anfitrion le manda un IN a su endpoint de interrupcion, y el
