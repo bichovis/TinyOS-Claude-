@@ -5906,6 +5906,39 @@ buffer y la direccion de bus era la correcta.
 En la Pi lo que hay ahi es un LAN9514, y tiene que decir `0424:9514` con clase
 9. El `0424` es SMSC.
 
+### Y la placa dijo que no, otra vez, con el mejor sintoma hasta ahora
+
+```
+  [usb] el SETUP no paso: HCINT = 0x00000000
+```
+
+Cero. Ni completada, ni detenida, ni un error. El canal **no hizo nada**, y eso
+es distinto de fallar: un fallo tiene un bit.
+
+La causa une dos sintomas que yo tenia separados. `HCFG.FSLSPCLKSEL` le dice al
+nucleo a que reloj corre el PHY: 0 son 30/60 MHz -lo que toca a alta velocidad- y
+1 son 48 MHz, lo que toca a velocidad completa. Yo lo ponia a 0 **siempre**, en
+la inicializacion del nucleo.
+
+Y el puerto de la Pi enumera a velocidad completa. Con la base de tiempo
+equivocada una transferencia no falla: **no termina**. `HCINT` se queda a cero,
+que es exactamente el canal esperando unos plazos que no van a llegar.
+
+La leccion no es del bit, es del **sitio**. Eso no se puede configurar antes del
+reset del puerto, porque el dato que hace falta -la velocidad- es justamente lo
+que el reset averigua. Yo lo habia puesto en la inicializacion del nucleo, que
+es donde parecia que iba porque ahi esta todo lo demas del chip.
+
+Y la anomalia que dos pasos antes habia apuntado como "rara pero inofensiva" -que
+enumerase a velocidad completa en vez de alta- era la causa de que nada
+funcionara. Vale la pena escribirlo: cuando algo sale raro y se decide que no
+importa, conviene apuntar que se decidio eso, porque la siguiente cosa que falle
+puede estar colgando de ahi.
+
+De paso, el diagnostico de un canal que no contesta ahora dice si `ChEna` sigue
+puesto. Es la diferencia entre "el nucleo cogio la orden y esta a lo suyo" y "la
+acabo y no lo conto", que con `HCINT` a cero se veian igual.
+
 ### Lo que falta
 
 Ponerle una direccion con `SET_ADDRESS` -ahora mismo se le habla a la 0, que es

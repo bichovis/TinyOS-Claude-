@@ -42,6 +42,7 @@
 #define GNPTXFSIZ  0x028    /* ...y de la de transmision no periodica        */
 #define HPTXFSIZ   0x100    /* ...y de la periodica                          */
 #define HCFG       0x400    /* configuracion de anfitrion                    */
+#define HFIR       0x404    /* cada cuantos relojes empieza una trama        */
 #define HFNUM      0x408    /* numero de micro-trama: el reloj del USB        */
 #define HPRT0      0x440    /* EL puerto raiz                                */
 
@@ -345,9 +346,20 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
         if (i & (HCI_XFERCOMPL | HCI_CHHLTD | HCI_MALO)) return i;
     }
 
-    /* Nada en un par de millones de vueltas: se para el canal a mano para no
-     * dejarlo colgado y se dice que no hubo respuesta. */
-    escribir(HCCHAR(canal), leer(HCCHAR(canal)) | HCC_DISABLE);
+    /* Nada en un par de millones de vueltas. Antes de rendirse, contar lo que
+     * se ve, porque "HCINT a cero" no distingue dos cosas muy distintas: que el
+     * canal nunca arrancara, o que arrancara y este esperando algo.
+     *
+     * Lo dice ChEna: si sigue puesto, el nucleo cogio la orden y esta a lo
+     * suyo; si se bajo solo, la acabo y no lo conto. */
+    uint32_t c = leer(HCCHAR(canal));
+    printf("  [usb] el canal %d no contesta: HCCHAR = 0x%08x (%s), "
+           "HCTSIZ = 0x%08x, GINTSTS = 0x%08x\n",
+           canal, (unsigned int)c,
+           (c & HCC_ENABLE) ? "sigue habilitado" : "se deshabilito solo",
+           (unsigned int)leer(HCTSIZ(canal)), (unsigned int)leer(GINTSTS));
+
+    escribir(HCCHAR(canal), c | HCC_DISABLE);
     return 0;
 }
 
@@ -448,10 +460,6 @@ static void modo_anfitrion(void)
     escribir(GINTMSK, 0);
     escribir(GINTSTS, 0xFFFFFFFF);
 
-    /* El reloj de las lineas lentas: con 0 se le dice "30/60 MHz", que es lo
-     * que toca cuando el PHY es UTMI+ de alta velocidad. */
-    escribir(HCFG, leer(HCFG) & ~3u);
-
     fifos_repartir();
 }
 
@@ -513,6 +521,44 @@ static void puerto_reset(void)
     sleep(6);
     hprt_escribir(leer(HPRT0) & ~HPRT_RST);
     sleep(3);                          /* y tiempo para recuperarse */
+}
+
+/* --- El reloj del bus tiene que ser el del enlace ----------------------
+ *
+ * Esto es lo que faltaba, y es el fallo mas instructivo de todo el USB hasta
+ * ahora, porque une dos sintomas que yo tenia separados.
+ *
+ * HCFG.FSLSPCLKSEL le dice al nucleo a que reloj corre el PHY: 0 son 30/60 MHz
+ * -lo que toca a alta velocidad- y 1 son 48 MHz, lo que toca a velocidad
+ * completa. Yo lo ponia a 0 SIEMPRE, en la configuracion inicial, cuando
+ * todavia no se puede saber a que velocidad va a enumerar el puerto.
+ *
+ * Y el puerto de la Pi enumero a velocidad completa. Con la base de tiempo
+ * equivocada, una transferencia no falla: simplemente NO TERMINA. HCINT se
+ * queda a cero, que es lo que decia la placa, y eso no se parece a un error
+ * porque no lo es -es el canal esperando a unos plazos que no van a llegar-.
+ *
+ * La leccion es la del sitio, no la del bit: esto no se puede configurar antes
+ * del reset del puerto, porque el dato que hace falta -la velocidad- es
+ * justamente lo que el reset averigua. Yo lo habia puesto en la inicializacion
+ * del nucleo, que es donde parecia que iba.
+ *
+ * Y la anomalia que habia apuntado como "rara pero inofensiva" -que enumerase
+ * a velocidad completa- era la causa. */
+static void reloj_del_enlace(uint32_t hprt)
+{
+    uint32_t hcfg = leer(HCFG) & ~3u;
+
+    if (HPRT_SPD(hprt) == 0) {
+        escribir(HCFG, hcfg);            /* alta: 30/60 MHz */
+    } else {
+        escribir(HCFG, hcfg | 1u);       /* completa o baja: 48 MHz */
+
+        /* Y la trama: a 48 MHz, un milisegundo son 48000 relojes. El valor de
+         * despues del reset es para 60 MHz, asi que a velocidad completa las
+         * tramas saldrian a destiempo. */
+        escribir(HFIR, 48000);
+    }
 }
 
 static const char *velocidad(uint32_t hprt)
@@ -709,6 +755,12 @@ int main(int argc, char **argv)
     /* Y reconocer los avisos de cambio, que es lo que faltaba: si no, quedan
      * puestos para siempre y el driver no puede enterarse del siguiente. */
     hprt_reconocer(HPRT_CONNDET | HPRT_ENCHNG);
+
+    /* El reloj del bus, AHORA que se sabe la velocidad. Antes del reset no se
+     * podia saber. */
+    reloj_del_enlace(p);
+    printf("  [usb] reloj del enlace puesto para %s (HCFG = 0x%08x)\n",
+           velocidad(p), (unsigned int)leer(HCFG));
 
     /* --- 5. Y ahora a hablar ------------------------------------------
      *
