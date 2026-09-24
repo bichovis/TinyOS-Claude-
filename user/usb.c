@@ -127,12 +127,15 @@ static int esperar_bit(uint64_t off, uint32_t bit, int puesto, int ticks)
 
 /* --- Despertar el nucleo ----------------------------------------------
  *
- * El firmware de la Pi deja el DWC2 encendido y a medio configurar, asi que lo
- * primero es ponerlo en un estado CONOCIDO, y conocido quiere decir reset.
- * Heredar la configuracion de otro es como se depura durante tres dias algo
- * que funcionaba en un arranque y no en el siguiente.
+ * El firmware de la Pi deja el DWC2 encendido y a medio configurar. Heredar eso
+ * es como se depura durante tres dias algo que funciona en un arranque y no en
+ * el siguiente, asi que lo primero es ponerlo en un estado CONOCIDO.
  *
- * El orden no es negociable y cada paso tiene su motivo. */
+ * El orden importa mas de lo que parece, y aqui lo aprendi a base de que la
+ * placa no viera lo que tiene soldado: la seleccion de PHY hay que escribirla
+ * ANTES del reset, porque es el reset el que la hace efectiva. Yo la escribia
+ * despues, y en QEMU funcionaba igual -su modelo no simula el PHY- asi que el
+ * fallo solo aparecio en el hardware de verdad. */
 static int nucleo_despertar(void)
 {
     /* 1. Quitar las puertas de reloj y la pinza de alimentacion. Con el reloj
@@ -141,51 +144,55 @@ static int nucleo_despertar(void)
     escribir(PCGCCTL, 0);
 
     /* 2. Cerrar la salida de interrupciones mientras se configura. Aun no hay
-     *    nadie escuchando, y una interrupcion sin manejador con la fuente
-     *    abierta es el sistema girando en el vector. */
+     *    nadie escuchando, y una fuente abierta sin manejador es el sistema
+     *    girando en el vector. */
     escribir(GAHBCFG, leer(GAHBCFG) & ~AHB_GLBLINTR);
 
     /* 3. Nada de VBUS externo ni pulsos en las lineas: son cosas de una placa
      *    con transceptor de fuera, y aqui el PHY esta dentro del chip. */
     escribir(GUSBCFG, leer(GUSBCFG) & ~(USB_EXT_VBUS | USB_TS_DLINE));
 
-    /* 4. Esperar a que el bus este quieto ANTES de resetear. Resetear con una
-     *    transferencia AHB a medias deja el bus colgado, y con el medio chip. */
-    if (!esperar_bit(GRSTCTL, RST_AHBIDLE, 1, 10)) return 0;
-
-    /* 5. Y el reset. Se pide poniendo el bit, y se sabe que acabo cuando el
-     *    propio chip lo quita: no hay que quitarlo a mano. */
-    escribir(GRSTCTL, RST_CSFTRST);
-    if (!esperar_bit(GRSTCTL, RST_CSFTRST, 0, 20)) return 0;
-    if (!esperar_bit(GRSTCTL, RST_AHBIDLE, 1, 10)) return 0;
-
-    return 1;
-}
-
-/* --- Modo anfitrion ---------------------------------------------------
- *
- * Este controlador es OTG: puede ser anfitrion o dispositivo, y decide segun
- * lo que vea en el pin ID. En la Pi siempre es anfitrion, pero decirselo a
- * mano quita una variable: si el pin flotara, el chip se quedaria esperando a
- * que alguien le hable en vez de hablar el. */
-static void modo_anfitrion(void)
-{
+    /* 4. El PHY y el papel, AHORA, antes del reset.
+     *
+     * UTMI+ de alta velocidad: PHYSEL a cero es "no me pongas el serie de
+     * velocidad completa", y sin eso la Ethernet -que es de alta velocidad- no
+     * se veria nunca.
+     *
+     * Y el modo anfitrion a mano, aunque este chip lo deduzca del pin ID: si
+     * el pin flotara, se quedaria esperando a que alguien le hable en vez de
+     * hablar el. */
     uint32_t cfg = leer(GUSBCFG);
-
-    /* El PHY: UTMI+ y de alta velocidad, que es el que este chip lleva dentro.
-     * PHYSEL a cero es "no me pongas el serie de velocidad completa", y sin eso
-     * la Ethernet -que es de alta velocidad- no se veria nunca. */
     cfg &= ~(USB_ULPI_SEL | USB_PHYSEL_FS);
     cfg &= ~(USB_SRPCAP | USB_HNPCAP);     /* nada de negociar el papel */
     cfg |=  USB_FORCEHOST;
     cfg &= ~USB_FORCEDEV;
     escribir(GUSBCFG, cfg);
 
+    /* 5. Esperar a que el bus AHB este quieto ANTES de resetear. Resetear con
+     *    una transferencia a medias deja el bus colgado, y con el medio chip. */
+    if (!esperar_bit(GRSTCTL, RST_AHBIDLE, 1, 10)) return 0;
+
+    /* 6. Y el reset, que es lo que hace efectiva la eleccion de PHY. Se pide
+     *    poniendo el bit y termina cuando el propio chip lo quita. */
+    escribir(GRSTCTL, RST_CSFTRST);
+    if (!esperar_bit(GRSTCTL, RST_CSFTRST, 0, 20)) return 0;
+    if (!esperar_bit(GRSTCTL, RST_AHBIDLE, 1, 10)) return 0;
+
+    /* 7. Reafirmarlo. El reset no deberia borrar un registro de
+     *    configuracion, pero escribirlo otra vez cuesta una instruccion y
+     *    quita la duda. */
+    escribir(GUSBCFG, cfg);
+
     /* Forzar el modo tarda: el chip tiene que mirar las lineas y decidir, y
      * hasta 25 ms lo que uno lea no es definitivo. Es de las esperas que no se
      * pueden cambiar por un bucle mirando un bit, porque no hay bit. */
-    sleep(3);
+    sleep(4);
+    return 1;
+}
 
+/* --- Lo demas de la configuracion ------------------------------------- */
+static void modo_anfitrion(void)
+{
     /* DMA interno y rafagas de 16 palabras: es lo que GHWCFG2 dijo que este
      * ejemplar sabe hacer. Y la interrupcion global, otra vez abierta. */
     escribir(GAHBCFG, AHB_DMAEN | AHB_HBSTLEN(7) | AHB_GLBLINTR);
@@ -211,6 +218,42 @@ static void puerto_encender(void)
     uint32_t p = leer(HPRT0);
     if (!(p & HPRT_PWR)) hprt_escribir(p | HPRT_PWR);
     sleep(2);                          /* que la alimentacion suba */
+}
+
+/* Y esperar a que el controlador registre la conexion.
+ *
+ * Esto no estaba, y era el otro motivo de que la placa no viera su hub. El USB
+ * manda ANTIRREBOTAR una conexion al menos 100 ms antes de darla por buena
+ * -TATTDB en la norma- porque un conector que se acaba de enchufar hace
+ * contacto varias veces mientras entra. El controlador hace ese antirrebote
+ * por su cuenta, y hasta que termina PRTCONNSTS sigue a cero.
+ *
+ * Yo miraba una vez, 20 ms despues de dar corriente. En QEMU salia bien porque
+ * ahi no hay rebote que antirrebotar: la conexion es instantanea. Es la
+ * segunda vez en este paso que el emulador dice si a algo que el cobre dice
+ * no. */
+static int puerto_esperar_conexion(void)
+{
+    return esperar_bit(HPRT0, HPRT_CONNSTS, 1, 100);   /* hasta 1 segundo */
+}
+
+/* El estado de las lineas, que es el diagnostico de verdad cuando "no hay nada
+ * conectado". Dice lo que el PHY ve en el cobre, y eso no miente:
+ *
+ *   00  las dos bajas: no hay nada, o estamos en reset
+ *   01  D+ alta: hay un dispositivo de velocidad completa o alta
+ *   10  D- alta: hay uno de velocidad baja
+ *
+ * Con "no hay nada conectado" y un 01 aqui, el problema no es el cable: es que
+ * el controlador no ha llegado a enterarse. Eso fue exactamente lo que paso. */
+static const char *lineas(uint32_t hprt)
+{
+    switch ((hprt >> 10) & 3) {
+    case 0:  return "las dos bajas (nada, o en reset)";
+    case 1:  return "D+ alta (hay algo, completa o alta)";
+    case 2:  return "D- alta (hay algo, baja)";
+    default: return "las dos altas (eso no deberia pasar)";
+    }
 }
 
 /* Resetear el puerto es lo que hace que el dispositivo del otro lado se
@@ -384,15 +427,20 @@ int main(int argc, char **argv)
     printf("  [usb] nucleo en modo anfitrion; HPRT0 = 0x%08x\n",
            (unsigned int)p);
 
-    if (!(p & HPRT_CONNSTS)) {
-        /* En la Pi aqui hay un LAN9514 soldado, asi que esto no deberia pasar.
-         * En QEMU si: la raspi3b trae el controlador pero no trae nada
-         * enchufado a menos que se le diga. */
-        printf("  [usb] no hay nada conectado al puerto raiz\n");
+    if (!puerto_esperar_conexion()) {
+        /* En la Pi aqui hay un LAN9514 soldado, asi que esto no deberia pasar;
+         * en QEMU si, porque la raspi3b no trae nada enchufado a menos que se
+         * le diga. Y si pasa en la placa, el estado de las lineas dice si el
+         * problema esta en el cobre o en nosotros. */
+        p = leer(HPRT0);
+        printf("  [usb] no hay nada conectado (HPRT0 = 0x%08x)\n",
+               (unsigned int)p);
+        printf("  [usb] lineas: %s\n", lineas(p));
         for (;;) sleep(1000);
     }
 
-    printf("  [usb] algo conectado, velocidad %s\n", velocidad(p));
+    p = leer(HPRT0);
+    printf("  [usb] conectado: %s, lineas %s\n", velocidad(p), lineas(p));
 
     puerto_reset();
     p = leer(HPRT0);

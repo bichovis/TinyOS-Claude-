@@ -5756,6 +5756,43 @@ reloj: el chip esta emitiendo *start of frame* cada 125 microsegundos por su
 cuenta, que es el trabajo que un anfitrion hace sin que nadie le diga. Y la
 **velocidad completa** es de QEMU; en la Pi, el LAN9514 tiene que decir alta.
 
+### Y la placa dijo que no
+
+En la Pi, con un LAN9514 soldado al puerto, salio esto:
+
+```
+  [usb] nucleo en modo anfitrion; HPRT0 = 0x00001400
+  [usb] no hay nada conectado al puerto raiz
+```
+
+`0x1400` son dos bits: el 12, alimentacion del puerto, y el **10, que es el
+estado de las lineas**. `PRTLNSTS = 01` quiere decir D+ alta y D- baja, que es
+el reposo de un dispositivo enchufado con su resistencia en D+.
+
+O sea que el hub estaba ahi y el PHY lo estaba viendo. Lo que no habia ocurrido
+era que el controlador registrara la conexion, y eso ya no es un problema de
+cobre: es nuestro. Ese campo es el diagnostico, y tiene gracia que sea justo el
+que QEMU no modela -alli dice "las dos bajas" incluso con un pendrive
+conectado-.
+
+Dos cosas estaban mal, y las dos son de orden y de tiempo.
+
+**La seleccion de PHY iba despues del reset.** El DWC2 exige un reset del nucleo
+para que un cambio de PHY surta efecto, asi que escribirlo despues es no
+escribirlo. Yo reseteaba primero y configuraba despues; la configuracion no
+llegaba a aplicarse nunca. En QEMU daba igual porque su modelo no simula el
+PHY, asi que el fallo solo existia en el cobre.
+
+**Y no habia antirrebote.** El USB manda antirrebotar una conexion al menos 100
+ms antes de darla por buena -TATTDB en la norma- porque un conector que entra
+hace contacto varias veces. El controlador hace ese antirrebote por su cuenta y
+hasta que acaba `PRTCONNSTS` sigue a cero. Yo miraba **una vez**, 20 ms despues
+de dar corriente. En QEMU salia bien porque ahi no hay rebote que antirrebotar.
+
+Las dos veces, el mismo patron: el emulador diciendo si a algo que el cobre dice
+no. Y las dos veces el arreglo es correcto aunque no fuera la causa del
+sintoma, que es la unica clase de arreglo que merece la pena hacer a ciegas.
+
 ### Lo que falta para hablar con el
 
 Tener el puerto habilitado no es hablar. Lo siguiente es un canal, una
