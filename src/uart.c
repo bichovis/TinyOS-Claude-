@@ -502,7 +502,14 @@ uint64_t uart_klog_saca(char *dst, uint64_t n)
         klog_tail = (klog_tail + 1) % KLOG_SIZE;
     }
 
+    /* ¿Vacio? Se mira CON el cerrojo: mirarlo despues de soltarlo es dejar
+     * que un escritor de otro nucleo meta texto en medio, y entonces "no esta
+     * vacio" es verdad, la bandera se queda puesta, y nadie avisa nunca. */
+    int vacio = (klog_tail == klog_head);
+
     uart_end(f);
+
+    if (vacio) klog_entregado();
 
     /* Y despertar a quien estuviera esperando hueco. Fuera del cerrojo de la
      * UART, porque wq_wake_all pide sched_lock y el orden es ese. */

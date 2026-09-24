@@ -6658,6 +6658,39 @@ con Ctrl-Z ("[1] parado (Ctrl-Z)"), y `jobs` por la UART lo ve. La UART
 sigue funcionando igual. En la placa, lo partido: es el mismo camino con la
 temporizacion del paso 65b debajo.
 
+En la placa: el Logitech escribe en el shell. La primera prueba parecio
+fallar y fue un error al probar, no del codigo; la ronda de diagnostico que
+monte para verlo -informes en hexadecimal, resultado de cada `console_push`-
+se queda detras de `detallado`, y solo sobrevive a la vista un aviso si el
+kernel rechazara las teclas: un `-EPERM` mudo seria un teclado que "no
+funciona" sin pista alguna.
+
+### Y un anillo que se callaba
+
+Leer `klog_avisar()` para el eco destapo un fallo que llevaba ahi desde el
+paso 59 y que ningun sintoma habia senyalado. La bandera `klog_avisado`
+-"ya le he avisado, no le inundes"- solo se bajaba cuando un TICK encontraba
+el anillo vacio. Con un escritor que no para -un `cat` de 13 KB por un
+anillo de 4- el conserver vaciaba, el escritor volvia a llenar antes del
+tick, el tick veia texto y la bandera puesta, y no avisaba. El escritor se
+dormia esperando hueco, el conserver esperando aviso, y la consola se
+quedaba muda hasta que alguien tocaba una tecla.
+
+Lo tapaba precisamente eso: el conserver vacia el anillo cada vez que
+entrega teclas, y en una sesion con alguien tecleando el bloqueo duraba lo
+que tardaba la siguiente tecla. La prueba `k1` -el volcado del ELF- lo
+demostro al mirarla con lupa: el `echo` de despues se veia tecleado, pero su
+respuesta no salia nunca.
+
+El arreglo es poner la bandera donde el comentario ya decia que iba: se baja
+cuando el anillo SE QUEDA VACIO, que es cuando el conserver lo ha sacado
+todo (`klog_entregado()` desde `uart_klog_saca`). Y se mira con el cerrojo
+cogido: mirarlo despues de soltarlo deja que un escritor de otro nucleo meta
+texto en medio, y entonces "no esta vacio" es verdad, la bandera se queda
+puesta, y estamos donde estabamos. Con el arreglo, `DESPUES-DEL-ESTRES` sale
+en su sitio, y dos procesos escribiendo a la vez (`c1`) siguen saliendo
+enteros.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que

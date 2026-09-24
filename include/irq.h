@@ -21,6 +21,7 @@ extern uint64_t irq_avisos_perdidos;
  * esperar diez milisegundos. Pide sched_lock, asi que NUNCA con el cerrojo
  * de la UART cogido. */
 void     klog_avisar(void);
+void     klog_entregado(void);   /* el anillo se ha quedado vacio: proximo texto, aviso nuevo */
 void     irq_handle(void);      /* lo llama el vector IRQ desde vectors.S */
 uint64_t irq_count(void);              /* atendidas entre los cuatro nucleos */
 uint64_t irq_count_core(uint64_t core); /* y las de uno solo                 */

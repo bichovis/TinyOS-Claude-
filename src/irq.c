@@ -276,6 +276,23 @@ void klog_avisar(void)
         klog_avisado = 1;
 }
 
+/* El duenyo de la consola acaba de dejar el anillo vacio: el siguiente texto
+ * que entre necesita un aviso nuevo.
+ *
+ * Esto faltaba, y el fallo era de los que no se ven: la bandera solo se
+ * bajaba cuando un TICK encontraba el anillo vacio. Con un escritor que no
+ * para -un cat de 13 KB por un anillo de 4- el conserver vaciaba, el escritor
+ * volvia a llenar antes del tick, el tick veia texto y la bandera puesta, y
+ * no avisaba. El escritor se dormia esperando hueco, el conserver esperando
+ * aviso, y la consola se quedaba muda hasta que alguien tocaba una tecla
+ * -que es lo que tapaba el fallo: el conserver vacia el anillo cada vez que
+ * entrega teclas-. Salio a la luz al leer esta funcion para el eco del
+ * teclado USB, no por un sintoma. */
+void klog_entregado(void)
+{
+    klog_avisado = 0;
+}
+
 void irq_handle(void)
 {
     uint64_t core = this_core();

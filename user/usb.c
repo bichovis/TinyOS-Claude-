@@ -1118,16 +1118,30 @@ static int teclado_traducir(const uint8_t *inf, char *out)
 /* Entregar a la consola lo que se ha tecleado. Ctrl-C y Ctrl-Z no son bytes,
  * son ordenes, y las da el kernel: a quien le toca es cosa suya. El resto va
  * a la disciplina de linea por la misma puerta que las teclas de la UART. */
+static unsigned teclas_dadas;
+static int      rechazo_avisado;
+
+static void empujar(const char *b, int m)
+{
+    int64_t r = console_push(b, m);
+    if (r >= 0) { teclas_dadas += (unsigned)m; return; }
+
+    /* Un -EPERM callado seria un teclado que "no funciona" sin pista alguna.
+     * Se dice una vez y basta. */
+    if (!rechazo_avisado++)
+        printf("  [usb] la consola no me acepta teclas: %ld (%s)\n", (long)r, strerror(errno));
+}
+
 static void teclado_entregar(const char *b, int n)
 {
     char plano[8];
     int m = 0;
     for (int i = 0; i < n; i++) {
-        if (b[i] == 3)       { if (m) { console_push(plano, m); m = 0; } console_int();  continue; }
-        if (b[i] == 26)      { if (m) { console_push(plano, m); m = 0; } console_stop(); continue; }
+        if (b[i] == 3)       { if (m) { empujar(plano, m); m = 0; } console_int();  continue; }
+        if (b[i] == 26)      { if (m) { empujar(plano, m); m = 0; } console_stop(); continue; }
         plano[m++] = b[i];
     }
-    if (m) console_push(plano, m);
+    if (m) empujar(plano, m);
 }
 
 /* --- Lo demas de la configuracion ------------------------------------- */
@@ -1712,10 +1726,15 @@ int main(int argc, char **argv)
     unsigned vueltas = 0;
     for (;;) {
         if (detallado && ++vueltas % 200 == 0)
-            printf("  [usb] sondeos: %u con datos, %u NAK, %u NYET, %u sin respuesta, %u error\n",
-                   sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error);
+            printf("  [usb] sondeos: %u con datos, %u NAK, %u NYET, %u sin respuesta, %u error; %u teclas entregadas\n",
+                   sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error, teclas_dadas);
 
         int n = hid_sondear(&teclado, inf);
+        if (detallado && n >= 8) {
+            printf("  [usb] informe de %d bytes:", n);
+            for (int i = 0; i < 8; i++) printf(" %02x", inf[i]);
+            printf("\n");
+        }
         if (n >= 8 || (n == 0 && tecla_ultima)) {
             /* Con datos, o sin ellos pero con una tecla abajo: en el segundo
              * caso el informe no ha cambiado y lo que toca es repetir. */
