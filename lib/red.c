@@ -167,6 +167,32 @@ int resolver(const char *nombre, uint32_t *ip)
     return 0;
 }
 
+int ping(uint32_t ip, int seq, int bytes, int *ms, int *ttl, int decimas)
+{
+    if (mi_puerto() < 0) { errno = EIO; return -1; }
+
+    struct umsg_ping *p = (struct umsg_ping *)m.data;
+    m.type = UMSG_PING; m.len = sizeof(*p);
+    p->port = (unsigned long)puerto; p->ip = ip;
+    p->seq = (unsigned long)seq; p->datos = (unsigned long)bytes;
+    p->ms = p->ttl = 0;
+    if (msg_send(PORT_RED, &m) < 0) { errno = EIO; return -1; }
+
+    /* Puede llegar el eco del ping ANTERIOR, que se rindio por tiempo y
+     * contesto tarde. Se descarta por la secuencia y se sigue esperando. */
+    for (int v = 0; v < 4; v++) {
+        int r = red_esperar(UMSG_PING_OK, decimas);
+        if (r != 0) return r > 0 ? 0 : -1;          /* 1 = se agoto; -1 = no se puede */
+        const struct umsg_ping *q = (const struct umsg_ping *)m.data;
+        if ((int)q->seq != seq) continue;
+        if (ms)  *ms  = (int)q->ms;
+        if (ttl) *ttl = (int)q->ttl;
+        return 1;
+    }
+    errno = EAGAIN;
+    return 0;
+}
+
 int red_estado(struct red_estado *e)
 {
     if (mi_puerto() < 0) { errno = EIO; return -1; }

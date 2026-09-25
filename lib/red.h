@@ -24,6 +24,12 @@ void udp_cerrar(int s);
 
 int  resolver(const char *nombre, uint32_t *ip);   /* 0 si va bien; errno dice por que */
 
+/* Un ping: manda un eco y espera el suyo. Devuelve 1 si contesto (y rellena
+ * el viaje en milisegundos y el TTL), 0 si se agoto la espera -que es lo que
+ * significa "paquete perdido"- y -1 si la red dijo que no se puede llegar,
+ * con el motivo en errno. 'seq' distingue esta respuesta de la anterior. */
+int  ping(uint32_t ip, int seq, int bytes, int *ms, int *ttl, int decimas);
+
 struct red_estado {
     uint32_t ip, mascara, router, dns, ntp;
     int      estado;                   /* 0 sin tarjeta, 1 buscando, 2 pidiendo, 3 con ip */

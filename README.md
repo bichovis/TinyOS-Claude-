@@ -7144,6 +7144,69 @@ Y del otro lado: el servidor Python vio llegar `hola desde TinyOS`, y el
 `nc -u` del Mac recibio de vuelta lo que mando. Los dos sentidos, desde un
 programa normal. La hora sigue llegando por el DNS nuevo.
 
+## `ping`
+
+El programa de red mas antiguo que sigue en uso, y el que mas dice con
+menos: si contesta, hay cable, hay direccion, hay camino de ida Y de vuelta,
+y el otro esta vivo. Si no contesta, ninguna de esas cosas se puede dar por
+buena. La pila sabia CONTESTAR pings desde el paso 70; lo que faltaba era
+mandarlos.
+
+### ICMP no cabe en un enchufe
+
+ICMP no tiene puertos -es el protocolo con el que las maquinas hablan DE la
+red, no POR la red- asi que no encaja en la abstraccion del paso anterior.
+Lo habla la pila y se le pide con un mensaje: `UMSG_PING` con a quien y un
+numero de secuencia; contesta `UMSG_PING_OK` con el viaje en milisegundos y
+el TTL que traia el eco.
+
+Un eco se casa por tres cosas: que venga de quien se pregunto, que lleve
+nuestro identificador (`PING_IDENT`, dos letras) y que la secuencia sea la
+de este ping y no la del anterior, que se rindio y contesto tarde. Sin lo
+tercero, un ping perdido descuadra todos los siguientes.
+
+Y un tipo mas: el 3, "no he podido llegar". Lo manda un ROUTER y no el
+destino -es la unica forma de que un error llegue a quien pregunto- y trae
+dentro el principio del paquete que no paso. Aqui no se mira: con saber que
+fallo basta para decirlo, y el codigo distingue red, maquina, protocolo o
+puerto.
+
+### Ctrl-C tiene que dar el resumen
+
+Es lo que hace el ping de Unix y lo que uno espera, y aqui se ve POR QUE
+funciona: el manejador de `SIGINT` solo levanta una bandera -`printf` no es
+reentrante y un manejador no puede llamarlo- pero la senyal, al no llevar
+`SA_RESTART`, INTERRUMPE la espera: el `msg_recv` de dentro de `ping()`
+vuelve con error, el bucle mira la bandera y sale a imprimir el resumen. Las
+dos mitades -la senyal que interrumpe y la bandera que se consulta- son las
+dos piezas de los pasos 24 y 54, usadas juntas por primera vez.
+
+### La prueba, y lo que los numeros cuentan
+
+    / $ ping 10.0.2.2
+      PING 10.0.2.2: 56 bytes de datos
+      64 bytes de 10.0.2.2: seq=0 ttl=255 tiempo=5 ms
+      64 bytes de 10.0.2.2: seq=1 ttl=255 tiempo=11 ms
+      --- 10.0.2.2 ---
+      4 mandados, 4 recibidos, 0% perdidos; viaje min/medio/max = 5/9/11 ms
+    / $ ping google.com 2
+      PING google.com (192.178.25.110): 56 bytes de datos
+      64 bytes de 192.178.25.110: seq=0 ttl=255 tiempo=32 ms
+    / $ ping 10.0.2.99 2
+      seq=0: sin respuesta
+      2 mandados, 0 recibidos, 100% perdidos
+
+Y esos 11 ms al vecino de al lado dicen algo: no es lo que tarda la red, es
+lo que tarda TinyOS en mirarla. El driver de USB mira el canal de recepcion
+una vez por alarma, cada 10 ms, asi que un viaje de medio milisegundo se
+mide como diez. Los 31 ms a Google, en cambio, son casi todos reales: ahi el
+sondeo es el 30% y no el 100%.
+
+Es el coste de no usar interrupciones, medido por un programa de treinta
+lineas. El dia que el driver atienda la IRQ 9 en vez de preguntar, este
+numero bajara a lo que de verdad tarda el cable, y se vera aqui sin tocar
+nada.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -7342,6 +7405,11 @@ programa normal. La hora sigue llegando por el DNS nuevo.
   asi que a la larga se ira; lo corrige la sincronizacion de cada hora. El
   cambio de hora solo sabe la regla europea (`ZONA=CET`); otra zona con
   horario de verano necesita su regla.
+- `ping` mide el viaje con la resolucion del sondeo del driver: 10 ms. Y solo
+  hay UN ping en vuelo en la pila, asi que dos programas pingueando a la vez
+  se pisan; el segundo tapa al primero y el primero se queda sin respuesta.
+  Los ICMP de tipo 3 se dan por nuestros sin mirar el paquete que traen
+  dentro.
 - Los enchufes son solo UDP y ocho en total; no hay TCP, y sin TCP no hay
   HTTP ni nada que hable con la web. Un programa guarda un datagrama por
   enchufe: si llegan dos antes de que pregunte, se queda con el ultimo. La

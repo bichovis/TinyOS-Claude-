@@ -67,7 +67,7 @@ static uint16_t suma_fin(uint32_t s)
 }
 
 static const uint8_t TODOS[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-static struct message rx, tx;
+static struct message rx, tx, resp;
 
 /* Una trama al driver. Si el driver ya no esta, la tarjeta tampoco. */
 static void enviar(int n)
@@ -219,18 +219,113 @@ static void udp_enviar(uint32_t dst, uint16_t sport, uint16_t dport, const uint8
     ip_enviar(dst, 17, seg, 8 + n);
 }
 
-/* --- ICMP: "estas ahi?" "aqui estoy" ------------------------------------- */
+static void error_a(uint64_t port, const char *motivo);   /* esta en los enchufes */
+
+/* --- ICMP: "estas ahi?" "aqui estoy" ---------------------------------------
+ *
+ * ICMP es el protocolo con el que las maquinas se hablan DE la red, no POR
+ * la red: no lleva datos de nadie, lleva noticias sobre el camino. Dos tipos
+ * hacen falta aqui:
+ *
+ *   8 / 0   "estas ahi?" / "aqui estoy"  - el ping, que es literalmente un
+ *           paquete que pide que se lo devuelvan igual. Por eso mide el
+ *           viaje: lo que vuelve es lo que se mando.
+ *   3       "no he podido llegar", y lo manda un ROUTER, no el destino: es
+ *           la unica forma de que un error se entere quien pregunto.
+ *
+ * Contestar al 8 ya se hacia desde el paso 70. Mandarlo es lo nuevo, y con
+ * eso la Pi deja de solo responder a la red y empieza a preguntarle. */
 static unsigned pings;
 
-static void icmp_llego(uint32_t src, const uint8_t *d, int n)
+/* El ping en vuelo. Uno, porque un ping se espera antes de mandar el
+ * siguiente; el identificador y la secuencia son lo que distingue una
+ * respuesta nuestra de un eco de otro que ande por ahi. */
+#define PING_IDENT  0x5449               /* "TI" */
+static struct {
+    int      activo;
+    uint64_t cliente;
+    uint32_t ip;
+    uint16_t seq;
+    uint64_t t0;
+    int      bytes;
+} ping_vuelo;
+
+static void ping_contestar(int ok, unsigned ms, unsigned ttl, const char *motivo)
+{
+    if (!ping_vuelo.activo) return;
+    ping_vuelo.activo = 0;
+
+    if (!ok) { error_a(ping_vuelo.cliente, motivo); return; }
+
+    struct umsg_ping *p = (struct umsg_ping *)resp.data;
+    resp.type = UMSG_PING_OK; resp.len = sizeof(*p);
+    p->port = ping_vuelo.cliente; p->ip = ping_vuelo.ip;
+    p->seq = ping_vuelo.seq; p->datos = (unsigned long)ping_vuelo.bytes;
+    p->ms = ms; p->ttl = ttl;
+    msg_send(ping_vuelo.cliente, &resp);
+}
+
+static void icmp_llego(uint32_t src, unsigned ttl, const uint8_t *d, int n)
 {
     static uint8_t r[1480];
-    if (n < 8 || n > (int)sizeof(r) || d[0] != 8) return;   /* solo echo request */
-    memcpy(r, d, (size_t)n);
-    r[0] = 0; r[2] = r[3] = 0;                                /* echo reply */
-    pon16(r + 2, suma_fin(suma_parcial(r, n, 0)));
-    if (pings++ < 3) printf("  [red] ping de %d.%d.%d.%d (%d bytes): contesto\n", IP4(src), n - 8);
-    ip_enviar(src, 1, r, n);
+    if (n < 8 || n > (int)sizeof(r)) return;
+
+    /* "Estas ahi?": se devuelve lo mismo con el tipo cambiado. La suma se
+     * recalcula porque el tipo entra en ella. */
+    if (d[0] == 8) {
+        memcpy(r, d, (size_t)n);
+        r[0] = 0; r[2] = r[3] = 0;                            /* echo reply */
+        pon16(r + 2, suma_fin(suma_parcial(r, n, 0)));
+        if (pings++ < 3) printf("  [red] ping de %d.%d.%d.%d (%d bytes): contesto\n", IP4(src), n - 8);
+        ip_enviar(src, 1, r, n);
+        return;
+    }
+
+    /* "Aqui estoy": el eco de lo que mandamos. Se comprueba de quien viene,
+     * el identificador y la secuencia: un eco que no case es de otro. */
+    if (d[0] == 0 && ping_vuelo.activo) {
+        if (be16(d + 4) != PING_IDENT || be16(d + 6) != ping_vuelo.seq) return;
+        if (src != ping_vuelo.ip) return;
+        ping_contestar(1, (unsigned)(uptime() - ping_vuelo.t0), ttl, 0);
+        return;
+    }
+
+    /* "No he podido llegar". Lo manda un router y trae dentro el principio
+     * del paquete que no llego; aqui no se mira -con saber que fallo basta
+     * para decirlo- y se da por nuestro si habia un ping esperando. */
+    if (d[0] == 3 && ping_vuelo.activo) {
+        static const char *porques[] = { "red inalcanzable", "maquina inalcanzable",
+                                         "protocolo inalcanzable", "puerto cerrado" };
+        ping_contestar(0, 0, 0, d[1] < 4 ? porques[d[1]] : "no se puede llegar");
+    }
+}
+
+static void ping_pedido(void)
+{
+    const struct umsg_ping *q = (const struct umsg_ping *)rx.data;
+    static uint8_t b[1480];
+
+    if (!ip) { error_a(q->port, "todavia sin direccion IP (DHCP)"); return; }
+
+    int datos = (int)q->datos;
+    if (datos <= 0) datos = 56;                  /* los 56 de siempre: 64 de ICMP */
+    if (datos > 1400) datos = 1400;
+
+    b[0] = 8; b[1] = 0; b[2] = b[3] = 0;
+    pon16(b + 4, PING_IDENT);
+    pon16(b + 6, (uint16_t)q->seq);
+    /* Relleno con un patron que se reconoce si algo lo toca por el camino. */
+    for (int i = 0; i < datos; i++) b[8 + i] = (uint8_t)(0x10 + i);
+    pon16(b + 2, suma_fin(suma_parcial(b, 8 + datos, 0)));
+
+    ping_vuelo.activo = 1;
+    ping_vuelo.cliente = q->port;
+    ping_vuelo.ip = (uint32_t)q->ip;
+    ping_vuelo.seq = (uint16_t)q->seq;
+    ping_vuelo.bytes = datos;
+    ping_vuelo.t0 = uptime();
+
+    ip_enviar((uint32_t)q->ip, 1, b, 8 + datos);
 }
 
 static void hora_iniciar(void);
@@ -419,7 +514,6 @@ static uint16_t dns_id;
 static uint64_t hora_puesta;             /* la ultima que se puso; 0 = nunca */
 static uint64_t clientes[4];             /* puertos esperando un UMSG_HORA */
 static int      n_clientes;
-static struct message resp;
 
 static uint64_t a_unix(uint64_t anyo, uint64_t mes, uint64_t dia)
 {
@@ -877,7 +971,7 @@ static void ip_llego(const uint8_t *f, int n)
      * darnos en vez de a todos. */
     if (!es_nuestro && !(proto == 17 && dn >= 8 && be16(d + 2) == 68)) return;
 
-    if (proto == 1) { icmp_llego(src, d, dn); return; }
+    if (proto == 1) { icmp_llego(src, h[8], d, dn); return; }
     if (proto == 17 && dn >= 8) {
         int ul = be16(d + 4);
         if (ul < 8 || ul > dn) ul = dn;
@@ -937,6 +1031,7 @@ int main(int argc, char **argv)
         case UMSG_ENVIAR:   enchufe_enviar(); break;
         case UMSG_RESOLVER: resolver_pedido(); break;
         case UMSG_INFO:     info_pedida(); break;
+        case UMSG_PING:     ping_pedido(); break;
         default: break;
         }
     }

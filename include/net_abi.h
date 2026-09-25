@@ -101,3 +101,24 @@ struct umsg_info {
     unsigned char mac[6];
     char          tarjeta[16];
 };
+
+/* --- Ping: mandar un eco y esperar que vuelva -------------------------------
+ *
+ * ICMP no es UDP: no tiene puertos, asi que no cabe en un enchufe. Se pide
+ * a la pila, que manda el echo request, espera el reply y contesta con lo
+ * que traia: el viaje en milisegundos y el TTL con el que llego, que dice
+ * cuantos routers ha cruzado.
+ *
+ * 'seq' lo pone quien pregunta y la pila lo devuelve tal cual: es como se
+ * sabe que la respuesta es de ESTE ping y no del anterior, que llego tarde. */
+#define UMSG_PING      46        /* struct umsg_ping -> UMSG_PING_OK | UMSG_ERROR */
+#define UMSG_PING_OK  146        /* struct umsg_ping con ms y ttl                 */
+
+struct umsg_ping {
+    unsigned long port;              /* a donde contestar                  */
+    unsigned long ip;                /* a quien                            */
+    unsigned long seq;               /* el numero de este, para casarlo    */
+    unsigned long datos;             /* bytes de relleno (0 = 56, los de siempre) */
+    unsigned long ms;                /* en la respuesta: el viaje          */
+    unsigned long ttl;               /* en la respuesta: el TTL que traia  */
+};
