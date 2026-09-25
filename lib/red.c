@@ -19,6 +19,16 @@
 static int64_t  puerto = -1;
 static struct message m;
 
+/* Lo ultimo que la pila dijo que habia ido mal, en sus palabras. errno solo
+ * tiene numeros, y "conexion rechazada" o "el otro extremo no contesta" no
+ * son un numero de errno: son lo que hay que ensenyar. */
+static char motivo[128];
+
+const char *red_motivo(void)
+{
+    return motivo[0] ? motivo : strerror(errno);
+}
+
 static struct {
     int      abierto;
     int      local;
@@ -53,12 +63,19 @@ static void guardar(const struct umsg_dgrama *g)
  * decimas de segundo (0 = sin limite). Lo demas que llegue se atiende. */
 static int red_esperar(unsigned long tipo_ok, int decimas)
 {
+    motivo[0] = 0;
     if (decimas > 0 && alarma((uint64_t)puerto, (uint64_t)decimas * 10) < 0) decimas = 0;
     int r = -1;
     for (;;) {
         if (msg_recv((uint64_t)puerto, &m) < 0) { errno = EIO; break; }
         if (m.type == tipo_ok) { r = 0; break; }
-        if (m.type == UMSG_ERROR) { errno = EIO; break; }
+        if (m.type == UMSG_ERROR) {
+            errno = EIO;
+            int k = 0;
+            while (k < (int)sizeof(motivo) - 1 && k < (int)m.len && m.data[k]) { motivo[k] = m.data[k]; k++; }
+            motivo[k] = 0;
+            break;
+        }
         if (m.type == CMSG_ALARMA) { errno = EAGAIN; r = 1; break; }
         if (m.type == UMSG_DATAGRAMA) guardar((const struct umsg_dgrama *)m.data);
     }
@@ -193,6 +210,85 @@ int ping(uint32_t ip, int seq, int bytes, int *ms, int *ttl, int decimas)
     return 0;
 }
 
+/* --- TCP -------------------------------------------------------------------
+ *
+ * Todo pasa por el mismo puerto de IPC que lo demas, asi que hay que tener
+ * cuidado con lo que llega sin haberse pedido: un UMSG_TCP_DATOS de una
+ * conexion mientras se espera el HUECO de otra. red_esperar ya guarda los
+ * datagramas UDP que se cruzan; para TCP se vuelve a esperar, que es lo que
+ * hace falta porque la pila no manda nada que no se le haya pedido. */
+static int tcp_pedir(unsigned long tipo, int c, const void *datos, int n)
+{
+    struct umsg_tcp *t = (struct umsg_tcp *)m.data;
+    if (n > TCP_DATOS_MAX) n = TCP_DATOS_MAX;
+    m.type = tipo;
+    m.len  = sizeof(*t) - TCP_DATOS_MAX + (uint64_t)(n > 0 ? n : 0);
+    t->port = (unsigned long)puerto;
+    t->conexion = (unsigned long)c;
+    t->ip = 0; t->puerto = 0;
+    t->n = (unsigned long)(n > 0 ? n : 0);
+    if (n > 0) memcpy(t->datos, datos, (size_t)n);
+    return msg_send(PORT_RED, &m) < 0 ? -1 : 0;
+}
+
+int tcp_conectar(uint32_t ip, int puerto_dst, int decimas)
+{
+    if (mi_puerto() < 0) { errno = EIO; return -1; }
+
+    struct umsg_tcp *t = (struct umsg_tcp *)m.data;
+    m.type = UMSG_TCP_ABRIR;
+    m.len  = sizeof(*t) - TCP_DATOS_MAX;
+    t->port = (unsigned long)puerto; t->conexion = 0;
+    t->ip = ip; t->puerto = (unsigned long)puerto_dst; t->n = 0;
+    if (msg_send(PORT_RED, &m) < 0) { errno = EIO; return -1; }
+
+    if (red_esperar(UMSG_TCP_ABIERTA, decimas) != 0) return -1;
+    return (int)((const struct umsg_tcp *)m.data)->conexion;
+}
+
+/* Lo que de verdad entro, que puede ser menos. */
+int tcp_enviar(int c, const void *datos, int n, int decimas)
+{
+    if (c < 1) { errno = EBADF; return -1; }
+    if (n <= 0) return 0;
+    if (tcp_pedir(UMSG_TCP_ENVIAR, c, datos, n) < 0) { errno = EIO; return -1; }
+    if (red_esperar(UMSG_TCP_HUECO, decimas) != 0) return -1;
+    return (int)((const struct umsg_tcp *)m.data)->n;
+}
+
+int tcp_enviar_todo(int c, const void *datos, int n, int decimas)
+{
+    const uint8_t *p = (const uint8_t *)datos;
+    int hecho = 0;
+    while (hecho < n) {
+        int r = tcp_enviar(c, p + hecho, n - hecho, decimas);
+        if (r <= 0) return hecho ? hecho : r;
+        hecho += r;
+    }
+    return hecho;
+}
+
+/* Bytes leidos; 0 si el otro extremo ha cerrado, -1 si fue mal o se agoto la
+ * espera (errno EAGAIN). Ojo a la diferencia: 0 es el final de la descarga,
+ * no un error. */
+int tcp_recibir(int c, void *datos, int max, int decimas)
+{
+    if (c < 1) { errno = EBADF; return -1; }
+    if (tcp_pedir(UMSG_TCP_LEER, c, 0, 0) < 0) { errno = EIO; return -1; }
+    if (red_esperar(UMSG_TCP_DATOS, decimas) != 0) return -1;
+
+    const struct umsg_tcp *t = (const struct umsg_tcp *)m.data;
+    int n = (int)t->n;
+    if (n > max) n = max;
+    if (n > 0) memcpy(datos, t->datos, (size_t)n);
+    return n;
+}
+
+void tcp_cerrar(int c)
+{
+    if (c >= 1) tcp_pedir(UMSG_TCP_CERRAR, c, 0, 0);
+}
+
 int red_estado(struct red_estado *e)
 {
     if (mi_puerto() < 0) { errno = EIO; return -1; }
@@ -206,6 +302,10 @@ int red_estado(struct red_estado *e)
     e->dns = (uint32_t)i->dns; e->ntp = (uint32_t)i->ntp; e->estado = (int)i->estado;
     memcpy(e->mac, i->mac, 6);
     memcpy(e->tarjeta, i->tarjeta, sizeof(e->tarjeta));
+    e->tramas_rx = (unsigned)i->tramas_rx; e->tramas_tx = (unsigned)i->tramas_tx;
+    e->tcp_seg = (unsigned)i->tcp_seg; e->tcp_fuera = (unsigned)i->tcp_fuera;
+    e->tcp_repes = (unsigned)i->tcp_repes; e->tcp_retx = (unsigned)i->tcp_retx;
+    e->tcp_ack = (unsigned)i->tcp_ack;
     return 0;
 }
 

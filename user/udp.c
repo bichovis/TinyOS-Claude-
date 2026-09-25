@@ -63,6 +63,10 @@ static int info(void)
         printf("  ip       %s  mascara %s\n  router   %s\n  dns      %s\n", a, b, c, d);
         if (e.ntp) { ip_texto(e.ntp, a); printf("  ntp      %s (del DHCP)\n", a); }
     }
+    printf("  tramas   %u recibidas, %u mandadas\n", e.tramas_rx, e.tramas_tx);
+    printf("  tcp      %u segmentos, %u fuera de orden, %u repetidos, "
+           "%u retransmitidos, %u ACK\n",
+           e.tcp_seg, e.tcp_fuera, e.tcp_repes, e.tcp_retx, e.tcp_ack);
     return 0;
 }
 

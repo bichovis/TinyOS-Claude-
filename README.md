@@ -7283,6 +7283,131 @@ prueba de que no hay tormenta ni se pierde nada: 2.388 datagramas de 200
 bytes en seis segundos desde el Mac contra `udp escucha 7`, **2.388
 recibidos y devueltos**, y el shell contestando al acabar.
 
+## TCP, y una pagina web
+
+Lo que falta para que TinyOS no solo hable a internet sino que CONSUMA
+internet. UDP manda un paquete y se olvida; TCP promete cuatro cosas que el
+cable no da -que llegue todo, en orden, una vez, y sin ahogar al que
+escucha- y las cuatro salen del mismo truco: **numerar los bytes**. No los
+paquetes: los bytes.
+
+De ahi salen las tres variables que son TCP entero:
+
+    snd_una   el primer byte mio que el otro aun NO ha reconocido
+    snd_nxt   el siguiente que mandaria
+    rcv_nxt   el siguiente que espero recibir; es lo que va en cada ACK
+
+Y de ahi sus dos rarezas. El SYN y el FIN **consumen un numero de
+secuencia** aunque no lleven datos, porque si no no habria forma de
+reconocerlos. Y los numeros dan la vuelta a los 4 GB, asi que "mayor que" no
+se puede escribir con `>` -compararia mal justo al dar la vuelta- y se
+escribe restando con signo: `(int32_t)(a - b) > 0`.
+
+### Lo que NO hace, dicho antes de empezar
+
+Un segmento en vuelo cada vez, y por eso no hay cola de retransmision: se
+guarda el segmento tal cual y retransmitir es mandarlo otra vez. Nada de
+reensamblar lo que llega desordenado: lo adelantado se tira y se repite el
+ACK, asi que una perdida cuesta un viaje mas. Y el cierre no espera los dos
+minutos del `TIME_WAIT` de verdad, solo dos segundos. Es un TCP de cliente,
+suficiente para descargar, y las tres cosas estan donde se ven.
+
+### Los datos se guardan, no se empujan
+
+Aqui hay una decision que cambia el disenyo. Los enchufes UDP del paso 72
+EMPUJAN: llega un datagrama y se manda al programa. Si el programa no lee,
+la cola de su puerto se llena y el `msg_send` de la pila **espera**... y una
+pila esperando es la red entera parada.
+
+Con TCP eso no es una posibilidad remota, es el caso normal: un servidor
+manda un megabyte en cuanto puede. Asi que los datos se quedan en la pila
+-8 KB por conexion- y el programa los PIDE. Lo que se llena entonces es la
+ventana, el otro extremo se frena solo, y eso es exactamente lo que TCP
+invento para esto. El control de flujo no hay que construirlo: hay que
+dejar que funcione.
+
+### 1 KB/s, y por que
+
+La primera version descargaba bien y a **1 KB/s**. 26.500 bytes en 14,9
+segundos. Lo primero fue instrumentar, no adivinar: unos contadores en la
+pila (`udp` los ensenya) dijeron 24 segmentos, **0 fuera de orden, 0
+repetidos, 0 retransmitidos**. No se perdia nada. Alguien esperaba.
+
+Del lado del Mac, un servidor con marcas de tiempo: los 26.500 bytes salian
+en **3 milisegundos** y cerraba. El retardo era entero mio. Y midiendo cada
+lectura dentro de TinyOS aparecio el patron:
+
+    [leer 1400 en 0 ms]  x6      <- vaciar el buzon de 8 KB, instantaneo
+    [leer  992 en 4931 ms]       <- y cinco segundos de nada
+
+Eso es una **ventana cerrada sin aviso**. El emisor no pregunta: lo ultimo
+que sabe de mi ventana es lo que le dijo mi ultimo ACK, y cuando la llena se
+para. Mi codigo avisaba de que habia sitio solo `if (!antes)`, o sea solo si
+la ventana estaba exactamente a cero: tras el primer aviso anunciaba 1400,
+el Mac mandaba 1400, volvia a verme llena, y yo nunca le decia que ya tenia
+8 KB libres. El Mac esperaba su *persist timer*: cinco segundos, y otra vez.
+
+La regla buena es la del RFC 1122: avisar cuando el hueco ha crecido lo
+bastante para que merezca la pena -un segmento entero, o la mitad del
+buzon-. Tres lineas:
+
+    int umbral = c->mss < TCP_BUZ / 2 ? c->mss : TCP_BUZ / 2;
+    if (c->estado == T_ABIERTA && tcp_hueco(c) >= c->ventana_dicha + umbral)
+        tcp_ack(c);
+
+**De 1 KB/s a 446 KB/s.** Un factor de 250 en tres lineas, y ninguna de
+ellas se habria escrito sin medir primero.
+
+### Dos fallos que solo aparecen al equivocarse a proposito
+
+Conectar a un puerto cerrado tardaba diez segundos y decia "vuelve a
+intentarlo", cuando el servidor contesta RST al instante. `tcp_terminar`
+avisaba a quien estuviera enviando y a quien estuviera leyendo, pero durante
+el saludo quien espera no es ninguno de los dos: es el que pidio ABRIR. Una
+linea, y ahora dice **"conexion rechazada"** en el acto.
+
+Y el motivo se perdia por el camino: la pila manda un texto y la libreria lo
+tiraba para poner `errno = EIO`, que se ensenya como "el hardware dijo que
+no". Ahora `red_motivo()` lo lleva hasta el programa, y una IP que no
+contesta dice **"el otro extremo no contesta"**.
+
+### `wget`
+
+HTTP es una linea con el metodo, unas cabeceras, una linea vacia, y detras
+la respuesta. Se pide con `Connection: close` para que el final de la
+respuesta sea el final de la conexion y no haya que entender el troceado de
+HTTP/1.1. Lo dificil -que los bytes lleguen todos, en orden y una vez- lo
+hace TCP.
+
+El unico detalle con historia es el fin de las cabeceras: se busca una LINEA
+VACIA contando lo que lleva la linea actual e ignorando los retornos de
+carro, asi valen el `\r\n` de la norma y el `\n` a secas de muchos proxys.
+Ser estricto al mandar y tolerante al recibir es una regla vieja de
+internet, y aqui se gana una descarga en vez de una pagina que parece vacia.
+De HTTPS no hay nada: cifrar pide criptografia que aqui no existe.
+
+### Las pruebas
+
+    / $ wget http://info.cern.ch/
+      info.cern.ch es 188.184.67.127; conectando al puerto 80...
+      HTTP/1.1 200 OK
+      <html><head></head><body><header>
+      <title>http://info.cern.ch</title>
+      ...
+      --- 646 bytes  (0.1 s, 5 KB/s)
+
+Esa es la primera pagina web del mundo, traida por un sistema operativo
+escrito paso a paso. Y la prueba que no se puede fingir:
+
+    / $ wget http://10.0.2.2:8080/mega.bin /MEGA.BIN
+      1048576 bytes en /MEGA.BIN  (2.3 s, 438 KB/s)
+
+Un megabyte, 738 segmentos, cero perdidas, cero retransmisiones; y el
+`md5` del fichero en la tarjeta, leido despues desde el Mac, **identico al
+original**. Tambien `neverssl.com` guardado y contado con `wc` (3.961
+bytes, 131 lineas), y todo junto -teclado USB, pendrive montado, ping y un
+megabyte a la vez- sin que nada se pise.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -7468,7 +7593,10 @@ recibidos y devueltos**, y el shell contestando al acabar.
   nadie lo sondea todavia.
 - El pendrive va a un sector por mensaje y sin cache de mas de un sector:
   un fichero de 100 KB son 200 viajes de ida y vuelta entre tres procesos.
-  Funciona; no es rapido. Y solo se enumera al arrancar: enchufarlo despues
+  Ahora esta MEDIDO, gracias al `wget` del paso 75: el mismo fichero de 26 KB
+  tarda 0,06 s escrito en la SD y 13 s escrito en el pendrive. Unos 2 KB/s;
+  el cuello no es TCP ni el USB, es el camino fs -> IPC -> driver, sector a
+  sector. Y solo se enumera al arrancar: enchufarlo despues
   no lo monta, y sacarlo mientras esta montado da errores en cada acceso
   pero no desmonta. Falta sondear el endpoint de interrupcion del hub.
 - Cualquier proceso puede mandar un `FS_DISCO` con su propio puerto y
@@ -7481,6 +7609,13 @@ recibidos y devueltos**, y el shell contestando al acabar.
   asi que a la larga se ira; lo corrige la sincronizacion de cada hora. El
   cambio de hora solo sabe la regla europea (`ZONA=CET`); otra zona con
   horario de verano necesita su regla.
+- TCP es de cliente: no hay LISTEN ni accept, asi que TinyOS puede pedir
+  paginas pero no servirlas. Tres conexiones a la vez como maximo, un
+  segmento en vuelo (una descarga va a un segmento por viaje de ida y
+  vuelta: en internet, con 30 ms de RTT, eso son unos 45 KB/s por conexion),
+  nada de reensamblado fuera de orden, retransmision con un reloj de un
+  segundo entero, y sin control de congestion: si la red se satura, TinyOS
+  no baja el ritmo porque no tiene ritmo que bajar.
 - `ping` mide el viaje con la resolucion del sondeo del driver: 10 ms. Y solo
   hay UN ping en vuelo en la pila, asi que dos programas pingueando a la vez
   se pisan; el segundo tapa al primero y el primero se queda sin respuesta.

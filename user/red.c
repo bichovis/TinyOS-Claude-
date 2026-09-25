@@ -20,7 +20,8 @@
  * para conseguir direccion, la Pi es una maquina mas de la red: se le puede
  * hacer ping y puede hablar con cualquiera. Encima de UDP van DNS y NTP
  * -la hora- y los "enchufes": puertos UDP que cualquier programa se queda
- * para hablar con la red por mensajes.
+ * para hablar con la red por mensajes. Y encima de IP, al lado de UDP, TCP:
+ * la tuberia fiable con la que se descarga una pagina web.
  *
  * Todo es big-endian ("orden de red"): el byte alto primero. El ARM guarda
  * los numeros al reves, asi que aqui no se lee ni escribe un numero
@@ -38,6 +39,11 @@ static uint64_t driver;                  /* puerto del driver; 0 = sin tarjeta *
 static uint8_t  mi_mac[6];               /* 'mac' a secas es la llamada al sistema */
 static char     tarjeta[16];
 static uint32_t ip, mascara, router, dns, ntp;   /* 0 = no lo tenemos */
+
+/* Cuentas, para que "la red va lenta" se pueda convertir en una causa. Las
+ * ensenya el programa `udp`. */
+static unsigned tramas, tramas_tx;
+static unsigned tcp_seg, tcp_fuera, tcp_repes, tcp_retx, tcp_ack_n;
 
 /* --- Bytes en orden de red ---------------------------------------------- */
 static uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
@@ -73,6 +79,7 @@ static struct message rx, tx, resp;
 static void enviar(int n)
 {
     if (!driver) return;
+    tramas_tx++;
     tx.type = NMSG_ENVIAR;
     tx.len  = (uint64_t)n;
     if (msg_send(driver, &tx) < 0) {
@@ -332,6 +339,7 @@ static void hora_iniciar(void);
 static void hora_tick(void);
 static void dns_tick(void);
 static void enchufes_barrer(void);
+static void tcp_tick(void);
 
 /* --- DHCP: pedir una direccion --------------------------------------------
  *
@@ -471,6 +479,7 @@ static void cada_segundo(void)
     hora_tick();
     dns_tick();
     enchufes_barrer();
+    tcp_tick();
 }
 
 /* --- La hora: dos programas encima de UDP ----------------------------------
@@ -931,7 +940,486 @@ static void info_pedida(void)
     i->estado = (unsigned long)(driver ? estado : 0);
     memcpy(i->mac, mi_mac, 6);
     memcpy(i->tarjeta, tarjeta, sizeof(i->tarjeta));
+    i->tramas_rx = tramas; i->tramas_tx = tramas_tx;
+    i->tcp_seg = tcp_seg; i->tcp_fuera = tcp_fuera; i->tcp_repes = tcp_repes;
+    i->tcp_retx = tcp_retx; i->tcp_ack = tcp_ack_n;
     msg_send(p->port, &resp);
+}
+
+/* --- TCP: una tuberia fiable sobre un cable que no lo es -----------------------
+ *
+ * Todo lo de arriba manda paquetes y se olvida. TCP promete que llega todo,
+ * en orden, una vez, y sin ahogar al que escucha; y las cuatro promesas salen
+ * de un solo truco: NUMERAR LOS BYTES. No los paquetes: los bytes. Cada
+ * extremo lleva la cuenta de por donde va, y nada se da por entregado hasta
+ * que el otro dice el numero del siguiente que espera.
+ *
+ * De ahi salen las tres variables que son TCP entero:
+ *
+ *   snd_una   el primer byte mio que el otro aun NO ha reconocido
+ *   snd_nxt   el siguiente que mandaria
+ *   rcv_nxt   el siguiente que espero recibir; es lo que va en cada ACK
+ *
+ * Y de ahi salen tambien sus dos cosas raras. Una: el SYN y el FIN CONSUMEN
+ * un numero de secuencia aunque no lleven un byte de datos, porque si no, no
+ * habria forma de reconocerlos. Dos: los numeros dan la vuelta a los 4 GB, asi
+ * que "mayor que" no se puede escribir con '>' -compararia mal justo al dar la
+ * vuelta- y se escribe restando con signo: (int32_t)(a - b) > 0.
+ *
+ * Lo que hay aqui es un TCP de CLIENTE, y con simplificaciones que se ven
+ * desde fuera y estan dichas en el README: un solo segmento en vuelo, nada de
+ * reensamblar lo que llega desordenado, y un cierre sin la espera de dos
+ * minutos del final. Con eso se descarga una pagina web, que es la prueba. */
+#define TCP_FIN   0x01
+#define TCP_SYN   0x02
+#define TCP_RST   0x04
+#define TCP_PSH   0x08
+#define TCP_ACK   0x10
+
+#define T_LIBRE     0
+#define T_SYN       1                   /* SYN mandado, esperando su SYN+ACK */
+#define T_ABIERTA   2
+#define T_CERRANDO  3                   /* FIN mandado, esperando su ACK y su FIN */
+#define T_MUERTA    4                   /* terminada; puede quedar algo por leer */
+
+#define TCP_BUZ    8192                 /* lo recibido y no leido: es la ventana */
+#define TCP_MSS    1400                 /* lo que anuncio; cabe en un mensaje IPC */
+#define TCP_CONEX     3
+
+struct conexion {
+    int      estado;
+    uint64_t pid, cliente;              /* de quien es, y a donde se le contesta */
+    uint32_t ip;
+    uint16_t local, remoto;
+
+    uint32_t snd_una, snd_nxt, rcv_nxt;
+    uint32_t ventana_otro;
+    int      mss;
+
+    /* Lo que esta en vuelo. UNO, y por eso no hace falta una cola de
+     * retransmision: se guarda el segmento tal cual y retransmitir es
+     * mandarlo otra vez igual. */
+    int      vuelo_banderas, vuelo_n;
+    uint32_t vuelo_seq;
+    unsigned vuelo_t, reintentos;
+    uint8_t  vuelo[TCP_MSS];
+
+    /* Lo recibido y no leido. El hueco que queda es la ventana que se
+     * anuncia, y ahi esta el control de flujo: si el programa no lee, la
+     * ventana se cierra y el otro extremo se para solo. */
+    uint8_t  buz[TCP_BUZ];
+    int      buz_n;
+    int      fin_recibido;
+
+    int      ventana_dicha;             /* la ultima ventana que se le anuncio */
+    uint64_t lector;                    /* puerto esperando datos, 0 = ninguno */
+    uint64_t envio;                     /* puerto esperando el ACK de su envio */
+    int      cerrar_pedido;
+    unsigned morir_en;                  /* segundo en que se suelta la ranura */
+};
+static struct conexion conex[TCP_CONEX];
+static uint16_t tcp_efimero = 40000;
+
+static int tcp_hueco(const struct conexion *c) { return TCP_BUZ - c->buz_n; }
+
+/* Un segmento al otro extremo. 'seq' se pasa a mano porque no es siempre
+ * snd_nxt: al retransmitir hay que volver a mandar el numero de entonces. */
+static void tcp_mandar(struct conexion *c, int banderas, uint32_t seq,
+                       const uint8_t *datos, int n)
+{
+    static uint8_t seg[1500];
+    int off = 20;
+
+    pon16(seg, c->local);
+    pon16(seg + 2, c->remoto);
+    pon32(seg + 4, seq);
+    pon32(seg + 8, (banderas & TCP_ACK) ? c->rcv_nxt : 0);
+
+    /* El SYN lleva detras una opcion: "no me mandes segmentos mayores que
+     * esto". Se anuncia 1400 y no 1460 a proposito: es lo que cabe en un
+     * mensaje de este sistema, asi que el otro extremo nunca mandara algo
+     * que no se pueda entregar de una pieza. */
+    if (banderas & TCP_SYN) {
+        seg[20] = 2; seg[21] = 4; pon16(seg + 22, TCP_MSS);
+        off = 24;
+    }
+    seg[12] = (uint8_t)((off / 4) << 4);
+    seg[13] = (uint8_t)banderas;
+    c->ventana_dicha = tcp_hueco(c);         /* lo ultimo que sabe el otro */
+    pon16(seg + 14, (uint16_t)c->ventana_dicha);
+    seg[16] = seg[17] = 0;                            /* suma, luego */
+    pon16(seg + 18, 0);                               /* nada urgente */
+    if (n) memcpy(seg + off, datos, (size_t)n);
+
+    /* La suma cubre una "pseudocabecera" con las dos direcciones, el
+     * protocolo y la longitud: asi un segmento que llegue a la maquina
+     * equivocada, o troceado, no pasa por bueno. */
+    uint8_t pseudo[12];
+    pon32(pseudo, ip); pon32(pseudo + 4, c->ip);
+    pseudo[8] = 0; pseudo[9] = 6; pon16(pseudo + 10, (uint16_t)(off + n));
+    pon16(seg + 16, suma_fin(suma_parcial(seg, off + n, suma_parcial(pseudo, 12, 0))));
+
+    ip_enviar(c->ip, 6, seg, off + n);
+}
+
+/* Poner un segmento en vuelo: se guarda entero, porque el reloj puede tener
+ * que volver a mandarlo. */
+static void tcp_volar(struct conexion *c, int banderas, const uint8_t *datos, int n)
+{
+    c->vuelo_banderas = banderas;
+    c->vuelo_seq = c->snd_una;
+    c->vuelo_n = n;
+    if (n) memcpy(c->vuelo, datos, (size_t)n);
+    c->vuelo_t = segundos;
+    c->reintentos = 0;
+    c->snd_nxt = c->snd_una + (uint32_t)n +
+                 (uint32_t)((banderas & (TCP_SYN | TCP_FIN)) ? 1 : 0);
+    tcp_mandar(c, banderas, c->vuelo_seq, datos, n);
+}
+
+static void tcp_ack(struct conexion *c) { tcp_ack_n++; tcp_mandar(c, TCP_ACK, c->snd_nxt, 0, 0); }
+
+/* Un RST a un segmento que no es de nadie. Sin esto, el otro extremo
+ * retransmite durante minutos contra una puerta que ya no existe. */
+static void tcp_rst_suelto(uint32_t dst, uint16_t sport, uint16_t dport,
+                           uint32_t seq, uint32_t ack, int banderas, int largo)
+{
+    struct conexion t = { 0 };
+    t.ip = dst; t.local = dport; t.remoto = sport; t.buz_n = TCP_BUZ;
+    if (banderas & TCP_ACK) {
+        t.rcv_nxt = 0;
+        tcp_mandar(&t, TCP_RST, ack, 0, 0);
+    } else {
+        t.rcv_nxt = seq + (uint32_t)largo + ((banderas & TCP_SYN) ? 1 : 0);
+        tcp_mandar(&t, TCP_RST | TCP_ACK, 0, 0, 0);
+    }
+}
+
+static void tcp_responder(struct conexion *c, unsigned long tipo, const uint8_t *d, int n)
+{
+    struct umsg_tcp *t = (struct umsg_tcp *)resp.data;
+    if (n > TCP_DATOS_MAX) n = TCP_DATOS_MAX;
+    resp.type = tipo;
+    resp.len  = sizeof(*t) - TCP_DATOS_MAX + (uint64_t)n;
+    t->port = c->cliente;
+    t->conexion = (unsigned long)(c - conex) + 1;
+    t->ip = c->ip; t->puerto = c->remoto;
+    t->n = (unsigned long)n;
+    if (n) memcpy(t->datos, d, (size_t)n);
+    msg_send(c->cliente, &resp);
+}
+
+/* Se acabo, bien o mal: se avisa a quien estuviera esperando algo y la
+ * ranura se suelta en un par de segundos. Ese retraso es lo que queda del
+ * TIME_WAIT de TCP, que en un sistema de verdad son dos minutos: tiempo para
+ * que un ACK tardio nuestro llegue y para que nadie reuse el puerto con
+ * paquetes viejos por el aire. */
+static void tcp_terminar(struct conexion *c, const char *motivo)
+{
+    int saludando = (c->estado == T_SYN);
+    c->estado = T_MUERTA;
+    c->vuelo_banderas = c->vuelo_n = 0;
+
+    /* Si se murio durante el saludo, quien espera es el que pidio ABRIR, y no
+     * esta ni en 'envio' ni en 'lector': esta en 'cliente'. Sin esto, un
+     * puerto cerrado -que contesta RST al instante- se quedaba callado y el
+     * programa esperaba sus diez segundos para decir "vuelve a intentarlo",
+     * que es justo lo contrario de lo que habia pasado. */
+    if (saludando) { error_a(c->cliente, motivo ? motivo : "no se pudo conectar"); c->morir_en = segundos + 1; }
+    if (c->envio)  { error_a(c->envio, motivo ? motivo : "la conexion se ha cerrado"); c->envio = 0; }
+    if (c->lector) {
+        if (motivo && !c->buz_n) error_a(c->lector, motivo);
+        else                     tcp_responder(c, UMSG_TCP_DATOS, c->buz, 0);
+        c->lector = 0;
+    }
+    if (!c->morir_en) c->morir_en = segundos + 2;
+}
+
+/* Entregar a quien estuviera esperando, si hay algo que entregar. */
+static void tcp_entregar(struct conexion *c)
+{
+    if (!c->lector) return;
+    if (!c->buz_n && !c->fin_recibido && c->estado != T_MUERTA) return;
+
+    int n = c->buz_n < TCP_DATOS_MAX ? c->buz_n : TCP_DATOS_MAX;
+    int antes = tcp_hueco(c);
+
+    tcp_responder(c, UMSG_TCP_DATOS, c->buz, n);       /* n = 0 es "se acabo" */
+    c->lector = 0;
+
+    if (n) {
+        c->buz_n -= n;
+        if (c->buz_n) memmove(c->buz, c->buz + n, (size_t)c->buz_n);
+
+        /* Y AVISAR de que hay sitio. Esto no es un detalle: aqui ponia "solo
+         * si la ventana estaba a cero", y con eso la descarga iba a 1 KB/s.
+         *
+         * El emisor no pregunta. Lo ultimo que sabe de mi ventana es lo que
+         * le dijo mi ultimo ACK, y cuando la llena SE PARA. Si yo vacio el
+         * buzon y no se lo digo, el se queda esperando su "persist timer",
+         * que son CINCO SEGUNDOS. Medido: las seis primeras lecturas tardaban
+         * 0 ms y la septima 4.931 ms, una y otra vez.
+         *
+         * La regla es la del RFC 1122: avisar cuando el hueco ha crecido lo
+         * bastante para que merezca la pena -un segmento entero, o la mitad
+         * del buzon-. Avisar en cada lectura seria un ACK por cada 1400
+         * bytes leidos; no avisar es esto. */
+        int umbral = c->mss < TCP_BUZ / 2 ? c->mss : TCP_BUZ / 2;
+        if (c->estado == T_ABIERTA && tcp_hueco(c) >= c->ventana_dicha + umbral)
+            tcp_ack(c);
+        (void)antes;
+    }
+}
+
+static struct conexion *tcp_buscar(uint32_t src, uint16_t sport, uint16_t dport)
+{
+    for (int i = 0; i < TCP_CONEX; i++) {
+        struct conexion *c = &conex[i];
+        if (c->estado == T_LIBRE) continue;
+        if (c->ip == src && c->remoto == sport && c->local == dport) return c;
+    }
+    return 0;
+}
+
+static void tcp_llego(uint32_t src, const uint8_t *d, int n)
+{
+    if (n < 20) return;
+    uint16_t sport = be16(d), dport = be16(d + 2);
+    uint32_t seq = be32(d + 4), ack = be32(d + 8);
+    int off = (d[12] >> 4) * 4, banderas = d[13];
+    if (off < 20 || off > n) return;
+
+    const uint8_t *datos = d + off;
+    int largo = n - off;
+
+    tcp_seg++;
+    struct conexion *c = tcp_buscar(src, sport, dport);
+    if (!c) {
+        /* De nadie. Un RST no se contesta con otro RST -eso seria un bucle
+         * entre dos maquinas- y lo demas si. */
+        if (!(banderas & TCP_RST)) tcp_rst_suelto(src, sport, dport, seq, ack, banderas, largo);
+        return;
+    }
+
+    if (banderas & TCP_RST) {
+        tcp_terminar(c, c->estado == T_SYN ? "conexion rechazada" : "el otro extremo ha cortado");
+        return;
+    }
+
+    /* El apreton de manos: SYN mio, SYN+ACK suyo, ACK mio. Tres y no dos,
+     * porque los dos extremos tienen que acordar por que numero empieza cada
+     * uno, y cada uno tiene que saber que el otro se ha enterado. */
+    if (c->estado == T_SYN) {
+        if (!(banderas & TCP_SYN) || !(banderas & TCP_ACK)) return;
+        if (ack != c->snd_nxt) return;                  /* no es de este SYN */
+
+        c->snd_una = ack;
+        c->rcv_nxt = seq + 1;
+        c->vuelo_banderas = c->vuelo_n = 0;
+        c->ventana_otro = be16(d + 14);
+
+        /* Su MSS, si lo dice. Las opciones van detras de la cabecera fija y
+         * hay que RECORRERLAS: cada una es tipo, longitud y valor, menos el
+         * 0 y el 1, que miden un byte. */
+        c->mss = 536;                                   /* el minimo de la norma */
+        for (int o = 20; o + 1 < off; ) {
+            int t = d[o];
+            if (t == 0) break;
+            if (t == 1) { o++; continue; }
+            int l = d[o + 1];
+            if (l < 2 || o + l > off) break;
+            if (t == 2 && l == 4) c->mss = be16(d + o + 2);
+            o += l;
+        }
+        if (c->mss > TCP_MSS) c->mss = TCP_MSS;
+        if (c->mss < 64)      c->mss = 536;
+
+        c->estado = T_ABIERTA;
+        tcp_ack(c);
+        tcp_responder(c, UMSG_TCP_ABIERTA, 0, 0);
+        return;
+    }
+
+    /* Lo que el otro reconoce. Con la resta con signo, que es la unica
+     * comparacion valida cuando los numeros dan la vuelta. */
+    if ((banderas & TCP_ACK) && (int32_t)(ack - c->snd_una) > 0 &&
+        (int32_t)(ack - c->snd_nxt) <= 0) {
+        c->snd_una = ack;
+        c->ventana_otro = be16(d + 14);
+
+        if (c->snd_una == c->snd_nxt) {                 /* ya no queda nada en vuelo */
+            int era_fin = (c->vuelo_banderas & TCP_FIN) != 0;
+            int mandados = c->vuelo_n;
+            c->vuelo_banderas = c->vuelo_n = 0;
+
+            if (c->envio) {
+                struct umsg_tcp *t = (struct umsg_tcp *)resp.data;
+                resp.type = UMSG_TCP_HUECO;
+                resp.len  = sizeof(*t) - TCP_DATOS_MAX;
+                t->port = c->envio;
+                t->conexion = (unsigned long)(c - conex) + 1;
+                t->ip = c->ip; t->puerto = c->remoto;
+                t->n = (unsigned long)mandados;         /* cuantos entraron */
+                msg_send(c->envio, &resp);
+                c->envio = 0;
+            }
+            /* Se pidio cerrar mientras habia algo sin reconocer: ahora si. */
+            if (c->cerrar_pedido && c->estado == T_ABIERTA) {
+                c->cerrar_pedido = 0;
+                c->estado = T_CERRANDO;
+                tcp_volar(c, TCP_FIN | TCP_ACK, 0, 0);
+            } else if (era_fin && c->estado == T_CERRANDO && c->fin_recibido) {
+                tcp_terminar(c, 0);
+            }
+        }
+    }
+
+    /* Los datos. Solo EN SECUENCIA: lo que llega adelantado se tira y se
+     * repite el ACK, para que el otro rellene el hueco. Un TCP de verdad lo
+     * guardaria (eso es el reensamblado fuera de orden); aqui una perdida
+     * cuesta un viaje mas y ya. */
+    if (largo > 0) {
+        int32_t adelanto = (int32_t)(c->rcv_nxt - seq);
+        if (adelanto > 0) {                             /* repetido en parte */
+            tcp_repes++;
+            if (adelanto >= largo) { tcp_ack(c); return; }
+            datos += adelanto; largo -= adelanto; seq += (uint32_t)adelanto;
+        }
+        if (seq != c->rcv_nxt) { tcp_fuera++; tcp_ack(c); return; }   /* adelantado: que repita */
+
+        int cabe = tcp_hueco(c);
+        if (cabe > 0) {
+            int cuantos = largo < cabe ? largo : cabe;
+            memcpy(c->buz + c->buz_n, datos, (size_t)cuantos);
+            c->buz_n += cuantos;
+            c->rcv_nxt += (uint32_t)cuantos;
+        }
+        tcp_ack(c);
+    }
+
+    /* Su FIN: "no voy a mandar mas". Tambien consume un numero, y solo
+     * cuenta si llega en su sitio. */
+    if ((banderas & TCP_FIN) && seq + (uint32_t)largo == c->rcv_nxt) {
+        c->fin_recibido = 1;
+        c->rcv_nxt++;
+        tcp_ack(c);
+        if (c->estado == T_CERRANDO && c->snd_una == c->snd_nxt) tcp_terminar(c, 0);
+    }
+
+    tcp_entregar(c);
+}
+
+/* --- Lo que piden los programas ---------------------------------------- */
+static void tcp_abrir(void)
+{
+    const struct umsg_tcp *q = (const struct umsg_tcp *)rx.data;
+
+    if (!ip) { error_a(q->port, "todavia sin direccion IP (DHCP)"); return; }
+
+    struct conexion *c = 0;
+    for (int i = 0; i < TCP_CONEX && !c; i++) if (conex[i].estado == T_LIBRE) c = &conex[i];
+    if (!c) { error_a(q->port, "no quedan conexiones"); return; }
+
+    int idx = (int)(c - conex);
+    memset(c, 0, sizeof(*c));
+    c->pid = rx.from; c->cliente = q->port;
+    c->ip = (uint32_t)q->ip; c->remoto = (uint16_t)q->puerto;
+    if (++tcp_efimero < 40000) tcp_efimero = 40000;
+    c->local = tcp_efimero;
+    c->mss = 536;
+
+    /* El numero por el que empieza cada extremo NO es 0: dos conexiones
+     * seguidas entre las mismas dos maquinas tendrian los mismos numeros y
+     * un paquete viejo del aire podria colarse en la nueva. Aqui sale del
+     * reloj, que es lo que hay a mano. */
+    c->snd_una = (uint32_t)(uptime() * 1000u + (unsigned)idx * 7919u);
+    c->estado = T_SYN;
+    tcp_volar(c, TCP_SYN, 0, 0);
+}
+
+static struct conexion *tcp_mia(const struct umsg_tcp *q)
+{
+    unsigned long i = q->conexion;
+    if (i < 1 || i > TCP_CONEX) return 0;
+    struct conexion *c = &conex[i - 1];
+    if (c->estado == T_LIBRE || c->pid != rx.from) return 0;
+    return c;
+}
+
+static void tcp_enviar_pedido(void)
+{
+    const struct umsg_tcp *q = (const struct umsg_tcp *)rx.data;
+    struct conexion *c = tcp_mia(q);
+    if (!c) return;
+
+    if (c->estado != T_ABIERTA) { error_a(q->port, "la conexion no esta abierta"); return; }
+    if (c->vuelo_banderas)      { error_a(q->port, "lo anterior aun no esta reconocido"); return; }
+
+    int n = (int)q->n;
+    if (n <= 0) return;
+    if (n > c->mss) n = c->mss;                       /* lo que quepa; se dira cuanto */
+    if (c->ventana_otro && n > (int)c->ventana_otro) n = (int)c->ventana_otro;
+    if (n <= 0) { error_a(q->port, "el otro extremo no acepta mas datos"); return; }
+
+    c->envio = q->port;
+    tcp_volar(c, TCP_ACK | TCP_PSH, q->datos, n);
+}
+
+static void tcp_leer_pedido(void)
+{
+    const struct umsg_tcp *q = (const struct umsg_tcp *)rx.data;
+    struct conexion *c = tcp_mia(q);
+    if (!c) return;
+    c->lector = q->port;
+    tcp_entregar(c);                                   /* si hay algo, ya */
+}
+
+static void tcp_cerrar_pedido(void)
+{
+    const struct umsg_tcp *q = (const struct umsg_tcp *)rx.data;
+    struct conexion *c = tcp_mia(q);
+    if (!c) return;
+
+    c->lector = c->envio = 0;
+    if (c->estado == T_ABIERTA) {
+        if (c->vuelo_banderas) c->cerrar_pedido = 1;   /* al reconocerse, el FIN */
+        else { c->estado = T_CERRANDO; tcp_volar(c, TCP_FIN | TCP_ACK, 0, 0); }
+    } else if (c->estado == T_SYN) {
+        tcp_mandar(c, TCP_RST, c->snd_nxt, 0, 0);
+        c->estado = T_MUERTA; c->morir_en = segundos + 1;
+    }
+    if (!c->morir_en) c->morir_en = segundos + 10;      /* tope, pase lo que pase */
+}
+
+/* El reloj de TCP: es lo que convierte "mandar y esperar" en "llega seguro".
+ * Sin esto, un segmento perdido para la conexion para siempre. */
+static void tcp_tick(void)
+{
+    for (int i = 0; i < TCP_CONEX; i++) {
+        struct conexion *c = &conex[i];
+        if (c->estado == T_LIBRE) continue;
+
+        /* El duenyo se ha muerto sin cerrar: se corta y se suelta. */
+        if (c->pid && kill(c->pid, 0) < 0) {
+            if (c->estado == T_ABIERTA || c->estado == T_SYN)
+                tcp_mandar(c, TCP_RST, c->snd_nxt, 0, 0);
+            memset(c, 0, sizeof(*c));
+            continue;
+        }
+
+        if (c->morir_en && segundos >= c->morir_en) { memset(c, 0, sizeof(*c)); continue; }
+
+        if (c->vuelo_banderas && segundos - c->vuelo_t >= 1) {
+            if (++c->reintentos > 5) {
+                tcp_terminar(c, c->estado == T_SYN ? "el otro extremo no contesta"
+                                                   : "se han perdido los datos");
+                continue;
+            }
+            c->vuelo_t = segundos;
+            tcp_retx++;
+            tcp_mandar(c, c->vuelo_banderas, c->vuelo_seq, c->vuelo, c->vuelo_n);
+        }
+    }
 }
 
 /* --- Lo que entra --------------------------------------------------------- */
@@ -972,6 +1460,7 @@ static void ip_llego(const uint8_t *f, int n)
     if (!es_nuestro && !(proto == 17 && dn >= 8 && be16(d + 2) == 68)) return;
 
     if (proto == 1) { icmp_llego(src, h[8], d, dn); return; }
+    if (proto == 6) { tcp_llego(src, d, dn); return; }
     if (proto == 17 && dn >= 8) {
         int ul = be16(d + 4);
         if (ul < 8 || ul > dn) ul = dn;
@@ -979,7 +1468,6 @@ static void ip_llego(const uint8_t *f, int n)
     }
 }
 
-static unsigned tramas;
 
 static void trama_llego(const uint8_t *f, int n)
 {
@@ -1032,6 +1520,10 @@ int main(int argc, char **argv)
         case UMSG_RESOLVER: resolver_pedido(); break;
         case UMSG_INFO:     info_pedida(); break;
         case UMSG_PING:     ping_pedido(); break;
+        case UMSG_TCP_ABRIR:  tcp_abrir(); break;
+        case UMSG_TCP_ENVIAR: tcp_enviar_pedido(); break;
+        case UMSG_TCP_LEER:   tcp_leer_pedido(); break;
+        case UMSG_TCP_CERRAR: tcp_cerrar_pedido(); break;
         default: break;
         }
     }

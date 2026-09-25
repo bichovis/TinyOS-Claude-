@@ -100,6 +100,11 @@ struct umsg_info {
     unsigned long estado;            /* 0 sin tarjeta, 1 buscando, 2 pidiendo, 3 con direccion */
     unsigned char mac[6];
     char          tarjeta[16];
+    /* CAMPOS NUEVOS, AL FINAL, SIEMPRE (la leccion del paso 35). Cuentas de
+     * la pila: sin ellas, "la red va lenta" no se puede convertir en una
+     * causa. */
+    unsigned long tramas_rx, tramas_tx;
+    unsigned long tcp_seg, tcp_fuera, tcp_repes, tcp_retx, tcp_ack;
 };
 
 /* --- Ping: mandar un eco y esperar que vuelva -------------------------------
@@ -121,4 +126,46 @@ struct umsg_ping {
     unsigned long datos;             /* bytes de relleno (0 = 56, los de siempre) */
     unsigned long ms;                /* en la respuesta: el viaje          */
     unsigned long ttl;               /* en la respuesta: el TTL que traia  */
+};
+
+/* --- TCP: una tuberia fiable sobre un cable que no lo es --------------------
+ *
+ * UDP manda un paquete y se olvida: si se pierde, se perdio. TCP promete
+ * cuatro cosas que el cable no da, y las cuatro salen del mismo truco -numerar
+ * los bytes y no dar uno por entregado hasta que el otro lo confirme-:
+ *
+ *   llega todo        lo que no se reconoce, se vuelve a mandar
+ *   llega en orden    cada byte tiene su numero
+ *   llega una vez     un numero repetido se descarta
+ *   sin ahogar        el que recibe dice cuanto le cabe (la "ventana")
+ *
+ * El contrato de aqui es el de siempre en este sistema -pedir por mensaje y
+ * que conteste al puerto que digas- con una diferencia que no es capricho:
+ * los datos que llegan NO se empujan al programa, se quedan en la pila y el
+ * programa los pide. Empujarlos obligaria a la pila a esperar si el programa
+ * no lee, y una pila esperando es la red entera parada. Guardandolos, lo que
+ * se llena es la ventana, el otro extremo se frena solo, y eso es justamente
+ * lo que TCP inventó para esto.
+ *
+ * Una conexion se identifica con un numero pequenyo que devuelve el ABRIR.
+ * Solo el proceso que la abrio puede usarla: la pila comprueba el pid que el
+ * kernel pone en cada mensaje. */
+#define UMSG_TCP_ABRIR    47     /* struct umsg_tcp -> UMSG_TCP_ABIERTA | UMSG_ERROR */
+#define UMSG_TCP_ENVIAR   48     /* struct umsg_tcp con datos -> UMSG_TCP_HUECO      */
+#define UMSG_TCP_LEER     49     /* struct umsg_tcp -> UMSG_TCP_DATOS (n=0: se acabo) */
+#define UMSG_TCP_CERRAR   50     /* struct umsg_tcp -> nada                          */
+
+#define UMSG_TCP_ABIERTA 147     /* struct umsg_tcp con la conexion                  */
+#define UMSG_TCP_DATOS   148     /* struct umsg_tcp con lo leido                     */
+#define UMSG_TCP_HUECO   149     /* lo anterior ya esta reconocido: manda mas        */
+
+#define TCP_DATOS_MAX   1400     /* por mensaje; la pila parte si hace falta         */
+
+struct umsg_tcp {
+    unsigned long port;              /* a donde contestar                  */
+    unsigned long conexion;          /* la que devolvio ABRIR              */
+    unsigned long ip;                /* ABRIR: a quien                     */
+    unsigned long puerto;            /* ABRIR: a que puerto                */
+    unsigned long n;                 /* bytes utiles de datos[]            */
+    unsigned char datos[TCP_DATOS_MAX];
 };

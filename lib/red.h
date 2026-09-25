@@ -24,17 +24,35 @@ void udp_cerrar(int s);
 
 int  resolver(const char *nombre, uint32_t *ip);   /* 0 si va bien; errno dice por que */
 
+/* Lo ultimo que la pila dijo que fue mal, en sus palabras ("conexion
+ * rechazada", "el otro extremo no contesta"). Si no dijo nada, strerror. */
+const char *red_motivo(void);
+
 /* Un ping: manda un eco y espera el suyo. Devuelve 1 si contesto (y rellena
  * el viaje en milisegundos y el TTL), 0 si se agoto la espera -que es lo que
  * significa "paquete perdido"- y -1 si la red dijo que no se puede llegar,
  * con el motivo en errno. 'seq' distingue esta respuesta de la anterior. */
 int  ping(uint32_t ip, int seq, int bytes, int *ms, int *ttl, int decimas);
 
+/* --- TCP -----------------------------------------------------------------
+ *
+ * Una conexion es un numero pequenyo. tcp_enviar puede aceptar MENOS de lo
+ * que se le da -como un write() de Unix- y devuelve cuanto entro; quien
+ * llama repite con el resto. tcp_recibir devuelve 0 cuando el otro extremo
+ * ha cerrado, que es como se sabe que una descarga ha terminado. */
+int  tcp_conectar(uint32_t ip, int puerto, int decimas);
+int  tcp_enviar(int c, const void *datos, int n, int decimas);
+int  tcp_enviar_todo(int c, const void *datos, int n, int decimas);
+int  tcp_recibir(int c, void *datos, int max, int decimas);
+void tcp_cerrar(int c);
+
 struct red_estado {
     uint32_t ip, mascara, router, dns, ntp;
     int      estado;                   /* 0 sin tarjeta, 1 buscando, 2 pidiendo, 3 con ip */
     uint8_t  mac[6];
     char     tarjeta[16];
+    unsigned tramas_rx, tramas_tx;
+    unsigned tcp_seg, tcp_fuera, tcp_repes, tcp_retx, tcp_ack;
 };
 int  red_estado(struct red_estado *e);
 
