@@ -301,11 +301,15 @@ struct message {
  * y 'base' la pone alguien de fuera. Por defecto es la fecha en que se
  * compilo el kernel, que es una mentira util: no es la hora, pero ordena
  * bien los ficheros que escriba este sistema, y eso es lo que necesita
- * make. init puede corregirla con SYS_settime si /etc/fecha dice otra.
+ * make. init puede corregirla con SYS_settime si /etc/fecha dice otra, y la
+ * pila de red (paso 71) la pone bien del todo preguntandole a un servidor
+ * NTP. Cuenta segundos de hora LOCAL, no UTC: es lo que FAT guarda y lo que
+ * `ls` y `fecha` ensenyan, y la conversion la hace quien la pone, con la
+ * variable ZONA de /etc/rc.
  *
- * Un reloj que solo sabe que el tiempo avanza, no que hora es. */
+ * Hasta entonces, un reloj que solo sabe que el tiempo avanza. */
 #define SYS_time         37   /* () -> segundos desde 1970                  */
-#define SYS_settime      38   /* (segundos) -> 0 | -1   (solo init)         */
+#define SYS_settime      38   /* (segundos) -> 0 | -1   (init, o la pila de red) */
 
 /* Memoria nueva, a cero, escribible, y traida segun se toque.
  *

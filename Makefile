@@ -39,7 +39,7 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir lento clave vi usb red
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir lento clave vi usb red hora
 
 # Los que van a /usr/bin de la tarjeta: todos menos los cinco que el kernel
 # lleva dentro (init, sh, fs, conserver, client) y por tanto no necesitan
@@ -213,7 +213,7 @@ sdtest: all | $(BUILD)
 	 printf 'Mi nombre no cabe en 8.3.\n' > "$$D/un nombre bastante largo.txt"; \
 	 printf 'Y el mio tampoco, pero sin espacios.\n' > "$$D/ensamblador-de-prueba.txt"; \
 	 mkdir -p "$$D/ETC"; \
-	 printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > "$$D/ETC/RC"; \
+	 printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\nZONA=CET\n' > "$$D/ETC/RC"; \
 	 mkdir -p "$$D/USR/BIN"; \
 	 for p in $(BINPROGS); do \
 	   cp $(BUILD)/$$p.elf "$$D/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF"; \
@@ -258,7 +258,7 @@ sdcard: all firmware
 	@cp $(BUILD)/kernel8.img $(BUILD)/sdcard/
 	@printf 'Soy el de la particion de arranque, y cuelgo de /boot.\n' > $(BUILD)/sdcard/AVISO.TXT
 	@mkdir -p $(BUILD)/sddata/ETC
-	@printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\n' > $(BUILD)/sddata/ETC/RC
+	@printf '# /etc/rc - lo que lee init al arrancar\n# Cada linea NOMBRE=valor se mete en el entorno, y de ahi se hereda\n# a todo lo que se ejecute. Cambiar el PATH es editar esto, no\n# recompilar el sistema operativo.\nPATH=/usr/bin:.\nHOME=/\nTERM=serie\nSISTEMA=TinyOS\nZONA=CET\n' > $(BUILD)/sddata/ETC/RC
 	@mkdir -p $(BUILD)/sddata/USR/BIN
 	@for p in $(BINPROGS); do \
 	   cp $(BUILD)/$$p.elf $(BUILD)/sddata/USR/BIN/$$(echo $$p | tr a-z A-Z).ELF; \

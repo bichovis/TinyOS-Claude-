@@ -18,6 +18,7 @@
 #include "ipc.h"
 #include "mbox.h"
 #include "irq.h"
+#include "net_abi.h"
 
 /* El trozo que se saca del anillo del kernel de una vez. Va en la pila del
  * kernel, que es UNA pagina, asi que no puede ser grande. */
@@ -567,8 +568,12 @@ void syscall_dispatch(struct trap_frame *f)
     /* Solo init: la hora es de la maquina entera, y dejar que cualquiera
      * la cambie seria dejar que cualquiera mueva las fechas de todos los
      * ficheros. */
+    /* El reloj es de init -que arranca- y de la pila de red, que es por
+     * donde llega la hora de verdad (NTP). Nadie mas: una hora que pudiera
+     * cambiar cualquier programa no ordenaria nada. */
     case SYS_settime:
-        if (!current || current->pid != task_init_pid()) { ret = -1; break; }
+        if (!current || (current->pid != task_init_pid() &&
+                         current->pid != port_owner(PORT_RED))) { ret = -1; break; }
         reloj_poner(f->x[0]);
         ret = 0;
         break;

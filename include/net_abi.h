@@ -29,3 +29,24 @@ struct net_tarjeta {
     unsigned char mac[6];            /* la direccion de la tarjeta         */
     char          nombre[16];        /* "LAN9514", "CDC-ECM"               */
 };
+
+/* --- Clientes de la pila (a PORT_RED; contesta al puerto que digan) ----
+ *
+ * Lo primero que se le puede pedir a la red es la hora: la pila la pide a
+ * un servidor NTP, la pone en el reloj del kernel y la devuelve. La pone
+ * ella y no el cliente porque el reloj del sistema no es de cualquiera
+ * (SYS_settime): es de init, que arranca, y de la pila, que es por donde
+ * llega la hora de verdad. */
+#define UMSG_HORA      40        /* struct umsg_pedir -> UMSG_HORA_OK | UMSG_ERROR */
+#define UMSG_HORA_OK  140        /* struct umsg_hora                           */
+#define UMSG_ERROR    141        /* data = el motivo, en texto                 */
+
+struct umsg_pedir {
+    unsigned long port;              /* a donde contestar                  */
+};
+
+struct umsg_hora {
+    unsigned long segundos;          /* hora LOCAL, segundos desde 1970    */
+    unsigned long desfase;           /* segundos de la zona sobre UTC (+/-) */
+    unsigned long servidor;          /* la IP del servidor NTP que contesto */
+};

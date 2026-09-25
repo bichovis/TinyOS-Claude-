@@ -7002,6 +7002,74 @@ va encima de UDP: DNS para saber donde esta el servidor de hora, y NTP para
 preguntarle. Es el paso siguiente, y con el la hora del kernel y las fechas
 de los ficheros.
 
+## La hora, por fin
+
+En la placa el DHCP cerro a la primera: `192.168.1.11/24`, router y DNS en
+`192.168.1.1`, y sin servidor de hora (el router no da la opcion 42). Asi
+que la hora son dos preguntas mas, las dos por UDP, y las dos en `red.c`.
+
+### DNS: "que direccion tiene pool.ntp.org?"
+
+Al servidor de nombres que dio el DHCP, puerto 53. La pregunta es el nombre
+partido en trozos con su longitud delante -`4pool3ntp3org0`- y "tipo A,
+clase IN". La respuesta repite la pregunta y anyade registros; el que
+interesa es el de tipo A, cuatro bytes. Los nombres de la respuesta pueden
+venir "comprimidos": un byte que empieza por `11` es un puntero a otro sitio
+del mensaje, y hay que saltarlo sin seguirlo, que es lo unico que la
+mayoria de los analizadores de DNS hechos a mano se dejan.
+
+### NTP: "que hora es?"
+
+A esa direccion, puerto 123. 48 bytes casi todos a cero -el primero dice
+"version 4, soy cliente"- y vuelven 48 con cuatro marcas de tiempo. Se usa
+la de transmision: segundos desde 1900 (32 bits, con 32 mas de fraccion que
+aqui se tiran: le sobra precision a un reloj que FAT guarda de dos en dos
+segundos). Restar 2.208.988.800 la pasa a 1970. Un servidor con estrato 0
+es un "vete de aqui" y se trata como fallo.
+
+### Hora local, y quien la pone
+
+El resultado es UTC. El reloj del kernel cuenta hora LOCAL, y es una
+decision, no un descuido: es lo que FAT guarda, lo que `ls` y `fecha`
+ensenyan, y lo que el Makefile siembra al compilar. Cambiarlo a UTC habria
+obligado a tocar `fs`, `ls`, `fecha` y la semilla para que todo siguiera
+cuadrando; sumar la zona al ponerla deja todo lo demas como estaba. La zona
+viene de `/etc/rc`: `ZONA=CET` es Europa central -+1 en invierno y +2 entre
+el ultimo domingo de marzo y el ultimo de octubre, a la 01:00 UTC; el dia de
+la semana sale de contar dias desde el 1 de enero de 1970, que fue jueves-,
+`ZONA=+2` o `ZONA=-5` es fija, y sin `ZONA` es UTC. `NTP=` cambia el
+servidor.
+
+Y la pone la pila, no un programa. `SYS_settime` era solo de init; ahora es
+de init -que arranca- y de quien esta en `PORT_RED`, que es por donde llega
+la hora de verdad. `hora`, el programa, no habla NTP: le pide a la pila
+(`UMSG_HORA`) que sincronice y le devuelva la hora, con un tiempo de espera
+de veinte segundos por si la red no contesta. Mismo reparto que con los
+ficheros: el que sabe del protocolo y tiene el permiso es el servidor.
+
+La pila sincroniza sola nada mas tener direccion, lo repite cada hora, y si
+algo falla -DNS mudo, NTP mudo- lo dice una vez y lo reintenta al minuto.
+
+### La prueba
+
+En QEMU, con la red de usuario, que sale a Internet de verdad:
+
+    [red] DHCP: tengo la 10.0.2.15/24, router 10.0.2.2, DNS 10.0.2.3, NTP 0.0.0.0, alquiler 86400 s
+    [red] DNS: pool.ntp.org es 212.227.145.233
+    [red] hora: 2026-09-25 08:10:50 (NTP de 212.227.145.233, zona +2)
+    / $ hora
+      2026-09-25 08:11:23   (zona +2, NTP de 178.215.228.24)
+    / $ fecha
+      2026-09-25 08:11:27   (1790323887 segundos desde 1970)
+    / $ write /mnt/CONHORA.TXT esto tiene fecha de verdad
+    / $ ls /mnt
+        2026-09-25 08:11        27  CONHORA.TXT
+        2026-09-24 23:36        88  PEN.TXT
+
+El reloj del Mac decia 08:11:35 CEST al terminar. Un fichero escrito en el
+pendrive lleva la hora de verdad, que era el objetivo: la Pi tiene la hora
+exacta y la usa al crear o modificar ficheros.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -7194,6 +7262,12 @@ de los ficheros.
   servirle al `fs` los sectores que quiera: el `fs` no tiene forma de saber
   si quien le habla es un driver. Un proceso podria "montar" lo que
   quisiera en /mnt.
+- La hora se toma de la marca de transmision del servidor NTP, sin
+  compensar el viaje de ida y vuelta: el error es de milisegundos, y el
+  reloj del kernel avanza a segundos enteros con el contador del sistema,
+  asi que a la larga se ira; lo corrige la sincronizacion de cada hora. El
+  cambio de hora solo sabe la regla europea (`ZONA=CET`); otra zona con
+  horario de verano necesita su regla.
 - La pila de red guarda UNA trama esperando a ARP; si llegan dos seguidas a
   destinos desconocidos, la primera se pierde y el protocolo de arriba tiene
   que reintentar. La tabla ARP no caduca. No hay fragmentacion IP: un

@@ -231,6 +231,9 @@ static void icmp_llego(uint32_t src, const uint8_t *d, int n)
     ip_enviar(src, 1, r, n);
 }
 
+static void hora_iniciar(void);
+static void hora_tick(void);
+
 /* --- DHCP: pedir una direccion --------------------------------------------
  *
  * Cuatro mensajes, todos a 255.255.255.255 porque al principio no se sabe
@@ -329,10 +332,12 @@ static void dhcp_llego(const uint8_t *d, int n)
         ip = yi; mascara = msk ? msk : 0xFFFFFF00; router = rtr; dns = dn; ntp = nt;
         alquiler = lease ? lease : 3600; quedan = alquiler;
         estado = 3;
-        if (!renovaba)
+        if (!renovaba) {
             printf("  [red] DHCP: tengo la %d.%d.%d.%d/%d, router %d.%d.%d.%d, DNS %d.%d.%d.%d, "
                    "NTP %d.%d.%d.%d, alquiler %u s\n",
                    IP4(ip), bits(mascara), IP4(router), IP4(dns), IP4(ntp), (unsigned)alquiler);
+            hora_iniciar();                           /* ya se puede preguntar la hora */
+        }
         return;
     }
     if (tipo == 6) {                                  /* NAK: desde el principio */
@@ -364,15 +369,281 @@ static void cada_segundo(void)
             dhcp_mandar(3);                           /* renovar */
         if (!quedan) { printf("  [red] DHCP: se acabo el alquiler\n"); dhcp_buscar(); }
     }
+    hora_tick();
+}
+
+/* --- La hora: dos programas encima de UDP ----------------------------------
+ *
+ * Ya somos una maquina de la red. Lo que David queria era la hora, y la hora
+ * son dos preguntas, las dos por UDP:
+ *
+ *   DNS  "que direccion tiene pool.ntp.org?"  al servidor de nombres que
+ *        dio el DHCP, puerto 53. La pregunta es el nombre partido en trozos
+ *        con su longitud delante ("4pool3ntp3org0"), y la respuesta repite
+ *        la pregunta y anyade registros; el que interesa es el de tipo A,
+ *        cuatro bytes. Los nombres pueden venir "comprimidos": un byte que
+ *        empieza por 11 es un puntero a otro sitio del mensaje, y hay que
+ *        saltarlo sin seguirlo.
+ *
+ *   NTP  "que hora es?" a esa direccion, puerto 123. 48 bytes casi todos a
+ *        cero -el primero dice "version 4, soy cliente"- y vuelven 48 con
+ *        cuatro marcas de tiempo. Se usa la de transmision: segundos desde
+ *        1900, con 32 bits de fraccion que aqui se tiran. Le sobra precision
+ *        a un reloj que FAT guarda de dos en dos segundos.
+ *
+ * El resultado es UTC. El reloj del kernel cuenta hora LOCAL -es lo que FAT
+ * guarda y lo que `ls` ensenya- asi que aqui se suma la zona: ZONA=CET en
+ * /etc/rc es Europa central, +1 en invierno y +2 entre el ultimo domingo de
+ * marzo y el ultimo domingo de octubre, a la una de la madrugada UTC. Y la
+ * pone la pila, no un programa: SYS_settime es de init y de quien esta en
+ * PORT_RED, que es por donde llega la hora de verdad. */
+#define PUERTO_DNS_LOCAL 5353
+#define PUERTO_NTP        123
+#define NTP_1970   2208988800UL          /* segundos entre 1900 y 1970 */
+
+static const char *ntp_nombre = "pool.ntp.org";
+static long zona_base;                   /* segundos sobre UTC, en invierno */
+static int  zona_eu;                     /* con cambio de hora europeo */
+
+static int      hora_estado;             /* 0 nada, 1 resolviendo, 2 preguntando */
+static unsigned hora_siguiente, hora_intentos;
+static int      hora_auto;               /* volver a intentarlo cuando toque */
+static uint32_t ntp_ip, hora_servidor;
+static uint16_t dns_id;
+static uint64_t hora_puesta;             /* la ultima que se puso; 0 = nunca */
+static uint64_t clientes[4];             /* puertos esperando un UMSG_HORA */
+static int      n_clientes;
+static struct message resp;
+
+static uint64_t a_unix(uint64_t anyo, uint64_t mes, uint64_t dia)
+{
+    static const uint64_t meses[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    uint64_t dias = 0;
+    for (uint64_t a = 1970; a < anyo; a++)
+        dias += ((a % 4 == 0 && a % 100 != 0) || a % 400 == 0) ? 366 : 365;
+    int bis = (anyo % 4 == 0 && anyo % 100 != 0) || anyo % 400 == 0;
+    for (uint64_t k = 1; k < mes; k++) dias += meses[k - 1] + ((k == 2 && bis) ? 1u : 0u);
+    return (dias + dia - 1) * 86400;
+}
+
+static void formatear(uint64_t t, char *dst)
+{
+    uint64_t dias = t / 86400, resto = t % 86400, anyo = 1970;
+    for (;;) {
+        int bis = (anyo % 4 == 0 && anyo % 100 != 0) || anyo % 400 == 0;
+        uint64_t largo = bis ? 366 : 365;
+        if (dias < largo) break;
+        dias -= largo; anyo++;
+    }
+    static const uint64_t meses[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    int bis = (anyo % 4 == 0 && anyo % 100 != 0) || anyo % 400 == 0;
+    uint64_t mes = 0;
+    for (; mes < 12; mes++) {
+        uint64_t largo = meses[mes] + ((mes == 1 && bis) ? 1u : 0u);
+        if (dias < largo) break;
+        dias -= largo;
+    }
+    snprintf(dst, 32, "%04lu-%02lu-%02lu %02lu:%02lu:%02lu",
+             anyo, mes + 1, dias + 1, resto / 3600, (resto % 3600) / 60, resto % 60);
+}
+
+/* Cuanto sumar a UTC para esa fecha. Con ZONA=CET, el cambio de hora: el
+ * ultimo domingo de marzo y el de octubre, a la 01:00 UTC. El dia de la
+ * semana sale de contar dias desde el 1 de enero de 1970, que fue jueves. */
+static long desfase_de(uint64_t utc)
+{
+    if (!zona_eu) return zona_base;
+
+    uint64_t anyo = 1970, dias = utc / 86400;
+    for (;;) {
+        uint64_t largo = ((anyo % 4 == 0 && anyo % 100 != 0) || anyo % 400 == 0) ? 366 : 365;
+        if (dias < largo) break;
+        dias -= largo; anyo++;
+    }
+    uint64_t m31 = a_unix(anyo, 3, 31), o31 = a_unix(anyo, 10, 31);
+    uint64_t inicio = m31 - ((m31 / 86400 + 4) % 7) * 86400 + 3600;
+    uint64_t fin    = o31 - ((o31 / 86400 + 4) % 7) * 86400 + 3600;
+    return zona_base + ((utc >= inicio && utc < fin) ? 3600 : 0);
+}
+
+static void zona_leer(void)
+{
+    const char *n = getenv("NTP");
+    const char *z = getenv("ZONA");
+    if (n && *n) ntp_nombre = n;
+
+    if (!z || !*z || (z[0] == 'U' && z[1] == 'T' && z[2] == 'C')) { zona_base = 0; return; }
+    if (z[0] == 'C' && z[1] == 'E' && z[2] == 'T') { zona_base = 3600; zona_eu = 1; return; }
+    if (z[0] == '+' || z[0] == '-') {
+        long h = 0, m = 0; int i = 1;
+        while (z[i] >= '0' && z[i] <= '9') h = h * 10 + (z[i++] - '0');
+        if (z[i] == ':') { i++; while (z[i] >= '0' && z[i] <= '9') m = m * 10 + (z[i++] - '0'); }
+        zona_base = (z[0] == '-' ? -1 : 1) * (h * 3600 + m * 60);
+        return;
+    }
+    printf("  [red] ZONA=%s: no la entiendo, uso UTC\n", z);
+}
+
+static void contestar_clientes(int ok, const char *motivo)
+{
+    for (int i = 0; i < n_clientes; i++) {
+        if (ok) {
+            struct umsg_hora *h = (struct umsg_hora *)resp.data;
+            resp.type = UMSG_HORA_OK; resp.len = sizeof(*h);
+            h->segundos = hora_puesta;
+            h->desfase  = (unsigned long)desfase_de(hora_puesta - desfase_de(hora_puesta));
+            h->servidor = hora_servidor;
+        } else {
+            resp.type = UMSG_ERROR;
+            int k = 0; for (; motivo[k] && k < 200; k++) resp.data[k] = motivo[k];
+            resp.data[k] = 0; resp.len = (uint64_t)k + 1;
+        }
+        msg_send(clientes[i], &resp);
+    }
+    n_clientes = 0;
+}
+
+static void hora_fallo(const char *motivo)
+{
+    printf("  [red] sin hora: %s; lo intento en un minuto\n", motivo);
+    contestar_clientes(0, motivo);
+    hora_estado = 0; hora_auto = 1; hora_siguiente = segundos + 60;
+}
+
+/* --- DNS --- */
+static void dns_pedir(void)
+{
+    static uint8_t q[300];
+    if (!dns) { hora_fallo("el DHCP no me dio servidor de nombres"); return; }
+
+    dns_id++;
+    pon16(q, dns_id); pon16(q + 2, 0x0100);           /* quiero recursion */
+    pon16(q + 4, 1); pon16(q + 6, 0); pon16(q + 8, 0); pon16(q + 10, 0);
+    int n = 12;
+    const char *t = ntp_nombre;
+    while (*t) {
+        int l = 0;
+        while (t[l] && t[l] != '.') l++;
+        if (l > 63 || n + l + 6 > (int)sizeof(q)) break;
+        q[n++] = (uint8_t)l;
+        memcpy(q + n, t, (size_t)l); n += l; t += l;
+        if (*t == '.') t++;
+    }
+    q[n++] = 0;
+    pon16(q + n, 1); pon16(q + n + 2, 1); n += 4;     /* tipo A, clase IN */
+    udp_enviar(dns, PUERTO_DNS_LOCAL, 53, q, n);
+}
+
+static int nombre_saltar(const uint8_t *d, int n, int o)
+{
+    while (o < n) {
+        int l = d[o];
+        if (!l) return o + 1;
+        if (l & 0xC0) return o + 2;                   /* puntero: dos bytes y fuera */
+        o += l + 1;
+    }
+    return -1;
+}
+
+static void ntp_pedir(void);
+
+static void dns_llego(const uint8_t *d, int n)
+{
+    if (hora_estado != 1 || n < 12 || be16(d) != dns_id || !(d[2] & 0x80)) return;
+    if (d[3] & 0xF) { hora_fallo("el DNS dice que ese nombre no existe"); return; }
+
+    int preguntas = be16(d + 4), respuestas = be16(d + 6), o = 12;
+    for (int i = 0; i < preguntas && o > 0; i++) { o = nombre_saltar(d, n, o); if (o > 0) o += 4; }
+    for (int i = 0; i < respuestas && o > 0 && o + 10 <= n; i++) {
+        o = nombre_saltar(d, n, o);
+        if (o < 0 || o + 10 > n) break;
+        int tipo = be16(d + o), largo = be16(d + o + 8);
+        if (tipo == 1 && largo == 4 && o + 14 <= n) {
+            ntp_ip = be32(d + o + 10);
+            printf("  [red] DNS: %s es %d.%d.%d.%d\n", ntp_nombre, IP4(ntp_ip));
+            hora_estado = 2; hora_intentos = 0; hora_siguiente = segundos + 2;
+            ntp_pedir();
+            return;
+        }
+        o += 10 + largo;
+    }
+    hora_fallo("el DNS no trae ninguna direccion");
+}
+
+/* --- NTP --- */
+static void ntp_pedir(void)
+{
+    static uint8_t b[48];
+    memset(b, 0, 48);
+    b[0] = 0x23;                                      /* LI 0, version 4, modo 3: cliente */
+    udp_enviar(ntp_ip, PUERTO_NTP, 123, b, 48);
+}
+
+static void ntp_llego(uint32_t src, const uint8_t *d, int n)
+{
+    if (hora_estado != 2 || n < 48 || (d[0] & 7) != 4) return;
+    if (d[1] == 0) { hora_fallo("el servidor NTP no esta sincronizado"); return; }
+    uint32_t seg = be32(d + 40);
+    if (seg < NTP_1970) return;
+
+    uint64_t utc = seg - NTP_1970;
+    long desf = desfase_de(utc);
+    uint64_t local = utc + (uint64_t)desf;
+
+    if (poner_hora(local) < 0) printf("  [red] el kernel no me deja poner la hora\n");
+    hora_puesta = local; hora_servidor = src; hora_estado = 0;
+    hora_auto = 1; hora_siguiente = segundos + 3600;   /* y dentro de una hora, otra vez */
+
+    char txt[32];
+    formatear(local, txt);
+    printf("  [red] hora: %s (NTP de %d.%d.%d.%d, zona %c%ld)\n", txt, IP4(src),
+           desf < 0 ? '-' : '+', (desf < 0 ? -desf : desf) / 3600);
+    contestar_clientes(1, 0);
+}
+
+static void hora_iniciar(void)
+{
+    if (!ip) return;
+    hora_intentos = 0; hora_auto = 0;
+    hora_siguiente = segundos + 2;
+    if (ntp) { ntp_ip = ntp; hora_estado = 2; ntp_pedir(); }
+    else     { hora_estado = 1; dns_pedir(); }
+}
+
+static void hora_tick(void)
+{
+    if (hora_estado && segundos >= hora_siguiente) {
+        if (++hora_intentos >= 4) {
+            hora_fallo(hora_estado == 1 ? "el DNS no contesta" : "el servidor NTP no contesta");
+            return;
+        }
+        hora_siguiente = segundos + 2;
+        if (hora_estado == 1) dns_pedir(); else ntp_pedir();
+    } else if (!hora_estado && hora_auto && ip && segundos >= hora_siguiente) {
+        hora_iniciar();
+    }
+}
+
+/* Un programa pide la hora: se apunta su puerto y se pregunta, si no se
+ * estaba preguntando ya. */
+static void hora_pedida(void)
+{
+    const struct umsg_pedir *p = (const struct umsg_pedir *)rx.data;
+    if (n_clientes < 4) clientes[n_clientes++] = p->port;
+
+    if (!driver)      { contestar_clientes(0, "no hay tarjeta de red"); return; }
+    if (!ip)          { contestar_clientes(0, "todavia sin direccion IP (DHCP)"); return; }
+    if (!hora_estado) hora_iniciar();
 }
 
 /* --- Lo que entra --------------------------------------------------------- */
 static void udp_llego(uint32_t src, uint16_t sport, uint16_t dport, const uint8_t *d, int n)
 {
-    (void)src; (void)sport;
-    if (dport == 68) dhcp_llego(d, n);
-    /* Los demas puertos: nadie los escucha todavia. El paso siguiente pone
-     * aqui a los clientes -DNS, NTP- por mensaje, como los del fs. */
+    if (dport == 68)                                    dhcp_llego(d, n);
+    else if (dport == PUERTO_DNS_LOCAL && sport == 53)  dns_llego(d, n);
+    else if (dport == PUERTO_NTP && sport == 123)       ntp_llego(src, d, n);
+    /* Los demas puertos: nadie los escucha. Un dia habra clientes UDP por
+     * mensaje, como los del fs; hoy la unica que hace falta es la hora. */
 }
 
 static void ip_llego(const uint8_t *f, int n)
@@ -443,6 +714,9 @@ int main(int argc, char **argv)
     if (alarma(PORT_RED, 100) < 0)
         printf("  [red] sin reloj: si nadie contesta al DHCP no podre insistir\n");
 
+    /* La zona horaria y el servidor de hora, de /etc/rc via el entorno. */
+    zona_leer();
+
     for (;;) {
         if (msg_recv(PORT_RED, &rx) < 0) break;
 
@@ -450,6 +724,7 @@ int main(int argc, char **argv)
         case NMSG_TARJETA: tarjeta_llego(); break;
         case NMSG_TRAMA:   trama_llego((const uint8_t *)rx.data, (int)rx.len); break;
         case CMSG_ALARMA:  cada_segundo(); break;
+        case UMSG_HORA:    hora_pedida(); break;
         default: break;
         }
     }
