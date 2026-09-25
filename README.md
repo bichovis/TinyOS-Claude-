@@ -7207,6 +7207,82 @@ lineas. El dia que el driver atienda la IRQ 9 en vez de preguntar, este
 numero bajara a lo que de verdad tarda el cable, y se vera aqui sin tocar
 nada.
 
+## La IRQ 9 de verdad
+
+El ping del paso anterior dejo un numero incomodo: 11 ms hasta el router de
+al lado, cuando el viaje real es de medio milisegundo. No era la red, era
+TinyOS mirandola una vez cada 10 ms. Esta es la ultima deuda del diseno del
+USB, y la parte del kernel llevaba hecha desde el paso 58: `irq_register`
+abre la fuente, el despachador la cierra y manda `CMSG_IRQ`, `irq_ack` la
+reabre. Lo que faltaba era del otro lado: el DWC2 tenia `GINTMSK` a cero y
+no levantaba la linea.
+
+### Habilitar solo lo que se sabe apagar
+
+El nucleo tiene mas de treinta causas de interrupcion. Este driver enmascara
+UNA: `GINT_HCHINT`, "un canal ha terminado". No es pereza, es la regla que
+gobierna todo esto: **una causa enmascarada que no se sepa limpiar es una
+tormenta**. La linea se queda alta, el manejador reabre la fuente y vuelve a
+entrar inmediatamente, y la maquina se queda dando vueltas en el manejador
+sin llegar a ejecutar al driver que iba a arreglarlo. Es el mismo peligro que
+el paso 58 ya nombraba al explicar por que el kernel enmascara antes de
+avisar.
+
+Debajo de `GINT_HCHINT` hay otro filtro, y ahi estaba el trabajo de verdad:
+`HAINTMSK` dice que canales propagan. El canal 0 -control y bulk, todo lo
+que hace el driver mirando- NO puede estar ahi. `canal_hacer` ponia su bit,
+copiando a la referencia, y la referencia atiende interrupciones: al volver
+de una transferencia por espera activa, `HCINT` se queda con lo que paso, y
+con ese bit en `HAINTMSK` eso mantendria la linea alta hasta la siguiente
+transferencia. O para siempre, si no hay siguiente. Quitar esa linea es el
+cambio mas pequeno del paso y el que decide si funciona.
+
+Asi que en `HAINTMSK` entra solo el canal de la red, y por asignacion y no
+por OR, para no heredar nada. Y `GINTMSK` se enciende al FINAL de arrancar
+la tarjeta: cuando el canal ya esta armado, su `HCINTMSK` lleva solo "me he
+detenido", y el driver esta a punto de entrar en su bucle de mensajes. Una
+interrupcion antes de eso no tendria a quien avisar.
+
+### Apagar la causa, y luego reconocer
+
+En el bucle, el aviso se atiende en ese orden y no en otro:
+
+    if (m.type == CMSG_IRQ) {
+        red_sondear(1);        /* mirar el canal limpia su HCINT: baja la linea */
+        irq_ack(IRQ_USB);      /* y AHORA se reabre la fuente */
+    }
+
+Al reves seria reabrir con la causa todavia puesta, o sea volver a entrar
+por lo mismo. Es la version con interrupciones del mismo cuidado que el
+conserver tiene con la FIFO de la UART desde el paso 8: reconocer y vaciar
+tienen un orden, y el equivocado no falla a veces, falla siempre.
+
+### El sondeo se queda
+
+La alarma sigue mirando la red cada 10 ms, y ahora casi nunca encuentra
+nada. Ese *casi* es su razon de ser: si un aviso se perdiera -la cola del
+puerto llena, el driver ocupado en un sondeo largo del teclado- la trama se
+recoge 10 ms mas tarde en vez de quedarse el canal parado para siempre
+esperando un aviso que ya paso. Cuesta una lectura de registro por tick y
+compra que un fallo raro sea un retraso en vez de una avería. Los contadores
+`tramas_por_irq` / `tramas_por_sondeo` (con `detallado`) dicen cual de los
+dos caminos esta trabajando.
+
+### La prueba es un numero que baja
+
+    Antes:  64 bytes de 10.0.2.2: seq=1 ttl=255 tiempo=11 ms
+    Ahora:  64 bytes de 10.0.2.2: seq=1 ttl=255 tiempo=0 ms
+            4 mandados, 4 recibidos, 0% perdidos; viaje min/medio/max = 0/0/1 ms
+
+Y a Google, 38-49 ms: ahi el sondeo nunca fue el problema y el numero no
+cambia, que es exactamente lo que tenia que pasar.
+
+Lo demas sigue: teclado, `/mnt`, la hora por NTP, el DNS. Sin tarjeta de red
+`GINTMSK` no se enciende nunca y el driver se comporta como antes. Y la
+prueba de que no hay tormenta ni se pierde nada: 2.388 datagramas de 200
+bytes en seis segundos desde el Mac contra `udp escucha 7`, **2.388
+recibidos y devueltos**, y el shell contestando al acabar.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -7423,11 +7499,11 @@ nada.
 - Cualquier proceso podria ponerse en `PORT_RED` antes que `red` y quedarse
   con las tramas; y cualquier proceso puede mandar `NMSG_ENVIAR` al driver.
   Misma falta de identidad que con `FS_DISCO`.
-- La red se sondea a cada alarma, 10 ms: una trama tarda hasta eso en verse.
-  El driver sigue sin usar la IRQ 9; el canal 1 que se queda esperando es el
-  sustituto barato de una interrupcion de canal, y el dia que haga falta
-  menos latencia, `GINTMSK` y `HAINTMSK` estan a un bit de dar el aviso por
-  mensaje como la UART.
+- La recepcion de red va por la IRQ 9 (paso 74), pero el TECLADO sigue
+  sondeado cada 10 ms, y el canal 0 -control y bulk- sigue con espera activa
+  dentro de `canal_hacer`: un sondeo partido del teclado ocupa el driver
+  hasta un milisegundo, y una trama que llegue en medio espera a que
+  termine. Las interrupciones estan solo donde se midio que hacian falta.
 - El LAN9514 va sin modo turbo: una trama por transferencia. Y el driver no
   mira el endpoint de interrupcion de la tarjeta, asi que un cable que se
   desenchufa no se nota hasta que algo falla.
@@ -7435,8 +7511,10 @@ nada.
   `fs` se queda esperando para siempre, y con el todo el que use ficheros.
   Si muere en cualquier otro momento, el siguiente `msg_send` falla y /mnt
   se desmonta limpiamente.
-- El driver de USB no pide ninguna interrupcion todavia: `GINTMSK` esta a cero
-  y se pregunta mirando los registros. La IRQ 9 esta reclamada y sin usar.
+- `irq_avisos_perdidos` -los CMSG_IRQ que no cupieron en la cola del driver-
+  se cuenta en el kernel desde el paso 58 y no lo ensenya nadie. Con la red
+  por interrupciones importa mas que antes, aunque el sondeo de red de
+  seguridad recoge lo que se pierda 10 ms mas tarde.
 - La direccion que se le da al DWC2 lleva el alias `0xC0000000` y ese alias
   es de este SoC: en otra placa con el mismo controlador seria otro, o ninguno.
   Deberia salir del arbol de dispositivos (`dma-ranges`), igual que la lista de

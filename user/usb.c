@@ -58,6 +58,15 @@
 
 /* GAHBCFG */
 #define AHB_GLBLINTR    (1u << 0)     /* deja salir interrupciones           */
+
+/* GINTSTS / GINTMSK. De las treinta y tantas causas que tiene el nucleo,
+ * este driver solo quiere UNA: "un canal ha terminado". Las demas -SOF cada
+ * micro-trama, la FIFO de recepcion, el puerto- no se enmascaran, y eso no
+ * es pereza: una causa enmascarada que no se sepa limpiar es una tormenta de
+ * interrupciones, porque la linea se queda alta y el manejador vuelve a
+ * entrar en cuanto se reabre. Se habilita lo que se sabe apagar. */
+#define GINT_PRTINT     (1u << 24)    /* algo le pasa al puerto raiz         */
+#define GINT_HCHINT     (1u << 25)    /* un canal de host ha avisado         */
 #define AHB_HBSTLEN(n)  ((uint32_t)(n) << 1)
 #define AHB_DMAEN       (1u << 5)
 
@@ -444,7 +453,14 @@ static uint32_t canal_hacer(int canal, int entrada, int tipo, int mps,
      * termino. */
     escribir(HCINTMSK(canal), 0);
     escribir(HCINT(canal), 0xFFFFFFFF);
-    escribir(HAINTMSK, leer(HAINTMSK) | (1u << canal));
+
+    /* Y NO se toca HAINTMSK. Aqui ponia el bit de este canal, que es lo que
+     * dice la referencia... y la referencia atiende interrupciones. Este
+     * camino espera mirando: al volver deja HCINT con lo que paso, y si el
+     * canal estuviera en HAINTMSK eso mantendria la linea alta hasta la
+     * siguiente transferencia -o para siempre, si no hay siguiente-. En
+     * HAINTMSK solo entra el canal que de verdad avisa, que es el de la red
+     * (ver rx_armar). */
 
     /* Partida o no, y si lo es, en que mitad. Lo decide el contexto del
      * dispositivo, no quien llama: quien llama solo sabe que quiere leer un
@@ -1459,8 +1475,17 @@ static int ecm_arrancar(void)
  * nucleo repite el IN por su cuenta y el canal sigue "activo"; cuando llega
  * una, el canal se detiene con XFERCOMPL y ahi esta. Mirar si se ha detenido
  * es leer un registro, y se hace a cada alarma. Es lo que en Linux hace la
- * URB de recepcion siempre pendiente, y aqui sale sin interrupciones. */
+ * URB de recepcion siempre pendiente.
+ *
+ * Desde el paso 74 ese canal AVISA: cuando se detiene, el nucleo levanta la
+ * IRQ 9, el kernel la enmascara y manda un CMSG_IRQ, y el driver mira la red
+ * en el acto en vez de esperar a la alarma. Preguntar cada 10 ms seguia
+ * funcionando -y sigue ahi, de red de seguridad- pero ponia hasta 10 ms de
+ * retraso en cada trama, que es lo que el ping del paso 73 ensenyaba midiendo
+ * 11 ms hasta el router de al lado. */
 static int rx_armado, rx_tog;
+static int irq_de_verdad;                 /* 1 = la recepcion ya va por la IRQ */
+static unsigned tramas_por_irq, tramas_por_sondeo, irq_en_balde;
 
 static void rx_armar(void)
 {
@@ -1468,7 +1493,7 @@ static void rx_armar(void)
 
     escribir(HCINTMSK(CANAL_RX), 0);
     escribir(HCINT(CANAL_RX), 0xFFFFFFFF);
-    escribir(HAINTMSK, leer(HAINTMSK) | (1u << CANAL_RX));
+    escribir(HAINTMSK, 1u << CANAL_RX);        /* SOLO este: asignar, no anyadir */
     escribir(HCSPLT(CANAL_RX), 0);                    /* de alta, o raiz completa */
     escribir(HCCHAR(CANAL_RX), HCC_MC(1) | HCC_ADDR(nic.addr) | HCC_TIPO(EP_BULK) |
                                HCC_IN | HCC_EP(nic.ep_in) | HCC_MPS(nic.mps_in));
@@ -1588,12 +1613,16 @@ static void trama_llego(const uint8_t *f, int n)
     if (msg_send(PORT_RED, &m) < 0) { pila_avisada = 0; tramas_perdidas++; }
 }
 
-/* A cada alarma: si el canal de recepcion se ha detenido, hay trama; se
- * saca de su envoltorio y se vuelve a armar. */
-static void red_sondear(void)
+/* Mirar si el canal de recepcion se ha detenido: si lo ha hecho, hay trama,
+ * se saca de su envoltorio y se vuelve a armar. Lo llaman los dos caminos
+ * -la interrupcion y la alarma- y el argumento es solo para contar por cual
+ * llegan las cosas, que es como se ve si la IRQ esta haciendo su trabajo. */
+static void red_sondear(int por_irq)
 {
     if (!nic.hay) return;
     int n = rx_mirar();
+    if (n > 0)                  { if (por_irq) tramas_por_irq++; else tramas_por_sondeo++; }
+    else if (por_irq && n == 0) irq_en_balde++;
     if (n > 0) {
         const uint8_t *rx = (const uint8_t *)(dma_va + OFF_RX);
         if (nic.tipo == NIC_LAN9514) {
@@ -1623,6 +1652,15 @@ static int nic_arrancar(void)
 
     rx_tog = 0; nic.tog_out = 0;
     rx_armar();
+
+    /* Y ahora si: el canal esta armado, HAINTMSK lleva solo ese canal, su
+     * HCINTMSK lleva solo "me he detenido", y el driver esta a punto de
+     * entrar en su bucle de mensajes. Es el momento en que una interrupcion
+     * tiene a quien avisar y una causa que se sabe apagar. */
+    escribir(GINTSTS, 0xFFFFFFFF);
+    escribir(GINTMSK, GINT_HCHINT);
+    irq_de_verdad = 1;
+    printf("  [usb] la recepcion va por la IRQ %d; el sondeo queda de red de seguridad\n", IRQ_USB);
     return 0;
 }
 
@@ -1967,11 +2005,11 @@ static void modo_anfitrion(void)
     ahb |=  0x10 | AHB_DMAEN;
     escribir(GAHBCFG, ahb);
 
-    /* Y los avisos viejos borrados. Sin pedir interrupciones: se pregunta
-     * mirando, y con GINTMSK a cero el chip no levanta la linea. Es la unica
-     * desviacion deliberada de la referencia -ella si las pide- y el motivo es
-     * que este driver todavia no atiende su puerto de mensajes: una
-     * interrupcion que nadie recoge acabaria en una tormenta. */
+    /* Y los avisos viejos borrados, con la linea todavia callada: durante la
+     * enumeracion todo se hace mirando, y una interrupcion en medio no
+     * tendria a nadie escuchando -el driver aun no ha llegado a su bucle de
+     * mensajes-. Se encienden al final, cuando hay un canal que avisa y
+     * alguien que lo atiende (ver nic_arrancar). */
     escribir(GINTMSK, 0);
     escribir(GINTSTS, 0xFFFFFFFF);
 }
@@ -2530,7 +2568,15 @@ int main(int argc, char **argv)
         static struct message m;
         if (msg_recv((uint64_t)puerto, &m) < 0) break;
 
-        if (m.type == CMSG_IRQ) { irq_ack(IRQ_USB); continue; }
+        /* El aviso del nucleo. Primero se APAGA LA CAUSA -mirar el canal
+         * limpia su HCINT, que es lo que baja HAINT y con el la linea- y
+         * solo despues se reabre la IRQ. Al reves seria volver a entrar
+         * inmediatamente por lo mismo, que es la definicion de tormenta. */
+        if (m.type == CMSG_IRQ) {
+            red_sondear(1);
+            irq_ack(IRQ_USB);
+            continue;
+        }
 
         if (m.type == FS_OK)    { printf("  [usb] el disco esta montado en /mnt\n"); continue; }
         if (m.type == FS_ERROR) { printf("  [usb] el servidor de ficheros no ha podido montar el disco\n"); continue; }
@@ -2548,9 +2594,13 @@ int main(int argc, char **argv)
 
         if (m.type != CMSG_ALARMA) continue;
 
-        /* La red primero: mirar si el canal 1 ha recibido, y volver a armarlo.
+        /* La red, por si acaso. Con la IRQ encendida esto casi nunca encuentra
+         * nada, y ese casi es su razon de ser: si un aviso se perdiera -la
+         * cola del puerto llena, el driver ocupado en un sondeo largo- la
+         * trama se recogeria aqui 10 ms mas tarde, en vez de quedarse el
+         * canal parado para siempre esperando un aviso que ya paso.
          * Y si la pila aun no sabe que hay tarjeta, decirselo cada segundo. */
-        red_sondear();
+        red_sondear(0);
         if (nic.hay && !pila_avisada && (++sin_pila % 100) == 0) nic_anunciar((uint64_t)puerto);
         if (!teclado.hay) continue;
 
@@ -2558,9 +2608,13 @@ int main(int argc, char **argv)
          * el anfitrion le manda un IN a su endpoint de interrupcion, y el
          * teclado contesta NAK -"nada"- o un informe de 8 bytes. Aqui se
          * pregunta a cada alarma, que es un tick, y se traduce lo que llega. */
-        if (detallado && ++vueltas % 200 == 0)
+        if (detallado && ++vueltas % 200 == 0) {
             printf("  [usb] sondeos: %u con datos, %u NAK, %u NYET, %u sin respuesta, %u error; %u teclas entregadas\n",
                    sondeo_datos, sondeo_nak, sondeo_nyet, sondeo_nada, sondeo_error, teclas_dadas);
+            if (nic.hay)
+                printf("  [usb] tramas: %u por interrupcion, %u por sondeo; %u avisos sin trabajo\n",
+                       tramas_por_irq, tramas_por_sondeo, irq_en_balde);
+        }
 
         int n = hid_sondear(&teclado, inf);
         if (detallado && n >= 8) {
