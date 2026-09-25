@@ -7070,6 +7070,80 @@ El reloj del Mac decia 08:11:35 CEST al terminar. Un fichero escrito en el
 pendrive lleva la hora de verdad, que era el objetivo: la Pi tiene la hora
 exacta y la usa al crear o modificar ficheros.
 
+## Enchufes: la red para cualquier programa
+
+Hasta aqui la pila solo hablaba para si misma: DHCP, DNS y NTP eran suyos, y
+un programa solo podia pedirle la hora. Este paso la abre: cualquier
+programa puede quedarse un puerto UDP, mandar, recibir y resolver nombres.
+Es un socket de Unix sin el descriptor.
+
+### El cartero
+
+Un enchufe es un puerto UDP que un programa se queda (`UMSG_ABRIR`, con el
+puerto pedido o 0 para "el que sea", que sale de 49152 en adelante). A
+partir de ahi la pila hace de cartero: lo que llega a ese puerto va al
+programa como mensaje (`UMSG_DATAGRAMA`, con quien lo mando), y lo que el
+programa manda (`UMSG_ENVIAR`, con a quien) sale por el con su direccion.
+La tabla vive en la pila -ocho enchufes- y la identidad es el pid que el
+kernel pone en cada mensaje: nadie manda por el enchufe de otro, porque la
+pila comprueba `rx.from`. Los puertos de la propia pila (68, 123 y el suyo
+de DNS) no se pueden coger.
+
+Y la vida la marca el proceso. Si muere sin cerrar -un Ctrl-C-, su puerto
+de IPC desaparece y la siguiente entrega falla; pero un puerto UDP ocupado
+por un muerto hasta que llegue algo es un `udp escucha 7` que no se puede
+repetir. La solucion es la de Unix: `kill(pid, 0)` no manda nada, pregunta
+"existe ese proceso?", y la pila lo pregunta al abrir un enchufe y una vez
+por segundo. Es una linea nueva en `task_signal`: la senyal 0 contesta
+`-ESRCH` si no esta.
+
+### El DNS, para todos
+
+El DNS del paso anterior era de un solo uso, atado a la hora. Ahora es una
+tabla de consultas en vuelo -quien pregunta (la pila misma, o el puerto de
+un programa), por que nombre, con que identificador-, con sus reintentos.
+La respuesta se casa por el identificador, que es lo unico que el servidor
+devuelve intacto. La hora usa el mismo camino: pide `pool.ntp.org` y el DNS
+le llama de vuelta. Un nombre que ya es un numero con puntos no se pregunta,
+se lee.
+
+### `lib/red.h`: como lo ve un programa
+
+`udp_abrir`, `udp_enviar`, `udp_recibir` con espera en decimas de segundo,
+`udp_cerrar`, `resolver`, `red_estado`, y `ip_leer`/`ip_texto`. Un programa
+tiene UN puerto de IPC para todo lo de red, creado la primera vez que hace
+falta; por el llegan las respuestas, los datagramas de todos sus enchufes y
+las alarmas con que se miden las esperas. Como todo entra por el mismo
+sitio, lo que no es lo esperado no se tira: un datagrama para otro enchufe
+se guarda -uno por enchufe- hasta que alguien pregunte por el.
+
+`udp` es el programa que lo demuestra y la herramienta para probarlo: `udp`
+(que direccion tengo), `udp resuelve NOMBRE`, `udp manda DESTINO PUERTO
+texto` (y espera respuesta tres segundos), `udp escucha PUERTO` (ensenya lo
+que llega y lo devuelve). No hay nada de red dentro: todo es `lib/red.h`.
+
+### La prueba, desde fuera
+
+En QEMU, con un servidor de eco en Python en el Mac (`127.0.0.1:9999`; el
+10.0.2.2 de la red de usuario es el propio Mac) y `hostfwd=udp::7777-:7`
+para entrar desde el Mac hasta el puerto 7 de TinyOS:
+
+    / $ udp
+      tarjeta  CDC-ECM  52:54:00:12:34:57
+      ip       10.0.2.15  mascara 255.255.255.0
+    / $ udp resuelve pool.ntp.org
+      pool.ntp.org es 162.159.200.123
+    / $ udp manda 10.0.2.2 9999 hola desde TinyOS
+      17 bytes a 10.0.2.2:9999 desde el puerto 49153
+      respuesta de 10.0.2.2:9999, 21 bytes: "ECO:hola desde TinyOS"
+    / $ udp escucha 7
+      de 10.0.2.2:61007, 20 bytes: "hola pi desde el mac"
+      de 10.0.2.2:64016, 7 bytes: "segundo"
+
+Y del otro lado: el servidor Python vio llegar `hola desde TinyOS`, y el
+`nc -u` del Mac recibio de vuelta lo que mando. Los dos sentidos, desde un
+programa normal. La hora sigue llegando por el DNS nuevo.
+
 ## Limitaciones conocidas
 
 - `munmap` devuelve las paginas de datos pero no las tablas de nivel 3 que
@@ -7268,6 +7342,11 @@ exacta y la usa al crear o modificar ficheros.
   asi que a la larga se ira; lo corrige la sincronizacion de cada hora. El
   cambio de hora solo sabe la regla europea (`ZONA=CET`); otra zona con
   horario de verano necesita su regla.
+- Los enchufes son solo UDP y ocho en total; no hay TCP, y sin TCP no hay
+  HTTP ni nada que hable con la web. Un programa guarda un datagrama por
+  enchufe: si llegan dos antes de que pregunte, se queda con el ultimo. La
+  espera de `udp_recibir` es en decimas de segundo porque `alarma()` no da
+  mas fino a un proceso normal.
 - La pila de red guarda UNA trama esperando a ARP; si llegan dos seguidas a
   destinos desconocidos, la primera se pierde y el protocolo de arriba tiene
   que reintentar. La tabla ARP no caduca. No hay fragmentacion IP: un

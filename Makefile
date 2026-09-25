@@ -39,7 +39,7 @@ LDFLAGS := -nostdlib -nostartfiles -T linker.ld \
            -Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/kernel8.map
 
 # --- Programa de usuario: se compila aparte y se empotra en el kernel ---
-UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir lento clave vi usb red hora
+UPROGS  := hello conserver client fs ls cat run sh write rm cp mem deep forkd trap kill upper wc fp mkdir map rmdir mv env echo malo init fecha libc anyadir lento clave vi usb red hora udp
 
 # Los que van a /usr/bin de la tarjeta: todos menos los cinco que el kernel
 # lleva dentro (init, sh, fs, conserver, client) y por tanto no necesitan
@@ -79,7 +79,7 @@ ULDFLAGS := -nostdlib -nostartfiles -T user/user.ld \
 # enlazador saca de ella SOLO los objetos que hagan falta, asi que un
 # programa que no use printf no lo lleva dentro.
 LIBCASM := lib/setjmp.S
-LIBCSRC := lib/errno.c lib/file.c lib/string.c lib/stdio.c lib/stdlib.c lib/malloc.c lib/signal.c
+LIBCSRC := lib/errno.c lib/file.c lib/string.c lib/stdio.c lib/stdlib.c lib/malloc.c lib/signal.c lib/red.c
 LIBCOBJ := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIBCSRC)) \
            $(patsubst lib/%.S,$(BUILD)/lib/%.S.o,$(LIBCASM))
 CRT0    := $(BUILD)/lib/crt0.o

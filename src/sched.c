@@ -1111,10 +1111,22 @@ static int signal_locked(struct task *t, int sig)
 
 int task_signal(uint64_t pid, int sig)
 {
-    if (sig <= 0 || sig >= SIG_MAX) return -1;
+    if (sig < 0 || sig >= SIG_MAX) return -1;
 
     uint64_t flags = sched_lock_irqsave();
-    int ok = signal_locked(by_pid(pid), sig);
+    struct task *t = by_pid(pid);
+
+    /* La senyal 0 no se entrega: es la pregunta "existe ese proceso?", que
+     * es lo que Unix lleva haciendo con kill(pid, 0) desde siempre. La usa
+     * la pila de red para saber si el duenyo de un enchufe sigue vivo sin
+     * tener que esperar a que una entrega falle. */
+    if (sig == 0) {
+        int hay = (t != 0 && t->state != TASK_ZOMBIE);
+        sched_unlock_irqrestore(flags);
+        return hay ? 0 : -ESRCH;
+    }
+
+    int ok = signal_locked(t, sig);
     sched_unlock_irqrestore(flags);
     return ok ? 0 : -1;
 }

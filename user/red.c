@@ -18,8 +18,9 @@
  * mandar una trama), e ICMP, que es como una maquina dice "estoy aqui" (el
  * ping). Con esos cinco -Ethernet, ARP, IP, ICMP, UDP- y un cliente DHCP
  * para conseguir direccion, la Pi es una maquina mas de la red: se le puede
- * hacer ping y puede hablar con cualquiera. Lo que falta para la hora -DNS
- * y NTP- son dos programas mas ENCIMA de UDP, y van en el paso siguiente.
+ * hacer ping y puede hablar con cualquiera. Encima de UDP van DNS y NTP
+ * -la hora- y los "enchufes": puertos UDP que cualquier programa se queda
+ * para hablar con la red por mensajes.
  *
  * Todo es big-endian ("orden de red"): el byte alto primero. El ARM guarda
  * los numeros al reves, asi que aqui no se lee ni escribe un numero
@@ -35,6 +36,7 @@
 /* --- Lo que sabemos de nosotros ------------------------------------------ */
 static uint64_t driver;                  /* puerto del driver; 0 = sin tarjeta */
 static uint8_t  mi_mac[6];               /* 'mac' a secas es la llamada al sistema */
+static char     tarjeta[16];
 static uint32_t ip, mascara, router, dns, ntp;   /* 0 = no lo tenemos */
 
 /* --- Bytes en orden de red ---------------------------------------------- */
@@ -233,6 +235,8 @@ static void icmp_llego(uint32_t src, const uint8_t *d, int n)
 
 static void hora_iniciar(void);
 static void hora_tick(void);
+static void dns_tick(void);
+static void enchufes_barrer(void);
 
 /* --- DHCP: pedir una direccion --------------------------------------------
  *
@@ -370,6 +374,8 @@ static void cada_segundo(void)
         if (!quedan) { printf("  [red] DHCP: se acabo el alquiler\n"); dhcp_buscar(); }
     }
     hora_tick();
+    dns_tick();
+    enchufes_barrer();
 }
 
 /* --- La hora: dos programas encima de UDP ----------------------------------
@@ -510,17 +516,24 @@ static void hora_fallo(const char *motivo)
     hora_estado = 0; hora_auto = 1; hora_siguiente = segundos + 60;
 }
 
-/* --- DNS --- */
-static void dns_pedir(void)
+/* --- DNS: para la hora y para cualquiera --------------------------------------
+ *
+ * Una tabla chica de consultas en vuelo: quien pregunta (0 = la propia pila,
+ * para la hora; si no, el puerto de un programa), por que nombre, con que
+ * identificador, y cuantas veces se ha insistido. La respuesta se casa por
+ * el identificador, que es lo unico que el servidor devuelve intacto. */
+struct consulta { uint16_t id; uint64_t cliente; char nombre[64]; unsigned intentos, siguiente; };
+static struct consulta consultas[4];
+
+static void hora_resuelto(uint32_t quien);
+
+static void dns_mandar(struct consulta *c)
 {
     static uint8_t q[300];
-    if (!dns) { hora_fallo("el DHCP no me dio servidor de nombres"); return; }
-
-    dns_id++;
-    pon16(q, dns_id); pon16(q + 2, 0x0100);           /* quiero recursion */
+    pon16(q, c->id); pon16(q + 2, 0x0100);            /* quiero recursion */
     pon16(q + 4, 1); pon16(q + 6, 0); pon16(q + 8, 0); pon16(q + 10, 0);
     int n = 12;
-    const char *t = ntp_nombre;
+    const char *t = c->nombre;
     while (*t) {
         int l = 0;
         while (t[l] && t[l] != '.') l++;
@@ -532,6 +545,74 @@ static void dns_pedir(void)
     q[n++] = 0;
     pon16(q + n, 1); pon16(q + n + 2, 1); n += 4;     /* tipo A, clase IN */
     udp_enviar(dns, PUERTO_DNS_LOCAL, 53, q, n);
+    c->intentos++;
+    c->siguiente = segundos + 2;
+}
+
+static void dns_contestar(struct consulta *c, uint32_t quien, const char *motivo)
+{
+    if (!c->cliente) {                                /* era para la hora */
+        if (quien) hora_resuelto(quien); else hora_fallo(motivo);
+    } else {
+        struct umsg_resolver *r = (struct umsg_resolver *)resp.data;
+        if (quien) {
+            resp.type = UMSG_RESUELTO; resp.len = sizeof(*r);
+            r->port = c->cliente; r->ip = quien;
+            memcpy(r->nombre, c->nombre, sizeof(r->nombre));
+        } else {
+            resp.type = UMSG_ERROR;
+            int k = 0; for (; motivo[k] && k < 200; k++) resp.data[k] = motivo[k];
+            resp.data[k] = 0; resp.len = (uint64_t)k + 1;
+        }
+        msg_send(c->cliente, &resp);
+    }
+    c->id = 0;
+}
+
+/* Un numero con puntos no se pregunta: se lee. Devuelve 0 si no lo es. */
+static uint32_t ip_de_texto(const char *t)
+{
+    uint32_t v = 0; int partes = 0;
+    while (*t) {
+        if (*t < '0' || *t > '9') return 0;
+        unsigned x = 0;
+        while (*t >= '0' && *t <= '9') { x = x * 10 + (unsigned)(*t - '0'); if (x > 255) return 0; t++; }
+        v = (v << 8) | x; partes++;
+        if (*t == '.') { t++; if (!*t) return 0; }
+        else if (*t) return 0;
+    }
+    return partes == 4 ? v : 0;
+}
+
+static void dns_consultar(const char *nombre, uint64_t cliente)
+{
+    struct consulta *c = 0;
+    for (int i = 0; i < 4 && !c; i++) if (!consultas[i].id) c = &consultas[i];
+
+    struct consulta tmp = { 0 };
+    if (!c) c = &tmp;
+    c->id = ++dns_id ? dns_id : ++dns_id;
+    c->cliente = cliente;
+    int k = 0; for (; nombre[k] && k < 63; k++) c->nombre[k] = nombre[k];
+    c->nombre[k] = 0;
+    c->intentos = 0;
+
+    uint32_t directa = ip_de_texto(c->nombre);
+    if (directa)  { dns_contestar(c, directa, 0); return; }
+    if (c == &tmp) { dns_contestar(c, 0, "demasiadas consultas DNS a la vez"); return; }
+    if (!dns)     { dns_contestar(c, 0, "el DHCP no me dio servidor de nombres"); return; }
+    if (!ip)      { dns_contestar(c, 0, "todavia sin direccion IP (DHCP)"); return; }
+    dns_mandar(c);
+}
+
+static void dns_tick(void)
+{
+    for (int i = 0; i < 4; i++) {
+        struct consulta *c = &consultas[i];
+        if (!c->id || segundos < c->siguiente) continue;
+        if (c->intentos >= 3) dns_contestar(c, 0, "el DNS no contesta");
+        else dns_mandar(c);
+    }
 }
 
 static int nombre_saltar(const uint8_t *d, int n, int o)
@@ -545,12 +626,13 @@ static int nombre_saltar(const uint8_t *d, int n, int o)
     return -1;
 }
 
-static void ntp_pedir(void);
-
 static void dns_llego(const uint8_t *d, int n)
 {
-    if (hora_estado != 1 || n < 12 || be16(d) != dns_id || !(d[2] & 0x80)) return;
-    if (d[3] & 0xF) { hora_fallo("el DNS dice que ese nombre no existe"); return; }
+    if (n < 12 || !(d[2] & 0x80)) return;
+    struct consulta *c = 0;
+    for (int i = 0; i < 4 && !c; i++) if (consultas[i].id && consultas[i].id == be16(d)) c = &consultas[i];
+    if (!c) return;
+    if (d[3] & 0xF) { dns_contestar(c, 0, "el DNS dice que ese nombre no existe"); return; }
 
     int preguntas = be16(d + 4), respuestas = be16(d + 6), o = 12;
     for (int i = 0; i < preguntas && o > 0; i++) { o = nombre_saltar(d, n, o); if (o > 0) o += 4; }
@@ -559,15 +641,14 @@ static void dns_llego(const uint8_t *d, int n)
         if (o < 0 || o + 10 > n) break;
         int tipo = be16(d + o), largo = be16(d + o + 8);
         if (tipo == 1 && largo == 4 && o + 14 <= n) {
-            ntp_ip = be32(d + o + 10);
-            printf("  [red] DNS: %s es %d.%d.%d.%d\n", ntp_nombre, IP4(ntp_ip));
-            hora_estado = 2; hora_intentos = 0; hora_siguiente = segundos + 2;
-            ntp_pedir();
+            uint32_t quien = be32(d + o + 10);
+            if (!c->cliente) printf("  [red] DNS: %s es %d.%d.%d.%d\n", c->nombre, IP4(quien));
+            dns_contestar(c, quien, 0);
             return;
         }
         o += 10 + largo;
     }
-    hora_fallo("el DNS no trae ninguna direccion");
+    dns_contestar(c, 0, "el DNS no trae ninguna direccion");
 }
 
 /* --- NTP --- */
@@ -601,24 +682,29 @@ static void ntp_llego(uint32_t src, const uint8_t *d, int n)
     contestar_clientes(1, 0);
 }
 
+static void hora_resuelto(uint32_t quien)
+{
+    if (hora_estado != 1) return;
+    ntp_ip = quien;
+    hora_estado = 2; hora_intentos = 0; hora_siguiente = segundos + 2;
+    ntp_pedir();
+}
+
 static void hora_iniciar(void)
 {
     if (!ip) return;
     hora_intentos = 0; hora_auto = 0;
     hora_siguiente = segundos + 2;
     if (ntp) { ntp_ip = ntp; hora_estado = 2; ntp_pedir(); }
-    else     { hora_estado = 1; dns_pedir(); }
+    else     { hora_estado = 1; dns_consultar(ntp_nombre, 0); }   /* el DNS llama de vuelta */
 }
 
 static void hora_tick(void)
 {
-    if (hora_estado && segundos >= hora_siguiente) {
-        if (++hora_intentos >= 4) {
-            hora_fallo(hora_estado == 1 ? "el DNS no contesta" : "el servidor NTP no contesta");
-            return;
-        }
+    if (hora_estado == 2 && segundos >= hora_siguiente) {
+        if (++hora_intentos >= 4) { hora_fallo("el servidor NTP no contesta"); return; }
         hora_siguiente = segundos + 2;
-        if (hora_estado == 1) dns_pedir(); else ntp_pedir();
+        ntp_pedir();
     } else if (!hora_estado && hora_auto && ip && segundos >= hora_siguiente) {
         hora_iniciar();
     }
@@ -636,14 +722,134 @@ static void hora_pedida(void)
     if (!hora_estado) hora_iniciar();
 }
 
+/* --- Enchufes: la red para cualquier programa ---------------------------------
+ *
+ * Hasta aqui la pila solo hablaba para si misma: DHCP, DNS y NTP eran suyos.
+ * Un enchufe es un puerto UDP que un programa se queda, y a partir de ahi
+ * la pila hace de cartero: lo que llega a ese puerto va al programa como
+ * mensaje, y lo que el programa manda sale por el con su direccion. La
+ * identidad es el pid que el kernel pone en cada mensaje -nadie manda por
+ * el enchufe de otro- y la vida la marca su puerto de IPC: si el programa
+ * muere, la entrega falla y el enchufe se cierra solo. */
+struct enchufe { uint64_t pid, port; uint16_t local; };
+static struct enchufe enchufes[8];
+static uint16_t efimero = 49152;
+
+static int puerto_reservado(uint16_t p)
+{
+    return p == 68 || p == PUERTO_DNS_LOCAL || p == PUERTO_NTP;
+}
+
+/* Un enchufe cuyo duenyo ha muerto sin cerrarlo -un Ctrl-C- seguiria
+ * ocupando su puerto hasta que una entrega fallara. kill(pid, 0) es la
+ * pregunta "sigue ahi?", y se hace al abrir uno nuevo y una vez por segundo. */
+static void enchufes_barrer(void)
+{
+    for (int i = 0; i < 8; i++)
+        if (enchufes[i].pid && kill(enchufes[i].pid, 0) < 0) enchufes[i].pid = 0;
+}
+
+static struct enchufe *enchufe_por_puerto(uint16_t local)
+{
+    for (int i = 0; i < 8; i++) if (enchufes[i].pid && enchufes[i].local == local) return &enchufes[i];
+    return 0;
+}
+
+static void error_a(uint64_t port, const char *motivo)
+{
+    resp.type = UMSG_ERROR;
+    int k = 0; for (; motivo[k] && k < 200; k++) resp.data[k] = motivo[k];
+    resp.data[k] = 0; resp.len = (uint64_t)k + 1;
+    msg_send(port, &resp);
+}
+
+static void enchufe_abrir(void)
+{
+    const struct umsg_abrir *a = (const struct umsg_abrir *)rx.data;
+    uint16_t local = (uint16_t)a->local;
+
+    enchufes_barrer();
+    if (local && (puerto_reservado(local) || enchufe_por_puerto(local))) {
+        error_a(a->port, "ese puerto ya esta cogido"); return;
+    }
+    if (!local) {
+        for (int v = 0; v < 8192; v++) {
+            if (++efimero < 49152) efimero = 49152;
+            if (!enchufe_por_puerto(efimero)) { local = efimero; break; }
+        }
+    }
+    struct enchufe *e = 0;
+    for (int i = 0; i < 8 && !e; i++) if (!enchufes[i].pid) e = &enchufes[i];
+    if (!e || !local) { error_a(a->port, "no quedan enchufes"); return; }
+
+    e->pid = rx.from; e->port = a->port; e->local = local;
+
+    struct umsg_abrir *r = (struct umsg_abrir *)resp.data;
+    resp.type = UMSG_ABIERTO; resp.len = sizeof(*r);
+    r->port = a->port; r->local = local;
+    msg_send(a->port, &resp);
+}
+
+static void enchufe_cerrar(void)
+{
+    const struct umsg_abrir *a = (const struct umsg_abrir *)rx.data;
+    struct enchufe *e = enchufe_por_puerto((uint16_t)a->local);
+    if (e && e->pid == rx.from) e->pid = 0;
+}
+
+static void enchufe_enviar(void)
+{
+    const struct umsg_dgrama *d = (const struct umsg_dgrama *)rx.data;
+    struct enchufe *e = enchufe_por_puerto((uint16_t)d->local);
+    if (!e || e->pid != rx.from) return;              /* no es tuyo: ni caso */
+    if (!ip) { error_a(e->port, "todavia sin direccion IP (DHCP)"); return; }
+    int n = (int)d->n;
+    if (n < 0 || n > UDP_DATOS_MAX) return;
+    udp_enviar((uint32_t)d->ip, e->local, (uint16_t)d->puerto, d->datos, n);
+}
+
+/* Ha llegado algo para un enchufe: al programa. */
+static void enchufe_entregar(struct enchufe *e, uint32_t src, uint16_t sport, const uint8_t *d, int n)
+{
+    struct umsg_dgrama *g = (struct umsg_dgrama *)resp.data;
+    if (n > UDP_DATOS_MAX) n = UDP_DATOS_MAX;
+    resp.type = UMSG_DATAGRAMA;
+    resp.len  = sizeof(*g) - UDP_DATOS_MAX + (uint64_t)n;
+    g->local = e->local; g->ip = src; g->puerto = sport; g->n = (unsigned long)n;
+    memcpy(g->datos, d, (size_t)n);
+    if (msg_send(e->port, &resp) < 0) e->pid = 0;    /* se fue: el enchufe, con el */
+}
+
+static void resolver_pedido(void)
+{
+    const struct umsg_resolver *r = (const struct umsg_resolver *)rx.data;
+    char nombre[64];
+    memcpy(nombre, r->nombre, 63); nombre[63] = 0;
+    dns_consultar(nombre, r->port);
+}
+
+static void info_pedida(void)
+{
+    const struct umsg_pedir *p = (const struct umsg_pedir *)rx.data;
+    struct umsg_info *i = (struct umsg_info *)resp.data;
+    resp.type = UMSG_INFO_OK; resp.len = sizeof(*i);
+    i->ip = ip; i->mascara = mascara; i->router = router; i->dns = dns; i->ntp = ntp;
+    i->estado = (unsigned long)(driver ? estado : 0);
+    memcpy(i->mac, mi_mac, 6);
+    memcpy(i->tarjeta, tarjeta, sizeof(i->tarjeta));
+    msg_send(p->port, &resp);
+}
+
 /* --- Lo que entra --------------------------------------------------------- */
 static void udp_llego(uint32_t src, uint16_t sport, uint16_t dport, const uint8_t *d, int n)
 {
-    if (dport == 68)                                    dhcp_llego(d, n);
-    else if (dport == PUERTO_DNS_LOCAL && sport == 53)  dns_llego(d, n);
-    else if (dport == PUERTO_NTP && sport == 123)       ntp_llego(src, d, n);
-    /* Los demas puertos: nadie los escucha. Un dia habra clientes UDP por
-     * mensaje, como los del fs; hoy la unica que hace falta es la hora. */
+    if (dport == 68)                                    { dhcp_llego(d, n); return; }
+    if (dport == PUERTO_DNS_LOCAL && sport == 53)       { dns_llego(d, n); return; }
+    if (dport == PUERTO_NTP && sport == 123)            { ntp_llego(src, d, n); return; }
+
+    /* Los demas puertos son de los programas, si alguno se lo ha quedado. */
+    struct enchufe *e = enchufe_por_puerto(dport);
+    if (e) enchufe_entregar(e, src, sport, d, n);
 }
 
 static void ip_llego(const uint8_t *f, int n)
@@ -695,6 +901,7 @@ static void tarjeta_llego(void)
     const struct net_tarjeta *t = (const struct net_tarjeta *)rx.data;
     driver = t->port;
     memcpy(mi_mac, t->mac, 6);
+    memcpy(tarjeta, t->nombre, sizeof(tarjeta) - 1); tarjeta[sizeof(tarjeta) - 1] = 0;
     printf("  [red] tarjeta %s, MAC %02x:%02x:%02x:%02x:%02x:%02x: pido direccion (DHCP)\n",
            t->nombre, mi_mac[0], mi_mac[1], mi_mac[2], mi_mac[3], mi_mac[4], mi_mac[5]);
     dhcp_buscar();
@@ -725,6 +932,11 @@ int main(int argc, char **argv)
         case NMSG_TRAMA:   trama_llego((const uint8_t *)rx.data, (int)rx.len); break;
         case CMSG_ALARMA:  cada_segundo(); break;
         case UMSG_HORA:    hora_pedida(); break;
+        case UMSG_ABRIR:    enchufe_abrir(); break;
+        case UMSG_CERRAR:   enchufe_cerrar(); break;
+        case UMSG_ENVIAR:   enchufe_enviar(); break;
+        case UMSG_RESOLVER: resolver_pedido(); break;
+        case UMSG_INFO:     info_pedida(); break;
         default: break;
         }
     }

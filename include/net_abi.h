@@ -50,3 +50,54 @@ struct umsg_hora {
     unsigned long desfase;           /* segundos de la zona sobre UTC (+/-) */
     unsigned long servidor;          /* la IP del servidor NTP que contesto */
 };
+
+/* --- Enchufes UDP: la red para cualquier programa ---------------------------
+ *
+ * Un "enchufe" (socket) es un puerto UDP local que un programa se queda.
+ * Lo que llegue a ese puerto se le entrega como mensaje a SU puerto de IPC;
+ * lo que quiera mandar lo manda por la pila diciendo desde cual. La pila
+ * lleva la tabla (quien tiene que puerto UDP), y la identidad es el pid que
+ * el kernel pone en cada mensaje: nadie puede mandar por el enchufe de
+ * otro. Si el programa muere, su puerto de IPC desaparece, la entrega
+ * falla, y la pila cierra el enchufe sola.
+ *
+ * Es un socket de Unix sin el descriptor: abrir, enviar, recibir, cerrar;
+ * y resolver nombres, que sin eso solo se puede hablar con numeros. */
+#define UMSG_ABRIR       41      /* struct umsg_abrir -> UMSG_ABIERTO | UMSG_ERROR */
+#define UMSG_CERRAR      42      /* struct umsg_abrir (local) -> nada             */
+#define UMSG_ENVIAR      43      /* struct umsg_dgrama -> nada (UMSG_ERROR si no) */
+#define UMSG_RESOLVER    44      /* struct umsg_resolver -> UMSG_RESUELTO | UMSG_ERROR */
+#define UMSG_INFO        45      /* struct umsg_pedir -> UMSG_INFO_OK               */
+
+#define UMSG_ABIERTO    142      /* struct umsg_abrir con el puerto local asignado */
+#define UMSG_DATAGRAMA  143      /* struct umsg_dgrama: ha llegado esto            */
+#define UMSG_RESUELTO   144      /* struct umsg_resolver con ip                     */
+#define UMSG_INFO_OK    145      /* struct umsg_info                                */
+
+#define UDP_DATOS_MAX  1472      /* lo que cabe en una trama detras de IP y UDP    */
+
+struct umsg_abrir {
+    unsigned long port;              /* a donde contestar y entregar       */
+    unsigned long local;             /* puerto UDP pedido; 0 = el que sea  */
+};
+
+struct umsg_dgrama {
+    unsigned long local;             /* por que enchufe                    */
+    unsigned long ip;                /* el otro extremo                    */
+    unsigned long puerto;
+    unsigned long n;                 /* bytes utiles de datos[]            */
+    unsigned char datos[UDP_DATOS_MAX];
+};
+
+struct umsg_resolver {
+    unsigned long port;
+    unsigned long ip;                /* la respuesta                       */
+    char          nombre[64];
+};
+
+struct umsg_info {
+    unsigned long ip, mascara, router, dns, ntp;
+    unsigned long estado;            /* 0 sin tarjeta, 1 buscando, 2 pidiendo, 3 con direccion */
+    unsigned char mac[6];
+    char          tarjeta[16];
+};
